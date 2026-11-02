@@ -1,7 +1,7 @@
 # 更新日志
 
-本次更新有$\color{red}{较大}$改动，请$\color{red}{彻底卸载}$本插件$\color{red}{所有数据}$后重新安装！
-如果遇到Bug可加入1005645698群聊或在GitHub上Issues反馈
+本次更新有较大改动，请彻底卸载本插件所有数据后重新安装！
+如果遇到Bug可加入1005645698群聊或在 GitHub 上 Issues 反馈
 <p align="center">
   <a href="https://qm.qq.com/q/u3CDKSRfpY"><img src="./docs/images/qq-community.svg" alt="加入 QQ 闲聊群" width="220" /></a>
 </p>
