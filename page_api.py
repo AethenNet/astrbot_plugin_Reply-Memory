@@ -21,10 +21,13 @@ from astrbot.api import logger
 
 from .block_store import default_reason, format_remaining, parse_until
 from .config_model import (
+    GROUP_FIELD_BY_PATH,
     GROUP_OVERRIDE_FIELDS,
     build_global_snapshot,
     build_schema_patch,
+    coerce_group_value,
     deep_merge,
+    get_by_path,
 )
 from .web_compat import fail, ok, query_get, read_json
 
@@ -304,8 +307,35 @@ class PageApi:
             if independent:
                 if not values:
                     return fail("启用独立配置时至少需要提交一个字段")
-                saved = plugin.group_store.save_overrides(group_id, values, note=note)
+                # 只保存“与全局值不同”的字段。页面会提交完整表单，
+                # 若把未修改的默认值（尤其是记忆 RAG 的默认 False）也写入，
+                # 会导致该群记忆在没有提示的情况下被关闭。
+                global_values = build_global_snapshot(plugin._global_cfg())
+                existing = plugin.group_store.get_overrides(group_id)
+                overrides: dict[str, Any] = {}
+                for spec in GROUP_OVERRIDE_FIELDS:
+                    current = get_by_path(existing, spec.path)
+                    if current is not None:
+                        overrides[spec.path] = current
+                for path, value in values.items():
+                    spec = GROUP_FIELD_BY_PATH.get(str(path))
+                    if spec is None:
+                        continue
+                    coerced = coerce_group_value(spec, value)
+                    if coerced == global_values.get(path):
+                        overrides.pop(path, None)
+                    else:
+                        overrides[path] = coerced
+                if overrides:
+                    saved = plugin.group_store.save_overrides(
+                        group_id, overrides, note=note
+                    )
+                else:
+                    plugin.group_store.save_overrides(group_id, {}, note=note)
+                    plugin.group_store.set_independent(group_id, False, note=note)
+                    saved = {}
             else:
+                plugin.group_store.save_overrides(group_id, {}, note=note)
                 plugin.group_store.set_independent(group_id, False, note=note)
                 saved = {}
         except Exception as exc:
@@ -342,9 +372,22 @@ class PageApi:
         try:
             stats = store.get_stats()
             scopes = store.list_group_scopes()
+            counts = store.source_counts()
+            now = datetime.datetime.now(self.plugin._tzinfo())
+            today_start = now.replace(
+                hour=0, minute=0, second=0, microsecond=0
+            ).timestamp()
+            today = store.count_since(today_start)
         except Exception as exc:
             logger.error(f"[ActiveReply] 读取记忆统计失败: {exc}", exc_info=True)
             return fail(f"读取失败：{exc}")
+        stats["source_counts"] = {
+            "keyword": int(counts.get("keyword", 0)),
+            "model": int(counts.get("model", 0)),
+            "manual": int(counts.get("manual", 0)),
+            "consolidation": int(counts.get("consolidation", 0)),
+        }
+        stats["today"] = int(today)
         return ok({"stats": stats, "group_scopes": scopes})
 
     async def rag_list(self) -> dict[str, Any]:
@@ -358,6 +401,9 @@ class PageApi:
         keyword = query_get("keyword", "", str)
         group_scope = query_get("group_scope", "", str)
         role_id = query_get("role_id", "", str)
+        memory_type = query_get("memory_type", "", str)
+        identity = query_get("identity", "", str)
+        include_archived = bool(query_get("include_archived", 0, int))
         try:
             data = store.list_memories(
                 page=page or 1,
@@ -365,6 +411,9 @@ class PageApi:
                 keyword=keyword or "",
                 group_scope=group_scope or "",
                 role_id=role_id or "",
+                memory_type=memory_type or "",
+                identity=identity or "",
+                include_archived=include_archived,
             )
         except Exception as exc:
             logger.error(f"[ActiveReply] 读取记忆列表失败: {exc}", exc_info=True)
@@ -394,11 +443,14 @@ class PageApi:
             today_start = 0.0
         today = store.count_since(today_start) if store else 0
         return {
-            "enabled": bool(cfg.memory_rag.auto_extract_enable),
+            "enabled": bool(
+                cfg.memory_rag.enable and cfg.memory_rag.auto_extract_enable
+            ),
+            "memory_enabled": bool(cfg.memory_rag.enable),
             "provider_id": cfg.memory_rag.auto_extract_provider_id,
-            "every_n": cfg.memory_rag.auto_extract_every_n,
+            "batch_messages": cfg.memory_rag.batch_messages,
             "interval_minutes": cfg.memory_rag.auto_extract_interval_minutes,
-            "window": cfg.memory_rag.auto_extract_window,
+            "private_every_n": cfg.memory_rag.private_extract_every_n,
             "min_confidence": cfg.memory_rag.auto_extract_min_confidence,
             "scope": cfg.memory_rag.auto_extract_scope,
             "stats": {
@@ -407,6 +459,9 @@ class PageApi:
                 "model": int(counts.get("model", 0)),
                 "manual": int(counts.get("manual", 0)),
                 "today": int(today),
+                "types": stats.get("type_counts") or {},
+                "identities": stats.get("identity_counts") or {},
+                "archived": int(stats.get("archived_count", 0) or 0),
             },
             "providers": self._provider_options(),
         }
@@ -423,7 +478,7 @@ class PageApi:
         if "enable" not in payload:
             return fail("缺少 enable 参数")
         enable = bool(payload.get("enable"))
-        patch = {"memory_rag": {"auto_extract_enable": enable}}
+        patch = {"memory_rag": {"memory_generation": {"auto_extract_enable": enable}}}
         merged = deep_merge(copy.deepcopy(dict(self.plugin.config)), patch)
         try:
             self.plugin.config.clear()
@@ -460,7 +515,31 @@ class PageApi:
         if not removed:
             return fail("记忆不存在或已删除")
         logger.info("[ActiveReply] 页面删除记忆 | id=%s", memory_id)
-        return ok({"memory_id": memory_id, "deleted": True})
+        return ok(
+            {
+                "memory_id": memory_id,
+                "deleted": True,
+                "trash_id": store.latest_trash_id(),
+            }
+        )
+
+    async def rag_restore(self) -> dict[str, Any]:
+        """撤销删除：从回收站恢复一条记忆。"""
+        store = self.plugin.memory_store
+        if store is None:
+            return fail("记忆库未初始化")
+        payload = await read_json()
+        try:
+            trash_id = int(payload.get("trash_id") or 0)
+        except (TypeError, ValueError):
+            return fail("trash_id 无效")
+        if trash_id <= 0:
+            return fail("trash_id 无效")
+        new_id = store.restore_memory(trash_id)
+        if new_id is None:
+            return fail("回收站中没有该记录")
+        logger.info("[ActiveReply] 页面撤销删除 | trash=%s new_id=%s", trash_id, new_id)
+        return ok({"memory_id": new_id, "restored": True})
 
     async def rag_cleanup(self) -> dict[str, Any]:
         """在线程池执行旧格式记忆数据清理，避免阻塞事件循环。"""

@@ -1,11 +1,64 @@
 # 更新日志
 
+本次更新有$\color{red}{较大}$改动，请$\color{red}{彻底卸载}$本插件$\color{red}{所有数据}$后重新安装！
+如果遇到Bug可加入1005645698群聊或在GitHub上Issues反馈
+<p align="center">
+  <a href="https://qm.qq.com/q/u3CDKSRfpY"><img src="./docs/images/qq-community.svg" alt="加入 QQ 闲聊群" width="220" /></a>
+</p>
+
+## v1.1.0-beta.1（2026-11-03）
+
+### 新增与优化
+
+- 重构记忆 RAG：关键词写入 + 模型抽取 + 语义检索 + 去重 + 冲突失效 + 生命周期管理。
+- 记忆独立时间线：`memory_chats` 与对话历史 `session_chats` 分离，记忆固定记录完整日期、发送者 ID 与原始引用/@ 标记。
+- 置信度分档：major / discussion / daily / chatter / spam 五档，评分限制在档位区间内。
+- 群级配置：只保存与全局不同的字段；启动时自动修复旧版本自动填充的“记忆默认关闭”覆盖。
+- `/总结记忆`：管理员手动触发不再受自动抽取最低置信度限制。
+
+### 修复
+
+- 修复记忆时间与真实发送时间不一致：记忆库 `memory_time` 取窗口内最后一条有效消息的真实时间，不再使用摘要任务执行时间；抽取提示词附带当前时间与时区，并禁止照抄示例日期。
+- 修复自动记忆静默失效：自动抽取与群聊上下文、主动回复解耦；关闭上下文/主动回复后仍会维护记忆历史。
+- 修复群级独立配置自动把记忆 RAG 写成关闭的问题；旧 `groups.json` 中“7 个记忆字段全为旧默认值”的覆盖会在启动时清理。
+- 修复关闭“包含用户信息”时记忆历史缺少发送者 ID、导致抽取器无法解析的问题；记忆历史始终使用独立格式。
+- 修复自动抽取计数器丢失或异常重置后不再触发的问题；增加按历史长度兜底触发。
+- 修复旧提示词模板缺少发言归属、时间和置信度规则的问题；运行时自动补齐。
+- 修复手动 `/总结记忆` 的正常分数被自动门槛丢弃的问题；手动操作可显式绕过门槛。
+- 修复图片描述未同步写入记忆历史的问题。
+- 修复私聊记忆未使用独立时间线的问题。
+
+### 优化
+
+- 记忆历史与对话历史解耦，避免为了记忆而改变对话模型的上下文格式。
+- 群配置保存改为差异写入，避免未修改的默认值覆盖全局设置。
+- 自动抽取增加日志：启动配置、触发条件、窗口条数、缺少 Embedding、写入跳过原因。
+- 记忆详情中的“原始消息”保留引用/@ 标记；模型输入使用改写后的安全格式。
+- 配置 schema、默认提示词、README 与开发文档同步更新。
+
+### 迁移说明
+
+以下为未重装插件可能出现的情况及对旧版尝试性适配
+- 默认最低置信度调整为 0.50，自动迁移旧默认 0.60（曾把最低置信度刻意设置为 0.60，升级后会被迁移到 0.50）
+- 从旧版本升级时请保留 `data/plugin_data/astrbot_plugin_active_reply/`；启动时会执行记忆配置、阈值和群级覆盖迁移。
+- 旧版本已经写入的记忆不会自动重算时间
+- 使用记忆 RAG 前请确认 AstrBot 已配置可用的 Embedding 提供商；否则启动日志会给出警告，自动写入会被跳过。
+
 ## v1.0.5（2026-10-31）
 
 修复：
 
-- `/replytest` token 用量显示为 0：`@` / 唤醒回复此前走了流式路径，现在统一强制非流式，token 才能被统计
-- 新增 `raw_completion.usage` 回退解析，兼容 OpenAI / DeepSeek / Anthropic / Gemini 的用量字段（`prompt_tokens_details.cached_tokens`、`prompt_cache_hit_tokens`、`cache_read_input_tokens` 等）
+- `/replytest` token 用量显示为 0：`@` / 唤醒回复统一强制非流式，token 才能被统计
+- token 用量同时写入本轮报告，避免新消息触发新一轮重置后清零
+- 未返回 `usage` 时增加回退解析：`raw_completion.usage`、`choices[0].usage`，兼容 OpenAI / DeepSeek / Anthropic / Gemini / Moonshot
+- 调试报告新增「版本」与「流式」状态，未取到 usage 时会在报告内注明原因
+- 兼容 Gemini `usage_metadata`、Anthropic `cache_read_input_tokens`、DeepSeek `prompt_cache_hit_tokens` 等更多 usage 字段与嵌套形态
+
+新增：
+
+- `/replytest` 报告补回「插件运行日志（本轮）」节点：只收集插件自身经 `astrbot.api.logger` 输出的日志，不导入 `logging` / `loguru`，符合插件市场规范
+
+说明：AstrBot 核心日志无法在不违反日志规范的前提下读取，报告只能展示插件自身日志。
 
 ## v1.0.4（2026-10-31）
 
@@ -68,3 +121,5 @@
 - 模型工具：联网搜索 `grok_web_search`、长期记忆 RAG
 - 可视化控制台：状态、群级配置、记忆管理、全局设置
 - 指令 `/执行回复`：立即执行一次回复或判定
+
+> 项目仓库：https://github.com/AethenNet/astrbot_plugin_Reply-Memory

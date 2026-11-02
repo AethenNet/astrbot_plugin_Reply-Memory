@@ -1945,3 +1945,605 @@ button.btn-loading .icon {
     opacity: 1;
   }
 }
+
+/* ---------- 记忆来源卡片 ---------- */
+.source-card {
+  margin: 0 0 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  overflow: hidden;
+}
+
+.source-card-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 12px 14px;
+  border: none;
+  background: transparent;
+  color: var(--text);
+  cursor: pointer;
+  text-align: left;
+}
+
+.source-card-head > span:first-child {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1;
+}
+
+.source-caret {
+  transition: transform 0.2s ease;
+}
+
+.source-card[data-expanded="1"] .source-caret {
+  transform: rotate(90deg);
+}
+
+.source-tray {
+  max-height: 0;
+  overflow: hidden;
+  transition: max-height 0.25s ease;
+  padding: 0 14px;
+  border-top: 1px solid transparent;
+}
+
+.source-tray.open {
+  max-height: 240px;
+  border-top-color: var(--border);
+  padding-bottom: 12px;
+}
+
+.source-row {
+  display: grid;
+  grid-template-columns: 10px 48px 64px 1fr;
+  gap: 8px;
+  align-items: center;
+  padding: 7px 0;
+  font-size: 12.5px;
+}
+
+.source-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+}
+
+.source-dot.personal,
+.source-bar i.personal {
+  background: #3b82f6;
+}
+
+.source-dot.group,
+.source-bar i.group {
+  background: #10b981;
+}
+
+.source-dot.private,
+.source-bar i.private {
+  background: #8b5cf6;
+}
+
+.source-dot.unknown,
+.source-bar i.unknown {
+  background: #94a3b8;
+}
+
+.source-bar {
+  height: 6px;
+  border-radius: 999px;
+  background: var(--surface-3);
+  overflow: hidden;
+}
+
+.source-bar i {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+}
+
+/* ---------- 身份 / 类型颜色 ---------- */
+.pill.role-owner {
+  color: #dc2626;
+  background: rgba(220, 38, 38, 0.1);
+  border-color: rgba(220, 38, 38, 0.25);
+}
+
+.pill.role-group_owner {
+  color: #b45309;
+  background: rgba(245, 158, 11, 0.12);
+  border-color: rgba(245, 158, 11, 0.28);
+}
+
+.pill.role-group_admin {
+  color: #15803d;
+  background: rgba(22, 163, 74, 0.1);
+  border-color: rgba(22, 163, 74, 0.25);
+}
+
+.pill.role-member {
+  color: #64748b;
+  background: rgba(100, 116, 139, 0.1);
+  border-color: rgba(100, 116, 139, 0.22);
+}
+
+.pill.type-personal {
+  color: #1d4ed8;
+  background: rgba(59, 130, 246, 0.1);
+  border-color: rgba(59, 130, 246, 0.25);
+}
+
+.pill.type-group {
+  color: #047857;
+  background: rgba(16, 185, 129, 0.1);
+  border-color: rgba(16, 185, 129, 0.25);
+}
+
+.pill.type-private {
+  color: #6d28d9;
+  background: rgba(139, 92, 246, 0.1);
+  border-color: rgba(139, 92, 246, 0.25);
+}
+
+.pill.type-invalid {
+  color: #94a3b8;
+  background: rgba(148, 163, 184, 0.12);
+  border-color: rgba(148, 163, 184, 0.25);
+  margin-left: 4px;
+}
+
+/* ---------- RAG 操作栏 / 筛选弹窗 / Snackbar ---------- */
+.rag-actions {
+  margin-bottom: 10px;
+}
+
+.rag-filters {
+  grid-template-columns: 1fr 1fr;
+}
+
+.modal-card h3 {
+  margin: 0 0 12px;
+}
+
+.filter-form {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.filter-form label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.snackbar {
+  position: fixed;
+  left: 50%;
+  bottom: 20px;
+  transform: translateX(-50%) translateY(120%);
+  z-index: 90;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 240px;
+  padding: 10px 14px;
+  border-radius: 12px;
+  background: #1f2937;
+  color: #f8fafc;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.25);
+  transition: transform 0.2s ease;
+}
+
+.snackbar.show {
+  transform: translateX(-50%) translateY(0);
+}
+
+.snackbar .link-btn {
+  color: #93c5fd;
+  margin-left: auto;
+}
+
+.snackbar-progress {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 3px;
+  background: rgba(255, 255, 255, 0.15);
+  border-radius: 0 0 12px 12px;
+  overflow: hidden;
+}
+
+.snackbar-progress i {
+  display: block;
+  height: 100%;
+  width: 100%;
+  background: #60a5fa;
+}
+
+#modal-ok.danger {
+  background: #dc2626 !important;
+  border-color: #dc2626 !important;
+  color: #fff !important;
+}
+
+/* 滑动条：数值在左，滑条在右 */
+.control input[type="range"] {
+  flex: 1;
+  min-width: 120px;
+}
+
+.range-value {
+  text-align: left;
+}
+
+/* 设置项：名称在左，控件在右 */
+.form-row > .control > .switch,
+.form-row > .control > button {
+  margin-left: auto;
+}
+
+/* 记忆统计托盘：每行 4 个小卡片，时间跨度占两行 */
+.stats-grid-mini {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+  padding-top: 10px;
+}
+
+.mini-card {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 8px 10px;
+  border-radius: 10px;
+  background: var(--surface-2);
+  min-height: 62px;
+}
+
+.mini-label {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.mini-value {
+  font-size: 16px;
+  font-weight: 700;
+}
+
+.mini-hint {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.time-span-card {
+  grid-column: 4;
+  grid-row: 1 / span 2;
+  justify-content: center;
+}
+
+@media (max-width: 560px) {
+  .stats-grid-mini {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .time-span-card {
+    grid-column: 2;
+    grid-row: 1 / span 2;
+  }
+}
+
+/* Snackbar：完全隐藏、撤销按钮黄色、进度条动画 */
+.snackbar {
+  bottom: 16px;
+  opacity: 0;
+  visibility: hidden;
+  transform: translateX(-50%) translateY(140%);
+  transition: transform 0.2s ease, opacity 0.2s ease, visibility 0.2s;
+}
+
+.snackbar.show {
+  opacity: 1;
+  visibility: visible;
+  transform: translateX(-50%) translateY(0);
+}
+
+.snackbar .link-btn {
+  color: #facc15;
+  background: transparent;
+  border: none;
+  padding: 0 4px;
+  margin-left: auto;
+}
+
+.snackbar-progress i {
+  width: 100%;
+}
+
+.snackbar-progress i.countdown {
+  animation: snackbar-countdown 4s linear forwards;
+}
+
+@keyframes snackbar-countdown {
+  from {
+    width: 100%;
+  }
+  to {
+    width: 0;
+  }
+}
+
+/* 窄屏也保持「名称在左、控件在右」，开关与名称垂直居中对齐 */
+@media (max-width: 720px) {
+  .form-row,
+  #global-form .form-row {
+    grid-template-columns: minmax(88px, 34%) minmax(0, 1fr);
+    gap: 10px;
+    align-items: center;
+  }
+
+  .form-row > label {
+    font-size: 13px;
+    line-height: 1.4;
+  }
+
+  .form-row > .control {
+    align-items: center;
+  }
+}
+
+/* 名称与控件顶对齐，带说明的开关行也能与名称居中对齐 */
+.form-row,
+#global-form .form-row {
+  align-items: start;
+}
+
+.form-row > label {
+  padding-top: 7px;
+}
+
+/* 设置项说明换行到控件下方，避免挤压开关/滑条 */
+.form-row > .control {
+  flex-wrap: wrap;
+}
+
+.form-row > .control > .field-hint {
+  flex-basis: 100%;
+  text-align: left;
+}
+
+/* 设置项注释独占一行，不要求与控件对齐 */
+.row-hint {
+  grid-column: 1 / -1;
+  margin: -2px 0 0;
+  font-size: 11.5px;
+  line-height: 1.55;
+  color: var(--muted);
+  word-break: break-word;
+}
+
+/* 嵌套配置区块：独立卡片 + 组名 */
+.form-group {
+  margin: 14px 0;
+  padding: 14px 16px;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: var(--surface);
+}
+
+.form-group > h4 {
+  font-size: 16px;
+  font-weight: 700;
+  color: var(--text);
+  text-transform: none;
+  letter-spacing: 0;
+  margin: 0 0 10px;
+}
+
+/* 滑条数值更紧凑、字号略大 */
+.form-row > .control {
+  gap: 6px;
+}
+
+.form-row > .control > .range-value,
+.range-value {
+  font-size: 15px;
+  min-width: 44px;
+  text-align: left;
+}
+
+.form-row.disabled-row {
+  opacity: 0.55;
+}
+
+/* 页面外层不再使用卡片，设置头部固定 */
+.group-editor {
+  background: transparent;
+  border: none;
+  box-shadow: none;
+  padding: 0;
+}
+
+.sticky-head {
+  position: sticky;
+  top: var(--topbar-h, 56px);
+  z-index: 20;
+  background: var(--bg);
+  padding: 10px 0 8px;
+  margin: -10px 0 0;
+  border-bottom: 1px solid var(--border);
+}
+
+/* 单层配置区块：一张卡片，无重复标题 */
+.form-group.section-card {
+  margin: 0;
+  padding: 4px 16px;
+}
+
+/* 开关：名称在左、开关在右；其他控件：名称在上、控件在下 */
+.form-row.row-switch {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+}
+
+.form-row.row-switch > label {
+  padding-top: 0;
+}
+
+.form-row.row-switch > .control {
+  width: auto;
+  justify-content: flex-end;
+}
+
+.form-row.row-switch > .control > .switch {
+  margin-left: auto;
+}
+
+.form-row.row-stack {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 6px;
+}
+
+.form-row.row-stack > label {
+  padding-top: 0;
+}
+
+.form-row.row-stack > .control {
+  width: 100%;
+  align-items: center;
+}
+
+/* 记忆列表：整行可点击，展开时高度过渡 */
+.mem-row {
+  cursor: pointer;
+}
+
+.mem-toggle {
+  border: none;
+  background: transparent;
+  box-shadow: none;
+  padding: 0;
+  width: 32px;
+  height: 32px;
+}
+
+.mem-toggle:hover {
+  background: transparent;
+}
+
+.mem-toggle .icon {
+  transition: transform 0.2s ease;
+}
+
+.mem-toggle.open .icon {
+  transform: rotate(90deg);
+}
+
+.mem-detail > td {
+  background: transparent;
+  padding: 0 !important;
+  border: none !important;
+}
+
+.mem-detail-body {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 0;
+  opacity: 0;
+  overflow: hidden;
+  padding: 0 14px;
+  transform: translateY(-4px);
+  transition:
+    max-height 0.28s ease,
+    opacity 0.2s ease,
+    padding 0.28s ease,
+    transform 0.28s ease;
+}
+
+.mem-detail.open .mem-detail-body {
+  max-height: 720px;
+  opacity: 1;
+  padding: 12px 14px;
+  transform: translateY(0);
+}
+
+.mem-detail-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.mem-detail-content {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.7;
+  color: var(--text);
+  word-break: break-word;
+}
+
+.mem-detail-actions {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+
+.mem-toggle-cell {
+  text-align: right;
+}
+
+.mem-toggle-cell .icon-btn {
+  margin-left: auto;
+}
+
+.table th.w-toggle {
+  text-align: right;
+}
+
+
+@media (max-width: 620px) {
+  .mem-row {
+    position: relative;
+    padding-right: 54px;
+  }
+
+  .mem-detail {
+    border: none !important;
+    background: transparent !important;
+    padding: 0 !important;
+    margin: 0 !important;
+  }
+
+  .mem-detail > td {
+    background: transparent !important;
+    padding: 0 !important;
+  }
+
+  .mem-row .mem-toggle-cell {
+    position: absolute;
+    top: 50%;
+    right: 10px;
+    width: auto;
+    padding: 0;
+    transform: translateY(-50%);
+  }
+
+  .mem-row .mem-toggle-cell::before {
+    content: none;
+  }
+
+  .mem-detail:not([hidden]) {
+    display: block;
+  }
+}

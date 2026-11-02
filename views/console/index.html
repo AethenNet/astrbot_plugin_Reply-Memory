@@ -5,7 +5,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>主动回复 · 控制台</title>
-    <link rel="stylesheet" href="./styles.css?v=19" />
+    <link rel="stylesheet" href="./styles.css?v=33" />
   </head>
   <body>
     <!-- 图标库（内联 SVG，避免依赖外部图标字体/emoji） -->
@@ -47,8 +47,12 @@
           </div>
         </div>
         <div class="topbar-right">
+          <button id="theme-btn" class="theme-btn" type="button" title="主题：跟随系统" aria-label="切换主题">
+            <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
+              <path id="theme-path" d="M4 3h16a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2ZM8 21h8M12 17v4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"></path>
+            </svg>
+          </button>
           <span id="theme-chip" class="chip">跟随面板</span>
-          <span id="tz-chip" class="chip mono">-</span>
         </div>
       </header>
 
@@ -78,11 +82,6 @@
 
         <div class="drawer-foot">
           <div class="drawer-foot-actions">
-            <button id="theme-btn" class="theme-btn" type="button" title="主题：跟随系统" aria-label="切换主题">
-              <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
-                <path id="theme-path" d="M4 3h16a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2ZM8 21h8M12 17v4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"></path>
-              </svg>
-            </button>
             <button id="drawer-settings" class="drawer-settings" title="直接修改插件全局配置"><svg class="icon" aria-hidden="true"><use href="#i-settings"></use></svg>全局设置</button>
             <button id="drawer-blocks" class="drawer-settings" title="管理用户屏蔽记录"><svg class="icon" aria-hidden="true"><use href="#i-shield"></use></svg>屏蔽设置</button>
           </div>
@@ -141,7 +140,7 @@
               </div>
             </aside>
 
-            <div class="group-editor card">
+            <div class="group-editor">
               <div id="group-empty" class="empty">
                 <div class="empty-icon"><svg class="icon" aria-hidden="true"><use href="#i-inbox"></use></svg></div>
                 <h3>选择一个群</h3>
@@ -153,6 +152,7 @@
               </div>
 
               <div id="group-panel" class="hidden">
+                <div class="sticky-head">
                 <div class="group-panel-head">
                   <img id="group-avatar" class="group-avatar" alt="" />
                   <div class="group-title-block">
@@ -177,7 +177,9 @@
                   <button class="tab active" data-tab="active_reply" role="tab" title="概率 / 模型判定、触发积累、黑白名单"><svg class="icon" aria-hidden="true"><use href="#i-message"></use></svg>消息主动回复</button>
                   <button class="tab" data-tab="group_context_enhancement" role="tab" title="群聊历史记录与注入、图片转述"><svg class="icon" aria-hidden="true"><use href="#i-layers"></use></svg>群聊上下文增强</button>
                   <button class="tab" data-tab="group_reply_enhancement" role="tab" title="React Pattern、角色显示、智能 @ 与引用"><svg class="icon" aria-hidden="true"><use href="#i-sparkles"></use></svg>群聊回复增强</button>
+                  <button class="tab" data-tab="memory_rag" role="tab" title="本群记忆 RAG 独立设置"><svg class="icon" aria-hidden="true"><use href="#i-database"></use></svg>记忆 RAG</button>
                   <button class="tab" data-tab="user_block" role="tab" title="本群单独屏蔽用户"><svg class="icon" aria-hidden="true"><use href="#i-shield"></use></svg>用户屏蔽</button>
+                </div>
                 </div>
 
                 <div id="group-form" class="form-body"></div>
@@ -213,28 +215,25 @@
             </div>
           </div>
 
-          <div id="rag-stats" class="status-grid"></div>
+          <div id="rag-stats-card" class="source-card" data-expanded="0"></div>
+          <div id="rag-source-card" class="source-card"></div>
 
           <div class="card">
-            <div class="filters">
+            <div class="filter-actions rag-actions">
+              <button id="rag-search" class="primary small-btn"><svg class="icon" aria-hidden="true"><use href="#i-search"></use></svg>筛选</button>
+              <button id="rag-reset" class="ghost small-btn"><svg class="icon" aria-hidden="true"><use href="#i-reset"></use></svg>重置</button>
+              <button id="rag-cleanup" class="ghost small-btn" title="规范化旧记录的时间元数据"><svg class="icon" aria-hidden="true"><use href="#i-trash"></use></svg>清理</button>
+              <button id="rag-selftest" class="ghost small-btn" title="写入→读回→检索→删除 一条测试记忆"><svg class="icon" aria-hidden="true"><use href="#i-shield"></use></svg>自检</button>
+            </div>
+            <div class="filters rag-filters">
               <label class="field">
                 <span>关键词 / ID</span>
                 <input id="rag-keyword" class="input" placeholder="按内容或 ID 搜索" />
               </label>
               <label class="field">
-                <span>群范围</span>
-                <select id="rag-scope" class="input"></select>
-              </label>
-              <label class="field">
                 <span>角色 ID</span>
                 <input id="rag-role" class="input mono" placeholder="可选" />
               </label>
-              <div class="filter-actions">
-                <button id="rag-search" class="primary small-btn"><svg class="icon" aria-hidden="true"><use href="#i-search"></use></svg>筛选</button>
-                <button id="rag-reset" class="ghost small-btn"><svg class="icon" aria-hidden="true"><use href="#i-reset"></use></svg>重置</button>
-                <button id="rag-cleanup" class="ghost small-btn" title="规范化旧记录的时间元数据"><svg class="icon" aria-hidden="true"><use href="#i-trash"></use></svg>清理</button>
-                <button id="rag-selftest" class="ghost small-btn" title="写入→读回→检索→删除 一条测试记忆"><svg class="icon" aria-hidden="true"><use href="#i-shield"></use></svg>自检</button>
-              </div>
             </div>
 
             <div class="table-wrap">
@@ -242,16 +241,13 @@
                 <thead>
                   <tr>
                     <th class="w-id">ID</th>
-                    <th>内容</th>
-                    <th class="w-scope">群范围</th>
-                    <th class="w-roles">角色</th>
-                    <th class="w-src">来源</th>
                     <th class="w-time">时间</th>
-                    <th class="w-act">操作</th>
+                    <th class="w-scope">群范围</th>
+                    <th class="w-toggle"></th>
                   </tr>
                 </thead>
                 <tbody id="rag-body">
-                  <tr><td colspan="7" class="muted center pad">暂无数据</td></tr>
+                  <tr><td colspan="4" class="muted center pad">暂无数据</td></tr>
                 </tbody>
               </table>
             </div>
@@ -334,7 +330,8 @@
             <h2>全局设置</h2>
             <p class="muted">直接修改插件的全局配置，保存后立即生效</p>
           </div>
-          <div class="card group-editor">
+          <div class="group-editor">
+            <div class="sticky-head">
             <div class="group-panel-head">
               <img class="group-avatar" src="./logo.png" alt="" />
               <div class="group-title-block">
@@ -349,6 +346,7 @@
             <p id="global-hint" class="muted small group-hint"></p>
 
             <div class="tabs" id="global-tabs" role="tablist"></div>
+            </div>
 
             <div id="global-form" class="form-body">
               <p class="muted small pad">正在加载配置…</p>
@@ -367,6 +365,45 @@
       <pre id="detail-body" class="detail-body mono"></pre>
     </aside>
 
+    <div id="filter-modal" class="modal" aria-hidden="true">
+      <div class="modal-card">
+        <h3>筛选记忆</h3>
+        <div class="filter-form">
+          <label>记忆来源
+            <select id="filter-type" class="input">
+              <option value="">全部来源</option>
+              <option value="personal">个人</option>
+              <option value="group">群聊</option>
+              <option value="private">私聊</option>
+              <option value="unknown">未知</option>
+            </select>
+          </label>
+          <label>群范围
+            <select id="filter-scope" class="input"></select>
+          </label>
+          <label>身份
+            <select id="filter-identity" class="input">
+              <option value="">全部身份</option>
+              <option value="owner">所有者</option>
+              <option value="group_owner">群主</option>
+              <option value="group_admin">群管理</option>
+              <option value="member">群成员</option>
+            </select>
+          </label>
+        </div>
+        <div class="modal-actions">
+          <button id="filter-cancel" class="ghost">取消</button>
+          <button id="filter-apply" class="primary">应用</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="snackbar" class="snackbar" role="status">
+      <span id="snackbar-text"></span>
+      <button id="snackbar-undo" class="link-btn" type="button">撤销</button>
+      <div class="snackbar-progress"><i id="snackbar-bar"></i></div>
+    </div>
+
     <div id="modal" class="modal" aria-hidden="true">
       <div class="modal-card">
         <p id="modal-text"></p>
@@ -378,6 +415,6 @@
     </div>
 
     <div id="toast" class="toast"></div>
-    <script type="module" src="./app.js?v=19"></script>
+    <script type="module" src="./app.js?v=33"></script>
   </body>
 </html>

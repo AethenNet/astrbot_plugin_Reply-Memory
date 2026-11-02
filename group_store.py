@@ -1,7 +1,7 @@
 """每个群的独立配置存储。
 
-覆盖项只包含"群内行为"相关的字段（主动回复 / 群聊上下文 / 群聊回复增强），
-联网搜索、记忆 RAG、超时等属于全局服务配置，不在群级覆盖范围内。
+覆盖项只包含"群内行为"相关的字段（主动回复 / 群聊上下文 / 群聊回复增强 / 记忆 RAG）；
+联网搜索、超时等属于全局服务配置，不在群级覆盖范围内。
 
 数据保存在 ``data/plugin_data/astrbot_plugin_active_reply/groups.json``，
 与 AstrBot 的插件配置分开，避免 Schema 变更时丢失群配置。
@@ -132,9 +132,22 @@ class GroupStore:
         if not group_id:
             raise ValueError("group_id 不能为空")
 
+        def _lookup(path: str) -> tuple[bool, Any]:
+            """在扁平或嵌套提交值中查找字段；缺失表示跟随全局。"""
+            if path in values:
+                return True, values[path]
+            current: Any = values
+            for key in path.split("."):
+                if not isinstance(current, dict) or key not in current:
+                    return False, None
+                current = current[key]
+            return True, current
+
         nested: dict[str, Any] = {}
         for spec in GROUP_OVERRIDE_FIELDS:
-            raw = values.get(spec.path, values.get(spec.path.split(".")[-1]))
+            present, raw = _lookup(spec.path)
+            if not present:
+                continue
             coerced = coerce_group_value(spec, raw)
             set_by_path(nested, spec.path, coerced)
 

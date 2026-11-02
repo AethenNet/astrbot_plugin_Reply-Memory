@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import time
 from collections import OrderedDict, defaultdict
 
 
@@ -21,8 +22,11 @@ class RuntimeState:
     def __init__(self) -> None:
         """创建所有以会话来源为键的进程内状态映射。"""
         # 按 unified_msg_origin 隔离会话相关数据，避免不同群的状态相互混用。
-        # 群聊历史文本（每条一行，已格式化）
+        # 群聊历史文本（每条一行，已格式化）——供对话/主动回复使用
         self.session_chats: dict[str, list[str]] = defaultdict(list)
+        # 记忆专用历史：始终包含完整日期、发送者 ID 与原始引用/@ 标记，
+        # 不随对话上下文的格式开关变化，避免记忆时间/发言者被改写。
+        self.memory_chats: dict[str, list[str]] = defaultdict(list)
         # 消息 ID -> 发送者 ID，用于校验 @ / 引用的目标是否真实存在
         self.message_senders: dict[str, OrderedDict[str, str]] = defaultdict(
             OrderedDict
@@ -43,6 +47,12 @@ class RuntimeState:
         self.pending_report: dict[str, dict] = {}
         # 本轮执行日志
         self.turn_logs: dict[str, list[str]] = defaultdict(list)
+        # 最近一条消息时间，用于按对话间隔切窗
+        self.last_chat_at: dict[str, float] = {}
+        # 上次已总结到的最后一条消息 ID，避免窗口重叠重复写入
+        self.last_extract_msg: dict[str, str] = {}
+        # 本轮开始时间（用于截取插件运行日志）
+        self.turn_started_at: dict[str, float] = {}
         # 自动记忆：抽取计数与上次抽取时间
         self.extract_counters: dict[str, int] = defaultdict(int)
         self.last_extract_at: dict[str, float] = {}
@@ -56,12 +66,14 @@ class RuntimeState:
         """从各状态容器中移除指定来源的数据，不触碰长期存储。"""
         # 清除来源关联的所有短期数据；debug_origins 的生命周期由插件管理。
         self.session_chats.pop(origin, None)
+        self.memory_chats.pop(origin, None)
         self.message_senders.pop(origin, None)
         self.image_registry.pop(origin, None)
         self.sender_names.pop(origin, None)
         self.reply_counters.pop(origin, None)
         self.turn_usage.pop(origin, None)
         self.turn_logs.pop(origin, None)
+        self.turn_started_at.pop(origin, None)
         self.pending_report.pop(origin, None)
         self.extract_counters.pop(origin, None)
         self.last_extract_at.pop(origin, None)
@@ -88,6 +100,7 @@ class RuntimeState:
     # ------------------------------------------------------------------ #
     def reset_turn(self, origin: str) -> None:
         """新的一轮开始：清空用量与执行日志。"""
+        self.turn_started_at[origin] = time.time()
         self.turn_usage[origin] = {
             "input_cached": 0,
             "input_other": 0,
@@ -142,6 +155,18 @@ class RuntimeState:
     # ------------------------------------------------------------------ #
     # 便捷读写
     # ------------------------------------------------------------------ #
+    def append_memory_chat(self, origin: str, line: str, max_messages: int) -> None:
+        """追加记忆专用历史，并只保留最近 max_messages 条。"""
+        chats = self.memory_chats[origin]
+        chats.append(line)
+        limit = max(10, int(max_messages))
+        if len(chats) > limit:
+            del chats[: len(chats) - limit]
+
+    def memory_history(self, origin: str) -> list[str]:
+        """返回记忆历史；升级后尚未产生新记忆行时回退到对话历史。"""
+        return self.memory_chats.get(origin) or self.session_chats.get(origin) or []
+
     def append_chat(self, origin: str, line: str, max_messages: int) -> str:
         """追加一条已格式化的历史行，并将列表裁剪到指定长度。
 

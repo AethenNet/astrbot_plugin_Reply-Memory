@@ -12,7 +12,7 @@
  * 已持久化数据。各视图函数只负责当前页面区域，避免一次操作重建无关页面。
  */
 
-const UI_BUILD = 19;
+const UI_BUILD = 20;
 console.info(`[ActiveReply] UI build ${UI_BUILD}`);
 
 const bridge = window.AstrBotPluginView || window.AstrBotPluginPage || null;
@@ -51,6 +51,8 @@ const state = {
     keyword: "",
     scope: "",
     role: "",
+    memoryType: "",
+    identity: "",
     scopes: [],
   },
 };
@@ -86,6 +88,11 @@ const FIELD_GROUPS = [
     tab: "group_reply_enhancement",
     title: "群聊回复增强",
   },
+  {
+    prefix: "memory_rag.",
+    tab: "memory_rag",
+    title: "记忆 RAG",
+  },
 ];
 
 /** 通过元素 ID 获取控制台节点，减少重复的 DOM 查询写法。 */
@@ -114,7 +121,7 @@ let toastTimer = null;
  * 页面运行在受限 iframe 中，window.confirm 可能被禁用，
  * 因此用页面内的弹窗代替。
  */
-function askConfirm(message) {
+function askConfirm(message, options = {}) {
   return new Promise((resolve) => {
     $("modal-text").textContent = message;
     const modal = $("modal");
@@ -122,6 +129,7 @@ function askConfirm(message) {
     modal.setAttribute("aria-hidden", "false");
     const okBtn = $("modal-ok");
     const cancelBtn = $("modal-cancel");
+    okBtn.classList.toggle("danger", Boolean(options.danger));
     const finish = (value) => {
       modal.classList.remove("open");
       modal.setAttribute("aria-hidden", "true");
@@ -134,6 +142,22 @@ function askConfirm(message) {
     okBtn.addEventListener("click", onOk);
     cancelBtn.addEventListener("click", onCancel);
   });
+}
+
+/** 切 Tab 后把 Tab 下方的设置内容滚到顶栏下方。 */
+function scrollPageTop() {
+  const view = document.querySelector(".view.active") || document;
+  const form = view.querySelector("#global-form, #group-form, .form-body");
+  if (!form) {
+    window.scrollTo({ top: 0, behavior: "smooth" });
+    return;
+  }
+  try {
+    form.scrollIntoView({ behavior: "smooth", block: "start" });
+  } catch (error) {
+    const y = form.getBoundingClientRect().top + window.scrollY - 200;
+    window.scrollTo({ top: Math.max(0, y), behavior: "smooth" });
+  }
 }
 
 /** 显示短暂的成功或错误提示，并重置之前启动的隐藏计时器。 */
@@ -310,6 +334,7 @@ function cycleTheme() {
 /** 切换主视图与导航选中态，并按页面类型触发对应数据加载。 */
 function switchView(name) {
   state.view = name;
+  scrollPageTop();
   document.querySelectorAll(".view").forEach((node) => {
     node.classList.toggle("active", node.id === `view-${name}`);
   });
@@ -456,7 +481,7 @@ async function loadOverview(force = false) {
 function renderOverview(data) {
   const s = data.switches || {};
   const stats = data.stats || {};
-  $("tz-chip").textContent = data.timezone || "-";
+  // 时区展示已移除
   $("drawer-version").textContent = `v${data.version || "-"} · UI${UI_BUILD}`;
 
   const modeLabel = s.mode === "model_choice" ? "模型判定" : "概率";
@@ -724,9 +749,9 @@ function buildControl(field, value) {
   if (field.kind === "int" || field.kind === "float") {
     const step = field.step || (field.kind === "int" ? 1 : 0.1);
     return `
+      <span class="range-value" data-for="${path}">${value}</span>
       <input type="range" data-path="${path}" data-kind="${field.kind}"
-        min="${field.min}" max="${field.max}" step="${step}" value="${value}" />
-      <span class="range-value" data-for="${path}">${value}</span>`;
+        min="${field.min}" max="${field.max}" step="${step}" value="${value}" />`;
   }
   if (field.kind === "text") {
     return `<textarea data-path="${path}" data-kind="text">${escapeHtml(value || "")}</textarea>`;
@@ -759,26 +784,28 @@ function renderGroupPanel() {
     const rows = fields
       .map(
         (field) => `
-        <div class="form-row" data-row="${field.path}" ${
+        <div class="form-row row-${
+          field.kind === "bool" ? "switch" : "stack"
+        }" data-row="${field.path}" ${
           fieldVisible(field, values) ? "" : 'style="display:none"'
         }>
           <label>${escapeHtml(field.label)}</label>
-          <div class="control">${buildControl(field, values[field.path])}${
+          <div class="control">${buildControl(field, values[field.path])}</div>
+          ${
             field.hint
-              ? `<span class="field-hint">${escapeHtml(cleanHint(field.hint))}</span>`
+              ? `<p class="row-hint">${escapeHtml(cleanHint(field.hint))}</p>`
               : ""
-          }</div>
+          }
         </div>`
       )
       .join("");
     return `<div class="tab-panel ${
       state.currentTab === group.tab ? "active" : ""
-    }" data-panel="${group.tab}"><h4>${escapeHtml(group.title)}</h4>${rows}</div>`;
+    }" data-panel="${group.tab}"><div class="form-group section-card">${rows}</div></div>`;
   }).join("");
 
   const blockPanel = `
     <div class="tab-panel ${state.currentTab === "user_block" ? "active" : ""}" data-panel="user_block">
-      <h4>用户屏蔽</h4>
       <p class="muted small">只作用于本群，被屏蔽用户的消息会被直接忽略</p>
       <div class="block-form compact">
         <label class="block-field"><span>用户 ID</span>
@@ -850,6 +877,7 @@ function playTabSwitch(el) {
 /** 更新群级配置 Tab 与对应内容面板的活动状态。 */
 function switchTab(name) {
   state.currentTab = name;
+  scrollPageTop();
   document.querySelectorAll("#group-tabs .tab").forEach((tab) => {
     tab.classList.toggle("active", tab.dataset.tab === name);
   });
@@ -1038,9 +1066,9 @@ function buildSchemaControl(meta, value, path) {
     const max = Number(slider.max ?? 100);
     const step = Number(slider.step ?? (type === "int" ? 1 : 0.1));
     return `
+      <span class="range-value" data-for-global="${path}">${value ?? min}</span>
       <input type="range" data-global-path="${path}" data-global-type="${type}"
-        min="${min}" max="${max}" step="${step}" value="${value ?? min}" />
-      <span class="range-value" data-for-global="${path}">${value ?? min}</span>`;
+        min="${min}" max="${max}" step="${step}" value="${value ?? min}" />`;
   }
   if (type === "text") {
     return `<textarea data-global-path="${path}" data-global-type="text">${escapeHtml(
@@ -1089,12 +1117,15 @@ function renderSchemaBlock(schema, scopeValues, prefix) {
       : "";
     const style = visible ? "" : ' style="display:none"';
     const hint = meta.hint
-      ? `<span class="field-hint">${escapeHtml(cleanHint(meta.hint))}</span>`
+      ? `<p class="row-hint">${escapeHtml(cleanHint(meta.hint))}</p>`
       : "";
     html += `
-      <div class="form-row" data-global-row="${path}"${condAttr}${style}>
+      <div class="form-row ${
+        meta.type === "bool" ? "row-switch" : "row-stack"
+      }" data-global-row="${path}"${condAttr}${style}>
         <label>${escapeHtml(meta.description || key)}</label>
-        <div class="control">${buildSchemaControl(meta, scopeValues[key], path)}${hint}</div>
+        <div class="control">${buildSchemaControl(meta, scopeValues[key], path)}</div>
+        ${hint}
       </div>`;
   }
   return html;
@@ -1157,6 +1188,34 @@ function bindGlobalInputs() {
       input.addEventListener("input", rerun);
     }
   });
+  document.querySelectorAll("#global-form [data-global-path]").forEach((input) => {
+    if (
+      input.dataset.globalPath.endsWith("memory_control.enable") ||
+      input.dataset.globalPath === "memory_rag.enable"
+    ) {
+      input.addEventListener("change", syncMemoryMaster);
+    }
+  });
+  syncMemoryMaster();
+}
+
+/** 记忆总开关：关闭时禁用记忆 RAG 下的其他控件。 */
+function syncMemoryMaster() {
+  const master =
+    document.querySelector(
+      '#global-form [data-global-path="memory_rag.memory_control.enable"]'
+    ) ||
+    document.querySelector('#global-form [data-global-path="memory_rag.enable"]');
+  if (!master) return;
+  const disabled = !master.checked;
+  document
+    .querySelectorAll('#global-form [data-global-path^="memory_rag."]')
+    .forEach((input) => {
+      if (input === master) return;
+      input.disabled = disabled;
+      const row = input.closest(".form-row");
+      if (row) row.classList.toggle("disabled-row", disabled);
+    });
 }
 
 /** 从加载的 schema 中提取可作为一级 Tab 的对象配置区块。 */
@@ -1169,6 +1228,7 @@ function globalSections() {
 /** 切换全局设置的活动 Tab 和相应配置面板。 */
 function switchGlobalTab(key) {
   state.globalTab = key;
+  scrollPageTop();
   document.querySelectorAll("#global-tabs .tab").forEach((tab) => {
     tab.classList.toggle("active", tab.dataset.gtab === key);
   });
@@ -1202,11 +1262,15 @@ function renderGlobalForm() {
         state.globalValues[key] && typeof state.globalValues[key] === "object"
           ? state.globalValues[key]
           : {};
+      const body = renderSchemaBlock(meta.items, scope, key);
+      const nested = Object.values(meta.items || {}).some(
+        (item) => item && item.type === "object" && item.items
+      );
       return `<div class="tab-panel ${
         index === 0 ? "active" : ""
-      }" data-gpanel="${escapeHtml(key)}"><h4>${escapeHtml(
-        meta.description || key
-      )}</h4>${renderSchemaBlock(meta.items, scope, key)}</div>`;
+      }" data-gpanel="${escapeHtml(key)}">${
+        nested ? body : `<div class="form-group section-card">${body}</div>`
+      }</div>`;
     })
     .join("");
 
@@ -1329,81 +1393,246 @@ async function loadRagStats(updateScopes = false) {
     const stats = data.stats || {};
     if (updateScopes) {
       state.rag.scopes = data.group_scopes || [];
-      const select = $("rag-scope");
-      const current = state.rag.scope;
-      select.innerHTML = [
-        `<option value="">全部群范围</option>`,
-        ...state.rag.scopes.map(
-          (scope) =>
-            `<option value="${escapeHtml(scope)}" ${
-              scope === current ? "selected" : ""
-            }>${escapeHtml(scope)}</option>`
-        ),
-      ].join("");
+      const select = $("filter-scope");
+      if (select) {
+        select.innerHTML = [
+          `<option value="">全部群范围</option>`,
+          ...state.rag.scopes.map(
+            (scope) =>
+              `<option value="${escapeHtml(scope)}">${escapeHtml(scope)}</option>`
+          ),
+        ].join("");
+      }
     }
-    $("rag-stats").innerHTML = [
-      statusCard("记忆总数", formatNumber(stats.total_memories), "全部群"),
-      statusCard("群范围数", formatNumber(stats.group_scope_count), "不同 scope"),
-      statusCard("角色数", formatNumber(stats.role_count), "关联角色 ID"),
-      statusCard(
-        "时间跨度",
-        stats.oldest_memory_time_iso
-          ? `${String(stats.oldest_memory_time_iso).slice(0, 10)} 起`
-          : "-",
-        stats.latest_memory_time_iso
-          ? `最近 ${String(stats.latest_memory_time_iso).slice(0, 10)}`
-          : "暂无记录"
-      ),
-    ].join("");
+    renderStatsTray(stats);
+    renderSourceCard(stats);
   } catch (error) {
     toast(error.message || "加载记忆统计失败", true);
   }
 }
 
+/** 渲染「记忆统计」托盘：默认折叠，展开后 4 列小卡片。 */
+function renderStatsTray(stats) {
+  const card = $("rag-stats-card");
+  if (!card) return;
+  const sources = stats.source_counts || {};
+  const span = stats.oldest_memory_time_iso
+    ? `${String(stats.oldest_memory_time_iso).slice(0, 10)} 起`
+    : "-";
+  const items = [
+    ["记忆总数", formatNumber(stats.total_memories), ""],
+    ["群范围数", formatNumber(stats.group_scope_count), "不同 scope"],
+    ["角色数", formatNumber(stats.role_count), "关联角色 ID"],
+    ["今日新增", formatNumber(stats.today), ""],
+    ["关键词记忆", formatNumber(sources.keyword), ""],
+    ["模型抽取", formatNumber(sources.model), ""],
+  ];
+  const expanded = card.dataset.expanded === "1";
+  card.innerHTML = `
+    <button id="stats-card-toggle" class="source-card-head" type="button">
+      <span><b>记忆统计</b><span class="muted small">总数 / 来源 / 时间跨度</span></span>
+      <span class="pill">${formatNumber(stats.total_memories)} 条</span>
+      <svg class="icon source-caret" aria-hidden="true"><use href="#i-arrow-right"></use></svg>
+    </button>
+    <div class="source-tray ${expanded ? "open" : ""}">
+      <div class="stats-grid-mini">
+        <div class="mini-card time-span-card">
+          <span class="mini-label">时间跨度</span>
+          <b class="mini-value">${escapeHtml(span)}</b>
+          <span class="mini-hint">${escapeHtml(
+            stats.latest_memory_time_iso
+              ? `最近 ${String(stats.latest_memory_time_iso).slice(0, 10)}`
+              : "暂无记录"
+          )}</span>
+        </div>
+        ${items
+          .map(
+            ([label, value, hint]) => `
+          <div class="mini-card">
+            <span class="mini-label">${label}</span>
+            <b class="mini-value">${value}</b>
+            ${hint ? `<span class="mini-hint">${hint}</span>` : ""}
+          </div>`
+          )
+          .join("")}
+      </div>
+    </div>`;
+  $("stats-card-toggle").addEventListener("click", () => {
+    const next = card.dataset.expanded !== "1";
+    card.dataset.expanded = next ? "1" : "0";
+    card.querySelector(".source-tray").classList.toggle("open", next);
+  });
+}
+
+/** 渲染「记忆来源」卡片与可展开托盘。 */
+function renderSourceCard(stats) {
+  const card = $("rag-source-card");
+  if (!card) return;
+  const types = stats.type_counts || {};
+  const rows = [
+    ["个人", Number(types.personal || 0), "personal"],
+    ["群聊", Number(types.group || 0), "group"],
+    ["私聊", Number(types.private || 0), "private"],
+    ["未知", Number(types.unknown || 0), "unknown"],
+  ];
+  const total = rows.reduce((sum, row) => sum + row[1], 0) || 1;
+  const expanded = card.dataset.expanded === "1";
+  card.innerHTML = `
+    <button id="source-card-toggle" class="source-card-head" type="button">
+      <span><b>记忆来源</b><span class="muted small">个人 / 群聊 / 私聊 / 未知</span></span>
+      <span class="pill">${formatNumber(total)} 条</span>
+      <svg class="icon source-caret" aria-hidden="true"><use href="#i-arrow-right"></use></svg>
+    </button>
+    <div class="source-tray ${expanded ? "open" : ""}">
+      ${rows
+        .map(
+          ([label, count, kind]) => `
+        <div class="source-row">
+          <span class="source-dot ${kind}"></span>
+          <span class="source-label">${label}</span>
+          <span class="source-count">${formatNumber(count)}</span>
+          <span class="source-bar"><i class="${kind}" style="width:${(count / total) * 100}%"></i></span>
+        </div>`
+        )
+        .join("")}
+    </div>`;
+  $("source-card-toggle").addEventListener("click", () => {
+    const next = card.dataset.expanded !== "1";
+    card.dataset.expanded = next ? "1" : "0";
+    card.querySelector(".source-tray").classList.toggle("open", next);
+  });
+}
+
 /** 渲染分页记忆记录，并为详情与删除按钮绑定对应操作。 */
 function renderRagRows(items) {
   const body = $("rag-body");
+  const roleLabels = {
+    owner: "所有者",
+    group_owner: "群主",
+    group_admin: "群管理",
+    member: "群成员",
+  };
+  const typeLabels = {
+    personal: "个人",
+    group: "群聊",
+    private: "私聊",
+  };
   if (!Array.isArray(items) || !items.length) {
     body.innerHTML =
-      '<tr><td colspan="7" class="muted center pad">当前筛选条件下没有记忆</td></tr>';
+      '<tr><td colspan="4" class="muted center pad">当前筛选条件下没有记忆</td></tr>';
     return;
   }
   body.innerHTML = items
-    .map(
-      (item) => `
-      <tr>
+    .map((item) => {
+      const role = item.sender_role || "member";
+      const type = item.memory_type || "group";
+      const superseded = item.superseded_by
+        ? '<span class="pill type-invalid">已失效</span>'
+        : "";
+      const time = escapeHtml(
+        (item.memory_time_iso || "-").replace("T", " ").slice(0, 19)
+      );
+      const meta = item.extra_metadata || {};
+      const identities = { ...(meta.role_identities || {}) };
+      if (item.sender_id && item.sender_role) {
+        identities[item.sender_id] = item.sender_role;
+      }
+      const roleText = (item.related_role_ids || [])
+        .map((id) => `${roleLabels[identities[id] || "member"] || "群成员"} ${id}`)
+        .join("、");
+      const confidence =
+        meta.confidence !== undefined && meta.confidence !== null
+          ? Number(meta.confidence).toFixed(2)
+          : "-";
+      return `
+      <tr class="mem-row" data-mem-row="${escapeHtml(item.memory_id)}">
         <td class="mono" data-label="ID">${escapeHtml(item.memory_id)}</td>
-        <td data-label="内容" title="${escapeHtml(item.content)}">${escapeHtml(clip(item.content))}</td>
+        <td class="mono small" data-label="时间">${time}</td>
         <td class="mono" data-label="群范围">${escapeHtml(item.group_scope || "-")}</td>
-        <td data-label="角色">${
-          (item.related_role_ids || [])
-            .map((role) => `<span class="pill mono">${escapeHtml(role)}</span>`)
-            .join("") || '<span class="muted">-</span>'
-        }</td>
-        <td data-label="来源"><span class="pill source-pill">${autoSourceLabel(
-          item.source
-        )}</span></td>
-        <td class="mono small" data-label="时间">${escapeHtml(
-          (item.memory_time_iso || "-").replace("T", " ").slice(0, 19)
-        )}</td>
-        <td>
-          <div class="actions">
-            <button class="link-btn" data-detail="${escapeHtml(item.memory_id)}">${icon("eye")}详情</button>
-            <button class="link-btn danger" data-delete="${escapeHtml(
-              item.memory_id
-            )}">${icon("trash")}删除</button>
+        <td class="mem-toggle-cell">
+          <button class="icon-btn mem-toggle" type="button" data-toggle="${escapeHtml(
+            item.memory_id
+          )}" aria-label="展开记忆"><svg class="icon" aria-hidden="true"><use href="#i-arrow-right"></use></svg></button>
+        </td>
+      </tr>
+      <tr class="mem-detail" data-mem-detail="${escapeHtml(item.memory_id)}">
+        <td colspan="4">
+          <div class="mem-detail-body">
+            <div class="mem-detail-meta">
+              <span class="pill type-${type}">${typeLabels[type] || "未知"}</span>
+              ${superseded}
+              <span class="muted small">置信度：${confidence}</span>
+              <span class="muted small">角色：${roleText || "-"}</span>
+            </div>
+            <p class="mem-detail-content">${escapeHtml(item.content)}</p>
+            <div class="mem-detail-actions">
+              <button class="link-btn" data-detail="${escapeHtml(item.memory_id)}">${icon(
+                "eye"
+              )}详情</button>
+              <button class="link-btn" data-source="${escapeHtml(item.memory_id)}">${icon(
+                "inbox"
+              )}原始消息</button>
+              <button class="link-btn danger" data-delete="${escapeHtml(
+                item.memory_id
+              )}">${icon("trash")}删除</button>
+            </div>
           </div>
         </td>
-      </tr>`
-    )
+      </tr>`;
+    })
     .join("");
 
+  body.querySelectorAll(".mem-row").forEach((row) => {
+    row.addEventListener("click", () => {
+      const detail = body.querySelector(
+        `[data-mem-detail="${CSS.escape(row.dataset.memRow)}"]`
+      );
+      if (!detail) return;
+      const open = !detail.classList.contains("open");
+      detail.classList.toggle("open", open);
+      row.querySelector(".mem-toggle")?.classList.toggle("open", open);
+    });
+  });
   body.querySelectorAll("[data-detail]").forEach((btn) => {
     btn.addEventListener("click", () => void showMemory(btn.dataset.detail));
+  });
+  body.querySelectorAll("[data-source]").forEach((btn) => {
+    btn.addEventListener("click", () => void showSource(btn.dataset.source));
   });
   body.querySelectorAll("[data-delete]").forEach((btn) => {
     btn.addEventListener("click", () => void deleteMemory(btn.dataset.delete));
   });
+}
+
+/** 展示记忆关联的原始消息证据。 */
+async function showSource(memoryId) {
+  try {
+    const item = await callApi("GET", `rag/${encodeURIComponent(memoryId)}`);
+    const meta = item.extra_metadata || {};
+    const quotes = meta.quotes || (meta.evidence ? [meta.evidence] : []);
+    const sourceMessages = Array.isArray(meta.source_messages)
+      ? meta.source_messages
+      : [];
+    const lines = [
+      `记忆 ID：${item.memory_id}`,
+      `来源消息 ID：${item.source_msg_id || "-"}`,
+      `发送者：${item.sender_id || "-"}`,
+      `记忆时间：${item.memory_time_iso || "-"}`,
+      "",
+      "原始消息记录：",
+      ...(sourceMessages.length
+        ? sourceMessages
+        : quotes.length
+        ? quotes.map((quote) => `- ${quote}`)
+        : ["（未记录原文）"]),
+    ];
+    $("detail-title").textContent = "原始消息";
+    $("detail-body").textContent = lines.join("\n");
+    $("detail").classList.add("open");
+    $("detail").setAttribute("aria-hidden", "false");
+  } catch (error) {
+    toast(error.message || "读取原始消息失败", true);
+  }
 }
 
 const AUTO_SCOPE_LABELS = {
@@ -1629,18 +1858,20 @@ async function loadAutoMemory() {
 /** 展示自动记忆参数、开关状态和关键词/模型的记忆数量统计。 */
 function renderAutoMemory(data) {
   if (!data) return;
+  const memoryEnabled = data.memory_enabled !== false;
   const enabled = Boolean(data.enabled);
   const status = $("auto-memory-status");
-  status.textContent = enabled ? "已开启" : "已关闭";
-  status.className = `pill ${enabled ? "" : "muted-pill"}`;
+  status.textContent = memoryEnabled ? (enabled ? "已开启" : "已关闭") : "记忆未启用";
+  status.className = `pill ${enabled && memoryEnabled ? "" : "muted-pill"}`;
   const toggle = $("auto-memory-toggle");
-  toggle.textContent = enabled ? "关闭" : "开启";
+  toggle.textContent = memoryEnabled ? (enabled ? "关闭" : "开启") : "未启用";
+  toggle.disabled = !memoryEnabled;
   const provider = data.provider_id ? data.provider_id : "跟随当前会话模型";
-  const stats = data.stats || {};
   const rows = [
     ["抽取模型", provider],
-    ["抽取频率", `${data.every_n} 条 / ${data.interval_minutes} 分钟`],
-    ["回看窗口", `最近 ${data.window} 条消息`],
+    ["累计消息记忆", `冷却后总结最近 ${data.batch_messages} 条`],
+    ["抽取间隔", `${data.interval_minutes} 分钟`],
+    ["私聊抽取频率", `每 ${data.private_every_n} 条`],
     ["最低置信度", Number(data.min_confidence).toFixed(2)],
     ["记忆作用域", AUTO_SCOPE_LABELS[data.scope] || data.scope || "-"],
   ];
@@ -1656,12 +1887,7 @@ function renderAutoMemory(data) {
         )
         .join("")}
     </div>
-    <div class="auto-memory-stats">
-      <span>关键词记忆 <b>${formatNumber(stats.keyword || 0)}</b></span>
-      <span>模型抽取 <b>${formatNumber(stats.model || 0)}</b></span>
-      <span>今日新增 <b>${formatNumber(stats.today || 0)}</b></span>
-      <span>记忆总数 <b>${formatNumber(stats.total || 0)}</b></span>
-    </div>`;
+    `;
 }
 
 /** 切换自动记忆开关并刷新面板及记忆统计。 */
@@ -1693,6 +1919,8 @@ async function loadRagList() {
   if (state.rag.keyword) params.keyword = state.rag.keyword;
   if (state.rag.scope) params.group_scope = state.rag.scope;
   if (state.rag.role) params.role_id = state.rag.role;
+  if (state.rag.memoryType) params.memory_type = state.rag.memoryType;
+  if (state.rag.identity) params.identity = state.rag.identity;
   try {
     const data = await callApi("GET", "rag/list", params);
     state.rag.total = Number(data.total || 0);
@@ -1728,18 +1956,83 @@ function closeDetail() {
   $("detail").setAttribute("aria-hidden", "true");
 }
 
-/** 确认删除指定记忆，并在成功后更新统计与当前列表。 */
+let snackbarTimer = null;
+let snackbarTrash = null;
+
+/** 显示带撤销按钮的 Snackbar，并用 4 秒进度条提示剩余时间。 */
+function showSnackbar(text, trashId = null) {
+  const bar = $("snackbar-bar");
+  $("snackbar-text").textContent = text;
+  $("snackbar").classList.add("show");
+  snackbarTrash = trashId;
+  if (bar) {
+    bar.classList.remove("countdown");
+    bar.style.width = "";
+    void bar.offsetWidth;
+    bar.classList.add("countdown");
+  }
+  clearTimeout(snackbarTimer);
+  snackbarTimer = setTimeout(hideSnackbar, 4000);
+}
+
+function hideSnackbar() {
+  $("snackbar").classList.remove("show");
+  const bar = $("snackbar-bar");
+  if (bar) bar.classList.remove("countdown");
+  snackbarTrash = null;
+}
+
+async function undoDelete() {
+  if (!snackbarTrash) {
+    hideSnackbar();
+    return;
+  }
+  const trashId = snackbarTrash;
+  hideSnackbar();
+  try {
+    await callApi("POST", "rag/restore", { trash_id: trashId });
+    toast("已撤销删除");
+    await loadRagStats(false);
+    await loadRagList();
+  } catch (error) {
+    toast(error.message || "撤销失败", true);
+  }
+}
+
+/** 确认删除指定记忆，成功后显示可撤销 Snackbar。 */
 async function deleteMemory(memoryId) {
-  const confirmed = await askConfirm(`确定删除记忆 ${memoryId}？该操作不可恢复`);
+  const confirmed = await askConfirm(`确定删除记忆 ${memoryId}？`, {
+    danger: true,
+  });
   if (!confirmed) return;
   try {
-    await callApi("POST", `rag/${encodeURIComponent(memoryId)}/delete`, {});
-    toast(`已删除记忆 ${memoryId}`);
+    const data = await callApi(
+      "POST",
+      `rag/${encodeURIComponent(memoryId)}/delete`,
+      {}
+    );
+    showSnackbar(`已删除记忆 ${memoryId}`, data.trash_id);
     await loadRagStats(false);
     await loadRagList();
   } catch (error) {
     toast(error.message || "删除失败", true);
   }
+}
+
+/** 打开筛选弹窗，回填当前筛选条件。 */
+function openFilterModal() {
+  $("filter-type").value = state.rag.memoryType;
+  $("filter-scope").value = state.rag.scope;
+  $("filter-identity").value = state.rag.identity;
+  const modal = $("filter-modal");
+  modal.classList.add("open");
+  modal.setAttribute("aria-hidden", "false");
+}
+
+function closeFilterModal() {
+  const modal = $("filter-modal");
+  modal.classList.remove("open");
+  modal.setAttribute("aria-hidden", "true");
 }
 
 /** 执行记忆 RAG 后端自检并在详情抽屉展示各步骤结果。 */
@@ -1991,20 +2284,27 @@ function bindEvents() {
   $("save-global").addEventListener("click", () => void saveGlobal());
   $("reset-global").addEventListener("click", () => resetGlobalDefaults());
 
-  $("rag-search").addEventListener("click", () => {
+  $("rag-search").addEventListener("click", () => openFilterModal());
+  $("filter-apply").addEventListener("click", () => {
+    state.rag.memoryType = $("filter-type").value;
+    state.rag.scope = $("filter-scope").value;
+    state.rag.identity = $("filter-identity").value;
     state.rag.keyword = $("rag-keyword").value.trim();
-    state.rag.scope = $("rag-scope").value;
     state.rag.role = $("rag-role").value.trim();
     state.rag.page = 1;
+    closeFilterModal();
     void loadRagList();
   });
+  $("filter-cancel").addEventListener("click", closeFilterModal);
+  $("snackbar-undo").addEventListener("click", () => void undoDelete());
   $("rag-reset").addEventListener("click", () => {
     $("rag-keyword").value = "";
-    $("rag-scope").value = "";
     $("rag-role").value = "";
     state.rag.keyword = "";
     state.rag.scope = "";
     state.rag.role = "";
+    state.rag.memoryType = "";
+    state.rag.identity = "";
     state.rag.page = 1;
     void loadRagList();
   });
@@ -2061,6 +2361,13 @@ function bindEvents() {
 /* ------------------------------------------------------------------ */
 /** 等待 AstrBot bridge、注册主题变化监听，再进入状态概览页。 */
 async function init() {
+  const topbar = document.querySelector(".topbar");
+  if (topbar) {
+    document.documentElement.style.setProperty(
+      "--topbar-h",
+      `${topbar.offsetHeight}px`
+    );
+  }
   bindEvents();
   state.themeMode = loadThemeMode();
   state.systemDark =

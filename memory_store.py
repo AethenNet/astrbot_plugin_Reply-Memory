@@ -103,8 +103,40 @@ class MemoryStore:
                 CREATE INDEX IF NOT EXISTS idx_memories_platform ON memories(platform_id);
                 CREATE INDEX IF NOT EXISTS idx_roles_role ON memory_roles(role_id);
                 CREATE INDEX IF NOT EXISTS idx_roles_memory ON memory_roles(memory_id);
+
+                CREATE TABLE IF NOT EXISTS memory_trash (
+                    trash_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    original_id INTEGER NOT NULL,
+                    payload TEXT NOT NULL,
+                    roles TEXT NOT NULL DEFAULT '[]',
+                    deleted_at REAL NOT NULL
+                );
                 """
             )
+            self._ensure_columns(conn)
+
+    _EXTRA_COLUMNS = {
+        "memory_type": "TEXT NOT NULL DEFAULT 'group'",
+        "sender_id": "TEXT NOT NULL DEFAULT ''",
+        "sender_role": "TEXT NOT NULL DEFAULT 'member'",
+        "source_msg_id": "TEXT NOT NULL DEFAULT ''",
+        "source_time": "REAL NOT NULL DEFAULT 0",
+        "importance": "REAL NOT NULL DEFAULT 0.5",
+        "last_access": "REAL NOT NULL DEFAULT 0",
+        "access_count": "INTEGER NOT NULL DEFAULT 0",
+        "superseded_by": "INTEGER DEFAULT NULL",
+        "archived": "INTEGER NOT NULL DEFAULT 0",
+    }
+
+    def _ensure_columns(self, conn: sqlite3.Connection) -> None:
+        """为旧版数据库补齐新增字段（幂等）。"""
+        existing = {
+            str(row["name"])
+            for row in conn.execute("PRAGMA table_info(memories)").fetchall()
+        }
+        for name, ddl in self._EXTRA_COLUMNS.items():
+            if name not in existing:
+                conn.execute(f"ALTER TABLE memories ADD COLUMN {name} {ddl}")
 
     _MESSAGE_TYPE_SEGMENTS = {
         "group",
@@ -252,6 +284,7 @@ class MemoryStore:
     def _row_to_item(self, row: sqlite3.Row, role_ids: list[str]) -> dict[str, Any]:
         """将数据库行转换为包含角色和时区信息的普通字典。"""
         # 把 SQLite 行转换为不依赖 sqlite3.Row 的普通 API 字典。
+        keys = row.keys()
         item: dict[str, Any] = {
             "memory_id": int(row["id"]),
             "content": str(row["content"]),
@@ -263,13 +296,67 @@ class MemoryStore:
             "extra_metadata": self._parse_metadata(row["extra_metadata"]),
             "created_at": float(row["created_at"]),
             "updated_at": float(row["updated_at"]),
+            "memory_type": str(row["memory_type"] or "group")
+            if "memory_type" in keys
+            else "group",
+            "sender_id": str(row["sender_id"] or "") if "sender_id" in keys else "",
+            "sender_role": str(row["sender_role"] or "member")
+            if "sender_role" in keys
+            else "member",
+            "source_msg_id": str(row["source_msg_id"] or "")
+            if "source_msg_id" in keys
+            else "",
+            "source_time": float(row["source_time"] or 0)
+            if "source_time" in keys
+            else 0.0,
+            "importance": float(row["importance"] or 0.5)
+            if "importance" in keys
+            else 0.5,
+            "last_access": float(row["last_access"] or 0)
+            if "last_access" in keys
+            else 0.0,
+            "access_count": int(row["access_count"] or 0)
+            if "access_count" in keys
+            else 0,
+            "superseded_by": (
+                int(row["superseded_by"]) if row["superseded_by"] is not None else None
+            )
+            if "superseded_by" in keys
+            else None,
+            "archived": int(row["archived"] or 0) if "archived" in keys else 0,
         }
+        item["type_label"] = {
+            "personal": "个人",
+            "group": "群聊",
+            "private": "私聊",
+        }.get(item["memory_type"], "未知")
+        item["identity_label"] = {
+            "owner": "所有者",
+            "group_owner": "群主",
+            "group_admin": "群管理",
+            "member": "群成员",
+        }.get(item["sender_role"], "群成员")
+        if item["source_time"]:
+            item["source_time_iso"] = self.format_timestamp_iso(item["source_time"])
         item.update(self._time_fields(float(row["memory_time"])))
         return item
 
     # ------------------------------------------------------------------ #
     # 写入 / 读取
     # ------------------------------------------------------------------ #
+    def find_exact_memory(self, content: str, group_scope: str = "") -> int | None:
+        """查找同范围下正文完全相同的未归档记忆，用于快速去重。"""
+        text = str(content or "").strip()
+        if not text:
+            return None
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT id FROM memories WHERE content = ? "
+                "AND archived = 0 ORDER BY id DESC LIMIT 1",
+                (text,),
+            ).fetchone()
+        return int(row["id"]) if row else None
+
     def add_memory(
         self,
         *,
@@ -281,6 +368,12 @@ class MemoryStore:
         group_id: str = "",
         platform_id: str = "",
         extra_metadata: dict[str, Any] | None = None,
+        memory_type: str = "group",
+        sender_id: str = "",
+        sender_role: str = "member",
+        source_msg_id: str = "",
+        source_time: float | None = None,
+        importance: float = 0.5,
     ) -> int:
         """持久化一条记忆及其角色关联，并返回新记录 ID。
 
@@ -326,8 +419,9 @@ class MemoryStore:
                 INSERT INTO memories (
                     content, embedding, embedding_dim, memory_time,
                     group_scope, group_id, platform_id, extra_metadata,
-                    created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    created_at, updated_at, memory_type, sender_id, sender_role,
+                    source_msg_id, source_time, importance
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     clean_content,
@@ -340,6 +434,12 @@ class MemoryStore:
                     json.dumps(metadata, ensure_ascii=False),
                     now,
                     now,
+                    str(memory_type or "group"),
+                    str(sender_id or "").strip(),
+                    str(sender_role or "member"),
+                    str(source_msg_id or "").strip(),
+                    float(source_time or timestamp),
+                    max(0.0, min(1.0, float(importance))),
                 ),
             )
             memory_id = int(cursor.lastrowid or 0)
@@ -360,12 +460,7 @@ class MemoryStore:
             return None
         with self._lock, closing(self._connect()) as conn:
             row = conn.execute(
-                """
-                SELECT id, content, embedding_dim, memory_time, group_scope,
-                       group_id, platform_id, extra_metadata, created_at, updated_at
-                FROM memories WHERE id = ?
-                """,
-                (target,),
+                "SELECT * FROM memories WHERE id = ?", (target,)
             ).fetchone()
             if not row:
                 return None
@@ -383,6 +478,9 @@ class MemoryStore:
         keyword: str = "",
         group_scope: str = "",
         role_id: str = "",
+        memory_type: str = "",
+        identity: str = "",
+        include_archived: bool = False,
     ) -> dict[str, Any]:
         """按关键词、作用域和角色过滤记忆，并返回一页结果及分页信息。
 
@@ -422,6 +520,16 @@ class MemoryStore:
                 "WHERE r.memory_id = m.id AND r.role_id = ?)"
             )
             params.append(role_id)
+        memory_type = str(memory_type or "").strip()
+        if memory_type:
+            where.append("m.memory_type = ?")
+            params.append(memory_type)
+        identity = str(identity or "").strip()
+        if identity:
+            where.append("m.sender_role = ?")
+            params.append(identity)
+        if not include_archived:
+            where.append("m.archived = 0")
         where_sql = ("WHERE " + " AND ".join(where)) if where else ""
 
         with self._lock, closing(self._connect()) as conn:
@@ -431,9 +539,7 @@ class MemoryStore:
             total = int(total_row["total"]) if total_row else 0
             rows = conn.execute(
                 f"""
-                SELECT m.id, m.content, m.embedding_dim, m.memory_time,
-                       m.group_scope, m.group_id, m.platform_id,
-                       m.extra_metadata, m.created_at, m.updated_at
+                SELECT m.*
                 FROM memories m {where_sql}
                 ORDER BY m.memory_time DESC, m.id DESC
                 LIMIT ? OFFSET ?
@@ -470,8 +576,7 @@ class MemoryStore:
         }
 
     def delete_memory(self, memory_id: int) -> bool:
-        """删除指定记忆；关联角色由数据库外键级联清理。"""
-        # 删除主记录并依赖外键级联清理关联角色，返回是否删除到记录。
+        """删除记忆并做 ID 顺位；被删内容暂存回收站以便撤销。"""
         try:
             target = int(memory_id)
         except (TypeError, ValueError):
@@ -479,8 +584,167 @@ class MemoryStore:
         if target <= 0:
             return False
         with self._lock, closing(self._connect()) as conn, conn:
-            cursor = conn.execute("DELETE FROM memories WHERE id = ?", (target,))
-            return cursor.rowcount > 0
+            row = conn.execute(
+                "SELECT * FROM memories WHERE id = ?", (target,)
+            ).fetchone()
+            if row is None:
+                return False
+            keys = row.keys()
+            payload = {key: row[key] for key in keys}
+            roles = [
+                str(item["role_id"])
+                for item in conn.execute(
+                    "SELECT role_id FROM memory_roles WHERE memory_id = ?", (target,)
+                ).fetchall()
+            ]
+            conn.execute(
+                "INSERT INTO memory_trash(original_id, payload, roles, deleted_at) "
+                "VALUES (?, ?, ?, ?)",
+                (
+                    target,
+                    json.dumps(payload, ensure_ascii=False),
+                    json.dumps(roles, ensure_ascii=False),
+                    time.time(),
+                ),
+            )
+            conn.execute("DELETE FROM memories WHERE id = ?", (target,))
+        self.resequence_ids()
+        return True
+
+    def resequence_ids(self) -> int:
+        """把记忆 ID 重排为连续的 1..N，并同步角色与失效引用。"""
+        moved = 0
+        with self._lock:
+            conn = self._connect()
+            try:
+                conn.execute("PRAGMA foreign_keys = OFF")
+                with conn:
+                    rows = conn.execute(
+                        "SELECT id FROM memories ORDER BY id"
+                    ).fetchall()
+                    ids = [int(row["id"]) for row in rows]
+                    mapping = {
+                        old: index + 1
+                        for index, old in enumerate(ids)
+                        if old != index + 1
+                    }
+                    for old, new in sorted(mapping.items()):
+                        conn.execute(
+                            "UPDATE memories SET id = ? WHERE id = ?", (new, old)
+                        )
+                        conn.execute(
+                            "UPDATE memory_roles SET memory_id = ? WHERE memory_id = ?",
+                            (new, old),
+                        )
+                        moved += 1
+                    if mapping:
+                        for old, new in sorted(mapping.items()):
+                            conn.execute(
+                                "UPDATE memories SET superseded_by = ? "
+                                "WHERE superseded_by = ?",
+                                (new, old),
+                            )
+                    conn.execute("DELETE FROM sqlite_sequence WHERE name = 'memories'")
+                    if ids:
+                        conn.execute(
+                            "INSERT INTO sqlite_sequence(name, seq) VALUES ('memories', ?)",
+                            (len(ids),),
+                        )
+                conn.execute("PRAGMA foreign_keys = ON")
+            finally:
+                conn.close()
+        return moved
+
+    def restore_memory(self, trash_id: int) -> int | None:
+        """从回收站恢复一条记忆，返回新 ID。"""
+        with self._lock, closing(self._connect()) as conn, conn:
+            row = conn.execute(
+                "SELECT payload, roles FROM memory_trash WHERE trash_id = ?",
+                (int(trash_id),),
+            ).fetchone()
+            if row is None:
+                return None
+            payload = json.loads(row["payload"])
+            roles = json.loads(row["roles"]) if row["roles"] else []
+            conn.execute(
+                """
+                INSERT INTO memories (
+                    content, embedding, embedding_dim, memory_time,
+                    group_scope, group_id, platform_id, extra_metadata,
+                    created_at, updated_at, memory_type, sender_id, sender_role,
+                    source_msg_id, source_time, importance
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    payload.get("content", ""),
+                    payload.get("embedding", "[]"),
+                    payload.get("embedding_dim", 0),
+                    payload.get("memory_time", time.time()),
+                    payload.get("group_scope", ""),
+                    payload.get("group_id", ""),
+                    payload.get("platform_id", ""),
+                    payload.get("extra_metadata", "{}"),
+                    payload.get("created_at", time.time()),
+                    payload.get("updated_at", time.time()),
+                    payload.get("memory_type", "group"),
+                    payload.get("sender_id", ""),
+                    payload.get("sender_role", "member"),
+                    payload.get("source_msg_id", ""),
+                    payload.get("source_time", 0),
+                    payload.get("importance", 0.5),
+                ),
+            )
+            new_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+            conn.executemany(
+                "INSERT OR IGNORE INTO memory_roles(memory_id, role_id) VALUES (?, ?)",
+                [(new_id, role) for role in roles],
+            )
+            conn.execute(
+                "DELETE FROM memory_trash WHERE trash_id = ?", (int(trash_id),)
+            )
+            return new_id
+
+    def latest_trash_id(self) -> int | None:
+        """返回最近一次删除写入回收站的 ID。"""
+        with self._lock, closing(self._connect()) as conn:
+            row = conn.execute(
+                "SELECT MAX(trash_id) AS tid FROM memory_trash"
+            ).fetchone()
+        return int(row["tid"]) if row and row["tid"] is not None else None
+
+    def bump_access(self, memory_ids: list[int]) -> None:
+        """命中记忆时更新最后访问时间与访问次数。"""
+        ids = [int(item) for item in memory_ids if int(item) > 0]
+        if not ids:
+            return
+        now = time.time()
+        with self._lock, closing(self._connect()) as conn, conn:
+            placeholders = ",".join("?" for _ in ids)
+            conn.execute(
+                f"UPDATE memories SET last_access = ?, access_count = access_count + 1 "
+                f"WHERE id IN ({placeholders})",
+                [now, *ids],
+            )
+
+    def supersede(self, old_id: int, new_id: int) -> None:
+        """把旧记忆标记为被新记忆取代。"""
+        with self._lock, closing(self._connect()) as conn, conn:
+            conn.execute(
+                "UPDATE memories SET superseded_by = ? WHERE id = ?",
+                (int(new_id), int(old_id)),
+            )
+
+    def archive_stale(self, *, days: float = 20.0, max_importance: float = 0.35) -> int:
+        """归档低重要性且长期未访问的记忆。"""
+        cutoff = time.time() - max(1.0, float(days)) * 86400
+        with self._lock, closing(self._connect()) as conn, conn:
+            cursor = conn.execute(
+                "UPDATE memories SET archived = 1 "
+                "WHERE archived = 0 AND importance <= ? "
+                "AND COALESCE(NULLIF(last_access, 0), memory_time) < ?",
+                (float(max_importance), cutoff),
+            )
+            return int(cursor.rowcount or 0)
 
     def find_similar_memory(
         self,
@@ -578,6 +842,17 @@ class MemoryStore:
             role_row = conn.execute(
                 "SELECT COUNT(DISTINCT role_id) AS cnt FROM memory_roles"
             ).fetchone()
+            type_rows = conn.execute(
+                "SELECT memory_type, COUNT(*) AS cnt FROM memories "
+                "WHERE archived = 0 GROUP BY memory_type"
+            ).fetchall()
+            identity_rows = conn.execute(
+                "SELECT sender_role, COUNT(*) AS cnt FROM memories "
+                "WHERE archived = 0 GROUP BY sender_role"
+            ).fetchall()
+            archived_row = conn.execute(
+                "SELECT COUNT(*) AS cnt FROM memories WHERE archived = 1"
+            ).fetchone()
             range_row = conn.execute(
                 "SELECT MIN(memory_time) AS oldest, MAX(memory_time) AS latest "
                 "FROM memories"
@@ -593,7 +868,35 @@ class MemoryStore:
             if range_row and range_row["latest"] is not None
             else None
         )
+        type_counts = {
+            str(row["memory_type"] or "group"): int(row["cnt"]) for row in type_rows
+        }
+        identity_counts = {
+            str(row["sender_role"] or "member"): int(row["cnt"])
+            for row in identity_rows
+        }
         return {
+            "type_counts": {
+                "personal": type_counts.get("personal", 0),
+                "group": type_counts.get("group", 0),
+                "private": type_counts.get("private", 0),
+                "unknown": max(
+                    0,
+                    total
+                    - sum(
+                        type_counts.get(key, 0)
+                        for key in ("personal", "group", "private")
+                    )
+                    - (int(archived_row["cnt"]) if archived_row else 0),
+                ),
+            },
+            "identity_counts": {
+                "owner": identity_counts.get("owner", 0),
+                "group_owner": identity_counts.get("group_owner", 0),
+                "group_admin": identity_counts.get("group_admin", 0),
+                "member": identity_counts.get("member", 0),
+            },
+            "archived_count": int(archived_row["cnt"]) if archived_row else 0,
             "total_memories": total,
             "group_scope_count": int(scope_row["cnt"]) if scope_row else 0,
             "group_id_count": int(group_row["cnt"]) if group_row else 0,
@@ -608,6 +911,43 @@ class MemoryStore:
             ),
             "display_timezone": self._timezone_name,
         }
+
+    def consolidation_candidates(
+        self, *, older_than_days: float = 7.0, group_scope: str = "", limit: int = 80
+    ) -> list[dict[str, Any]]:
+        """返回可参与巩固的旧记忆（含 embedding 与角色）。"""
+        cutoff = time.time() - max(1.0, float(older_than_days)) * 86400
+        where = ["m.archived = 0", "m.superseded_by IS NULL", "m.memory_time < ?"]
+        params: list[Any] = [cutoff]
+        if group_scope:
+            where.append("m.group_scope = ?")
+            params.append(str(group_scope))
+        sql = (
+            "SELECT m.* FROM memories m WHERE "
+            + " AND ".join(where)
+            + " ORDER BY m.memory_time ASC LIMIT ?"
+        )
+        params.append(max(1, int(limit)))
+        with self._lock, closing(self._connect()) as conn:
+            rows = conn.execute(sql, params).fetchall()
+            ids = [int(row["id"]) for row in rows]
+            roles_map: dict[int, list[str]] = {}
+            if ids:
+                placeholders = ",".join("?" for _ in ids)
+                for item in conn.execute(
+                    f"SELECT memory_id, role_id FROM memory_roles "
+                    f"WHERE memory_id IN ({placeholders})",
+                    ids,
+                ).fetchall():
+                    roles_map.setdefault(int(item["memory_id"]), []).append(
+                        str(item["role_id"])
+                    )
+        items = []
+        for row in rows:
+            item = self._row_to_item(row, roles_map.get(int(row["id"]), []))
+            item["embedding"] = self._parse_embedding(row["embedding"])
+            items.append(item)
+        return items
 
     def list_group_scopes(self) -> list[str]:
         """按字典序返回最多 200 个非空记忆作用域。"""
@@ -668,7 +1008,7 @@ class MemoryStore:
         roles = self._normalize_role_ids(role_ids or [])
         mode = "all" if str(role_match_mode).strip().lower() == "all" else "any"
 
-        where: list[str] = []
+        where: list[str] = ["m.archived = 0", "m.superseded_by IS NULL"]
         params: list[Any] = []
         if group_scope:
             where.append("m.group_scope = ?")
@@ -704,11 +1044,7 @@ class MemoryStore:
 
         # 只在 SQL 中生成筛选子句，所有外部值仍通过 params 绑定；LIMIT 也受
         # scan_limit 约束，避免在 Python 层一次性载入整个记忆库再做排序。
-        sql = (
-            "SELECT m.id, m.content, m.embedding, m.embedding_dim, m.memory_time, "
-            "m.group_scope, m.group_id, m.platform_id, m.extra_metadata, "
-            "m.created_at, m.updated_at FROM memories m"
-        )
+        sql = "SELECT m.* FROM memories m"
         if where:
             sql += " WHERE " + " AND ".join(where)
         sql += " ORDER BY m.memory_time DESC LIMIT ?"
