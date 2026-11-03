@@ -1,11 +1,243 @@
 # 更新日志
 
+本次更新有较大改动，请彻底卸载本插件所有数据后重新安装！
+如果遇到Bug可加入1005645698群聊或在 GitHub 上 Issues 反馈
+<p align="center">
+  <a href="https://qm.qq.com/q/u3CDKSRfpY"><img src="./docs/images/qq-community.svg" alt="加入 QQ 闲聊群" width="220" /></a>
+</p>
+
+## 未发布（冲突取代、删除稳定与写入并发）
+
+- 修复（数据丢失）：删除记忆不再重排 ID。此前 `delete_memory` 每次都把全表 ID
+  重排为 1..N 并全量重建 FTS（3000 条库删一条约 330–860ms）；巩固流程按旧 ID
+  连续删除时，12 条库删 [5, 10] 实际删掉 5 和 11。现已移除 `resequence_ids`，
+  ID 稳定、不复用，3000 条库删一条约 2–3ms。
+- 修复：merge（相似度 ≥0.95）与 dedup（≥0.90）此前不看记忆类型，会改写或丢弃
+  类型不同的记忆。决策抽成纯函数 `memory_conflict.decide_similar_action`：
+  跨作用域一律新增；merge / duplicate 要求同类型；supersede 要求同类型且实体
+  有交集；其余新增。
+- 修复：「查相似 → 决策 → 写库/取代」加全局 `asyncio.Lock`，并发写入同一件事
+  不再双写（embedding 调用在锁外）。
+- 修复：相似查找排除已归档、已被取代的记忆，避免新记忆被误判为重复。
+- 性能：相似查找改用 numpy 批量余弦（与召回同一实现）。
+- 稳定性：写入、合并、取代、访问计数、归档、整合（`_store_memory`、召回访问计数、
+  维护循环、`enhance_memory_rag_write`）与控制台 `rag_delete` / `rag_restore` /
+  `rag_selftest` 的同步 SQLite 调用已放入线程池。其余仍为同步调用：
+  `read_memory` / `enhance_memory_rag_read` 工具、控制台的列表/详情/统计接口。
+- `find_exact_memory` 补上连接关闭与加锁。
+- 恢复文档文件名 `开发文档.md`（此前被重编码为乱码）。
+- 修复（静默失效）：`self._recall_cache` 从未在 `__init__` 中赋值，自动回忆每次
+  抛 `AttributeError` 被上层 `except` 吞掉，导致记忆自动注入实际不生效。现已
+  初始化，并新增接线测试（AST 检查关键属性都有赋值）防止再次漏接。
+- 测试：`tests/` 下新增 68 条用例（决策矩阵、相似查找、删除稳定、并发写入）；
+  连同原有基础用例共 91 条，`pytest` 全绿。
+- 工程：`ruff check .` 与 `ruff format --check .` 已通过（清理历史遗留的未使用
+  导入、导入排序与格式问题）。
+
+## 未发布（记忆可见性与性能）
+
+- 可见性统一为「本会话 ∪ 本人参与」：全局记忆只对参与过的人可见，私聊默认不跨群；
+  旧记忆按写入者回填参与者，补不上的不参与跨群召回。
+- 面板作用域改名：「本群优先+全局兜底」→「自动」，「全部全局」→「仅全局」。
+- 召回改为单次查询 + 批量余弦（numpy，缺失自动回退）+ 两阶段取行：
+  1200 条记忆单次召回由约 200ms 降到约 40ms。
+- 新增 45 秒检索缓存；记忆工具增加单请求预算（4 次 / 20 秒 / 12k 字符）。
+- 群聊历史改临时块注入，system 段逐轮稳定；`/replytest` 显示前缀缓存状态。
+- 修复：抽取失败重试此前是死代码（失败仍推进游标）。现按 ok/empty/failed/skipped
+  处理，失败按 30/60/120 秒重试，成功或明确为空才推进窗口游标。
+- 修复：精确去重忽略作用域、合并可跨作用域改写全局记忆、有效期可能被改短。
+- 向量只写 BLOB（旧 JSON 仍可读）；FTS 回填分批，且只在有新数据时重建索引。
+- 版本号保持 v1.1.0-beta.2（本次为未发布改动）。
+
+新增配置：`memory_control.cross_group_personal`（默认开）、`cross_group_private`（默认关）。
+
+## 未发布（控制台去重）
+
+- 自检合并：原「自检」（存储读写）与「试跑」（提示词抽取）合并为一个「自检」，
+  一次展示存储步骤与提示词解析/证据校验结果；移除独立试跑按钮与对应接口。
+- 提示词对照：预览同时显示「设置里的提示词」与「实际发送（系统追加后）」，
+  标明版本、字数与是否默认；试跑与真实抽取使用同一份最终提示词。
+- 全局设置不再提供黑名单编辑，屏蔽统一到「屏蔽设置」页（保留原因/时长）；
+  配置同步改为只增不删，重启不会再删掉带原因的屏蔽记录。
+- 全局设置隐藏「自动产生记忆」开关（与记忆页顶部面板重复），只保留面板开关；
+  切换后自动刷新已打开的设置表单。
+- 状态页与记忆页共用同一统计实现，自动记忆面板不再做重复统计查询。
+
+## 未发布（记忆准确性：提示词与原子记忆）
+
+目标：把「提示词 → 抽取模型 → 记忆准确性」这条链路做可控、可验证。
+
+新增：
+
+- 面板「提示词」：查看最终发给抽取模型的完整提示词（含系统追加规则）、版本、
+  字数、是否默认，避免改了配置却不知道实际发出去的是什么。
+- 面板「试跑」：用当前提示词与抽取模型跑一次内置样例，直接看到原始输出、
+  解析条数、证据校验通过数与耗时；失败会给出具体原因，不改动记忆库。
+- 多原子记忆：一次抽取产出 1–3 条，每条带类型（fact / preference / plan /
+  episode / relation）、实体、有效期与置信度；单条不合法只丢该条。
+- 按类型衰减：计划 3 天、事件 7 天、偏好 60 天、事实 120 天、关系 90 天（可配）。
+- 实体召回加分、卡片 MMR 去重、卡片显示记忆类型。
+- 解析失败自动修复重试一次（同一模型、只要求按契约重发），仍失败才丢窗。
+- 提示词版本写入记忆元数据（`prompt_version` / `prompt_hash`），便于回溯。
+
+变更：
+
+- 记忆注入默认 **5 条 / 600 字**（原 3 条 / 300 字），单条摘要上限 80 字；
+  两项均可在面板修改。
+- 同一件事被重复总结时改为**合并**：保留 ID、更新正文与向量、实体取并集、
+  有效期取较晚，不再新增重复行。
+
+修复：
+
+- 过期计划不再被召回；维护循环每小时归档 `valid_until` 已过的记忆。
+- 自定义提示词缺少输出契约时不再“悄悄退回旧格式”，面板可见契约是否追加。
+
+新增配置：
+
+| 路径 | 默认 | 说明 |
+|---|---|---|
+| `memory_generation.memory_multi_atom` | true | 多条原子记忆 |
+| `memory_generation.memory_atom_max_items` | 3 | 单窗上限 |
+| `memory_generation.memory_prompt_contract` | true | 自动追加输出契约 |
+| `memory_evaluation.memory_kind_decay` | 3/7/60/120/90 天 | 五类半衰期 |
+| `memory_injection.memory_inject_max_items` | 5 | 注入条数 |
+| `memory_injection.memory_inject_max_chars` | 600 | 注入字数 |
+| `memory_injection.memory_mmr_enabled` | true | 卡片去重 |
+| `memory_injection.memory_kind_badge` | true | 卡片显示类型 |
+| `memory_injection.memory_entity_boost` | 0.10 | 实体命中加分 |
+
+## 未发布（记忆与延迟优化）
+
+目标：记忆的完整性与准确性不下降，同时降低每轮 token 与首字延迟。
+
+新增与优化：
+
+- 群聊历史按字符预算注入：新增 `history_max_chars`（默认 3000），`max_messages`
+  默认从 200 降到 40；启动时对 `max_messages > 80` 给出告警。
+- 记忆注入改为紧凑卡片：3 条 / 300 字，`- #编号 [日期] 摘要`，排序确定化，
+  相同命中集合生成相同文本，便于复用缓存。
+- 关键词召回通道：FTS5 bigram 索引（中文 2 字查询可用），单次约 6ms；
+  FTS5 不可用时自动降级为空结果，向量路径不受影响。
+- 召回门控：词法命中且覆盖度足够时不再调用 embedding；仅规则命中且词法较弱
+  时才向量化，并带 300 秒 / 256 条的查询向量缓存。
+- 向量改存 BLOB 并预计算范数，读取时优先 BLOB、兼容旧 JSON；查询范数只算一次。
+  本机实测 1200 条窗口：旧 JSON 路径 440ms → 新路径 194ms（2.3×）。
+- 在线扫描上限 `memory_online_scan_limit`（默认 900），工具与控制台仍可全量检索。
+- 新增工具 `read_memory(memory_id)`：按编号深读正文与证据，每次重校验作用域，
+  越权按「不存在」处理。
+- 抽取完整性：`last_extract_msg` 改为抽取成功后才推进；失败按 30s/60s/120s
+  指数退避重试，最多 3 次，避免失败窗口被永久跳过。
+- 指标：`/replytest` 报告增加记忆注入条数、词法候选数、召回耗时与向量缓存命中；
+  控制台概览返回 `memory_engine`（索引状态与新参数）。
+
+修复：
+
+- 控制台「记忆来源」在没有记忆时显示「1 条」：除零兜底被误用到徽标上，
+  现改为徽标用真实合计、进度条单独兜底；同时提升 UI 资源版本号以刷新缓存。
+
+新增配置项：
+
+| 路径 | 默认 | 说明 |
+|---|---|---|
+| `group_context_enhancement.history_max_chars` | 3000 | 历史注入字数上限 |
+| `memory_rag.memory_injection.memory_online_scan_limit` | 900 | 在线语义扫描条数 |
+| `memory_rag.memory_injection.memory_min_similarity` | 0.55 | 召回最低相似度 |
+| `memory_rag.memory_injection.memory_lexical_recall` | true | 关键词召回通道 |
+| `memory_rag.memory_injection.memory_embedding_cache_ttl` | 300 | 向量缓存秒数 |
+| `memory_rag.memory_injection.memory_embedding_cache_size` | 256 | 向量缓存条数 |
+
+## 未发布（代码审查修复）
+
+修复：
+
+- 记忆召回跨群越界：`_recall_scopes` 的「全局兜底」原先把空作用域当成「不加过滤」，
+  会把其它群与私聊的记忆召回并注入当前群。`search_memories` 新增 `scope_mode`，
+  自动回忆与 `enhance_memory_rag_search` 的全局回退都改为精确匹配 `group_scope = ''`。
+- 写全局记忆时的跨作用域去重/取代：`find_similar_memory` 空作用域现在只比较全局
+  记忆；`_store_memory` 只取代同作用域的旧记忆，一个群的总结不会让别的群或全局
+  记忆失效。
+- 记忆召回阻塞事件循环：SQLite 扫描与逐条余弦计算移到 `asyncio.to_thread` 执行。
+- 自动回忆忽略群级配置：改用 `cfg_for_event(event)` 的结果，群级的注入条数、字数、
+  作用域与衰减参数现在会生效。
+- 两个配置项无效：「抽取输入字数上限」「对话间隔切窗」此前从未从配置读取，
+  现在映射到 `extract_max_chars` / `window_gap_minutes`。
+- 卸载不取消维护循环：`terminate()` 会取消维护任务与后台抽取任务，重载不再叠加。
+- 图片缓存无上限：新增 `RuntimeState.remember_images`，单来源最多保留 300 条。
+- LRU 淘汰遗漏 `last_chat_at` / `last_extract_msg`，已一并清理。
+- `_areply_stream_patched` / `_areply_send_patched` 守卫改用 `get_extra`，与写入方式一致。
+- 群配置保存接口返回的 `independent` 以实际存储为准。
+- 后台任务改用 `_spawn` 保存强引用，异常写入日志，不再静默丢失。
+
+变更：
+
+- 同时关闭「群聊上下文增强」与「智能回复」时不再强制关闭流式输出；其余情况仍强制
+  非流式，确保 `<mention/>` / `<quote/>` 在发送前完成转换。
+
+## v1.1.0-beta.2（2026-11-03）
+
+修复：
+
+- 修复重要群体决策档（major）的“至少 3 名成员”校验把 Bot 自己算作成员的问题：现在只统计真人发送者，2 名真人 + Bot 的群聊不会再绕过降档。
+
+变更：
+
+- 版本号更新为 v1.1.0-beta.2。
+- 自动回忆改用 extra_user_content_parts + mark_as_temp() 临时片段注入，system_prompt 保持静态；旧版 AstrBot 回退到 system_prompt。
+- _sender_ids_from_history 新增 include_bot 参数，默认保留 Bot ID 以兼容现有调用；major 降档校验显式使用不含 Bot 的发送者列表。
+
+## v1.1.0-beta.1（2026-11-03）
+
+### 新增与优化
+
+- 重构记忆 RAG：关键词写入 + 模型抽取 + 语义检索 + 去重 + 冲突失效 + 生命周期管理。
+- 记忆独立时间线：`memory_chats` 与对话历史 `session_chats` 分离，记忆固定记录完整日期、发送者 ID 与原始引用/@ 标记。
+- 置信度分档：major / discussion / daily / chatter / spam 五档，评分限制在档位区间内。
+- 群级配置：只保存与全局不同的字段；启动时自动修复旧版本自动填充的“记忆默认关闭”覆盖。
+- `/总结记忆`：管理员手动触发不再受自动抽取最低置信度限制。
+
+### 修复
+
+- 修复记忆时间与真实发送时间不一致：记忆库 `memory_time` 取窗口内最后一条有效消息的真实时间，不再使用摘要任务执行时间；抽取提示词附带当前时间与时区，并禁止照抄示例日期。
+- 修复自动记忆静默失效：自动抽取与群聊上下文、主动回复解耦；关闭上下文/主动回复后仍会维护记忆历史。
+- 修复群级独立配置自动把记忆 RAG 写成关闭的问题；旧 `groups.json` 中“7 个记忆字段全为旧默认值”的覆盖会在启动时清理。
+- 修复关闭“包含用户信息”时记忆历史缺少发送者 ID、导致抽取器无法解析的问题；记忆历史始终使用独立格式。
+- 修复自动抽取计数器丢失或异常重置后不再触发的问题；增加按历史长度兜底触发。
+- 修复旧提示词模板缺少发言归属、时间和置信度规则的问题；运行时自动补齐。
+- 修复手动 `/总结记忆` 的正常分数被自动门槛丢弃的问题；手动操作可显式绕过门槛。
+- 修复图片描述未同步写入记忆历史的问题。
+- 修复私聊记忆未使用独立时间线的问题。
+
+### 优化
+
+- 记忆历史与对话历史解耦，避免为了记忆而改变对话模型的上下文格式。
+- 群配置保存改为差异写入，避免未修改的默认值覆盖全局设置。
+- 自动抽取增加日志：启动配置、触发条件、窗口条数、缺少 Embedding、写入跳过原因。
+- 记忆详情中的“原始消息”保留引用/@ 标记；模型输入使用改写后的安全格式。
+- 配置 schema、默认提示词、README 与开发文档同步更新。
+
+### 迁移说明
+
+以下为未重装插件可能出现的情况及对旧版尝试性适配
+- 默认最低置信度调整为 0.50，自动迁移旧默认 0.60（曾把最低置信度刻意设置为 0.60，升级后会被迁移到 0.50）
+- 从旧版本升级时请保留 `data/plugin_data/astrbot_plugin_active_reply/`；启动时会执行记忆配置、阈值和群级覆盖迁移。
+- 旧版本已经写入的记忆不会自动重算时间
+- 使用记忆 RAG 前请确认 AstrBot 已配置可用的 Embedding 提供商；否则启动日志会给出警告，自动写入会被跳过。
+
 ## v1.0.5（2026-10-31）
 
 修复：
 
-- `/replytest` token 用量显示为 0：`@` / 唤醒回复此前走了流式路径，现在统一强制非流式，token 才能被统计
-- 新增 `raw_completion.usage` 回退解析，兼容 OpenAI / DeepSeek / Anthropic / Gemini 的用量字段（`prompt_tokens_details.cached_tokens`、`prompt_cache_hit_tokens`、`cache_read_input_tokens` 等）
+- `/replytest` token 用量显示为 0：`@` / 唤醒回复统一强制非流式，token 才能被统计
+- token 用量同时写入本轮报告，避免新消息触发新一轮重置后清零
+- 未返回 `usage` 时增加回退解析：`raw_completion.usage`、`choices[0].usage`，兼容 OpenAI / DeepSeek / Anthropic / Gemini / Moonshot
+- 调试报告新增「版本」与「流式」状态，未取到 usage 时会在报告内注明原因
+- 兼容 Gemini `usage_metadata`、Anthropic `cache_read_input_tokens`、DeepSeek `prompt_cache_hit_tokens` 等更多 usage 字段与嵌套形态
+
+新增：
+
+- `/replytest` 报告补回「插件运行日志（本轮）」节点：只收集插件自身经 `astrbot.api.logger` 输出的日志，不导入 `logging` / `loguru`，符合插件市场规范
+
+说明：AstrBot 核心日志无法在不违反日志规范的前提下读取，报告只能展示插件自身日志。
 
 ## v1.0.4（2026-10-31）
 
@@ -68,3 +300,5 @@
 - 模型工具：联网搜索 `grok_web_search`、长期记忆 RAG
 - 可视化控制台：状态、群级配置、记忆管理、全局设置
 - 指令 `/执行回复`：立即执行一次回复或判定
+
+> 项目仓库：https://github.com/AethenNet/astrbot_plugin_Reply-Memory

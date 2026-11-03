@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import time
 from collections import OrderedDict, defaultdict
 
 
@@ -21,8 +22,11 @@ class RuntimeState:
     def __init__(self) -> None:
         """创建所有以会话来源为键的进程内状态映射。"""
         # 按 unified_msg_origin 隔离会话相关数据，避免不同群的状态相互混用。
-        # 群聊历史文本（每条一行，已格式化）
+        # 群聊历史文本（每条一行，已格式化）——供对话/主动回复使用
         self.session_chats: dict[str, list[str]] = defaultdict(list)
+        # 记忆专用历史：始终包含完整日期、发送者 ID 与原始引用/@ 标记，
+        # 不随对话上下文的格式开关变化，避免记忆时间/发言者被改写。
+        self.memory_chats: dict[str, list[str]] = defaultdict(list)
         # 消息 ID -> 发送者 ID，用于校验 @ / 引用的目标是否真实存在
         self.message_senders: dict[str, OrderedDict[str, str]] = defaultdict(
             OrderedDict
@@ -35,7 +39,21 @@ class RuntimeState:
         self.reply_counters: dict[str, int] = defaultdict(int)
         # 本轮 token 用量（按来源累计）
         self.turn_usage: dict[str, dict[str, int]] = defaultdict(
-            lambda: {"input_cached": 0, "input_other": 0, "output": 0, "calls": 0}
+            lambda: {
+                "input_cached": 0,
+                "input_other": 0,
+                "output": 0,
+                "calls": 0,
+                "memory_hits": 0,
+                "lexical_hits": 0,
+                "recall_ms": 0,
+                "embedding_cache_hit": 0,
+            }
+        )
+        # 查询向量缓存：query hash -> (vector, 写入时间)。全局共享，按 TTL 与条数淘汰，
+        # 同一条问题在短时间内重复出现时不必再请求 embedding 服务。
+        self.embedding_cache: OrderedDict[str, tuple[list[float], float]] = (
+            OrderedDict()
         )
         # 回复调试开关（按来源）
         self.debug_origins: set[str] = set()
@@ -43,9 +61,19 @@ class RuntimeState:
         self.pending_report: dict[str, dict] = {}
         # 本轮执行日志
         self.turn_logs: dict[str, list[str]] = defaultdict(list)
+        # 最近一条消息时间，用于按对话间隔切窗
+        self.last_chat_at: dict[str, float] = {}
+        # 上次已总结到的最后一条消息 ID，避免窗口重叠重复写入
+        self.last_extract_msg: dict[str, str] = {}
+        # 本轮开始时间（用于截取插件运行日志）
+        self.turn_started_at: dict[str, float] = {}
+        # 上一轮 system 段指纹，用于判断前缀缓存是否还能命中
+        self.last_system_hash: dict[str, int] = {}
         # 自动记忆：抽取计数与上次抽取时间
         self.extract_counters: dict[str, int] = defaultdict(int)
         self.last_extract_at: dict[str, float] = {}
+        # 抽取失败后的重试次数，成功后清零
+        self.extract_retries: dict[str, int] = defaultdict(int)
         # LRU：最左侧最久未使用
         self.origin_lru: OrderedDict[str, None] = OrderedDict()
 
@@ -56,15 +84,22 @@ class RuntimeState:
         """从各状态容器中移除指定来源的数据，不触碰长期存储。"""
         # 清除来源关联的所有短期数据；debug_origins 的生命周期由插件管理。
         self.session_chats.pop(origin, None)
+        self.memory_chats.pop(origin, None)
         self.message_senders.pop(origin, None)
         self.image_registry.pop(origin, None)
         self.sender_names.pop(origin, None)
         self.reply_counters.pop(origin, None)
         self.turn_usage.pop(origin, None)
         self.turn_logs.pop(origin, None)
+        self.turn_started_at.pop(origin, None)
         self.pending_report.pop(origin, None)
         self.extract_counters.pop(origin, None)
         self.last_extract_at.pop(origin, None)
+        self.extract_retries.pop(origin, None)
+        # 这两个映射同样是按来源无限增长的，必须一起清，否则 LRU 只清了一半。
+        self.last_chat_at.pop(origin, None)
+        self.last_extract_msg.pop(origin, None)
+        self.last_system_hash.pop(origin, None)
 
     def touch_origin(self, origin: str, max_origins: int) -> None:
         """刷新来源的最近使用顺序，并按来源总数上限执行 LRU 淘汰。
@@ -88,13 +123,53 @@ class RuntimeState:
     # ------------------------------------------------------------------ #
     def reset_turn(self, origin: str) -> None:
         """新的一轮开始：清空用量与执行日志。"""
+        self.turn_started_at[origin] = time.time()
         self.turn_usage[origin] = {
             "input_cached": 0,
             "input_other": 0,
             "output": 0,
             "calls": 0,
+            "memory_hits": 0,
+            "lexical_hits": 0,
+            "recall_ms": 0,
+            "embedding_cache_hit": 0,
         }
         self.turn_logs[origin] = []
+
+    def bump_metric(self, origin: str, key: str, value: int = 1) -> None:
+        """累加本轮的自定义指标（召回命中、耗时、缓存命中）。"""
+        bucket = self.turn_usage[origin]
+        bucket[key] = int(bucket.get(key, 0)) + int(value)
+
+    # ------------------------------------------------------------------ #
+    # 查询向量缓存
+    # ------------------------------------------------------------------ #
+    def cache_get_embedding(self, key: str, ttl_seconds: int) -> list[float] | None:
+        """读取未过期的查询向量；过期或未命中返回 None。"""
+        if not key or ttl_seconds <= 0:
+            return None
+        item = self.embedding_cache.get(key)
+        if item is None:
+            return None
+        vector, created_at = item
+        if time.time() - created_at > max(1, int(ttl_seconds)):
+            self.embedding_cache.pop(key, None)
+            return None
+        self.embedding_cache.move_to_end(key)
+        return vector
+
+    def cache_put_embedding(self, key: str, vector: list[float], max_size: int) -> None:
+        """写入查询向量，并按容量上限淘汰最久未使用的条目。"""
+        if not key or max_size <= 0 or not vector:
+            return
+        self.embedding_cache[key] = (list(vector), time.time())
+        self.embedding_cache.move_to_end(key)
+        while len(self.embedding_cache) > max(1, int(max_size)):
+            self.embedding_cache.popitem(last=False)
+
+    def cache_clear_embeddings(self) -> None:
+        """清空查询向量缓存（数据目录切换或提供商变更时调用）。"""
+        self.embedding_cache.clear()
 
     def add_usage(self, origin: str, usage: object) -> None:
         """累加一次模型调用的 token 用量（兼容不同版本的 usage 结构）。"""
@@ -142,6 +217,18 @@ class RuntimeState:
     # ------------------------------------------------------------------ #
     # 便捷读写
     # ------------------------------------------------------------------ #
+    def append_memory_chat(self, origin: str, line: str, max_messages: int) -> None:
+        """追加记忆专用历史，并只保留最近 max_messages 条。"""
+        chats = self.memory_chats[origin]
+        chats.append(line)
+        limit = max(10, int(max_messages))
+        if len(chats) > limit:
+            del chats[: len(chats) - limit]
+
+    def memory_history(self, origin: str) -> list[str]:
+        """返回记忆历史；升级后尚未产生新记忆行时回退到对话历史。"""
+        return self.memory_chats.get(origin) or self.session_chats.get(origin) or []
+
     def append_chat(self, origin: str, line: str, max_messages: int) -> str:
         """追加一条已格式化的历史行，并将列表裁剪到指定长度。
 
@@ -166,6 +253,26 @@ class RuntimeState:
         registry.move_to_end(msg_id)
         while len(registry) > 2000:
             registry.popitem(last=False)
+
+    def remember_images(
+        self,
+        origin: str,
+        msg_id: str,
+        payload: dict[str, object],
+        *,
+        max_entries: int = 300,
+    ) -> None:
+        """登记一条消息的图片缓存，并限制单个来源的条目数。
+
+        图片条目只有在该消息行被对话历史上限挤出时才回收；关闭群聊上下文
+        增强时历史不会裁剪，缓存就会无限增长，因此这里再加一层硬上限。
+        """
+        if not msg_id:
+            return
+        registry = self.image_registry[origin]
+        registry[msg_id] = payload
+        while len(registry) > max(1, int(max_entries)):
+            registry.pop(next(iter(registry)))
 
     def remember_sender(self, origin: str, sender_id: str, nickname: str) -> None:
         """记录 QQ 号与昵称的对应关系（用于无标签的 "@昵称" 兜底）。"""

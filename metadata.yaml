@@ -1,10 +1,10 @@
 name: astrbot_plugin_active_reply
-display_name: 主动回复（ActiveReply）
+display_name: 主动回复与记忆（Reply & Memory）
 desc: 群聊主动回复增强插件：React 群聊上下文、模型判定主动回复、智能 @ 与引用、联网搜索、记忆 RAG 与可视化面板。
-short_desc: 让 Bot 自己决定何时开口、@ 谁、引用哪条消息。
+short_desc: 主动回复 + 长期记忆：让 Bot 自己决定何时开口、@ 谁，并记住该记的事。
 author: Dew
-repo: https://github.com/AethenNet/astrbot_plugin_active_reply
-version: v1.0.5
+repo: https://github.com/AethenNet/astrbot_plugin_Reply-Memory
+version: v1.1.0-beta.2
 category: 工具、AI 增强
 support_platforms:
   - aiocqhttp

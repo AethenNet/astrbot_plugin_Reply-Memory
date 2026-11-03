@@ -21,10 +21,15 @@ from astrbot.api import logger
 
 from .block_store import default_reason, format_remaining, parse_until
 from .config_model import (
+    DEFAULT_GROUP_SUMMARY_PROMPT,
+    DEFAULT_PRIVATE_SUMMARY_PROMPT,
+    GROUP_FIELD_BY_PATH,
     GROUP_OVERRIDE_FIELDS,
     build_global_snapshot,
     build_schema_patch,
+    coerce_group_value,
     deep_merge,
+    get_by_path,
 )
 from .web_compat import fail, ok, query_get, read_json
 
@@ -149,6 +154,24 @@ class PageApi:
     # ------------------------------------------------------------------ #
     # 概览
     # ------------------------------------------------------------------ #
+    def _memory_stats(self) -> dict[str, Any]:
+        """统一的记忆统计入口：总数、来源与今日新增，供两个页面复用。"""
+        store = self.plugin.memory_store
+        if store is None:
+            return {}
+        stats = store.get_stats()
+        counts = store.source_counts()
+        now = datetime.datetime.now(self.plugin._tzinfo())
+        today_start = now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+        stats["source_counts"] = {
+            "keyword": int(counts.get("keyword", 0)),
+            "model": int(counts.get("model", 0)),
+            "manual": int(counts.get("manual", 0)),
+            "consolidation": int(counts.get("consolidation", 0)),
+        }
+        stats["today"] = int(store.count_since(today_start))
+        return stats
+
     async def overview(self) -> dict[str, Any]:
         """汇总插件版本、群组、记忆统计、提供商和功能开关。"""
         # 汇总版本、群、记忆、Embedding 和全局开关供状态页一次渲染。
@@ -162,11 +185,10 @@ class PageApi:
             groups = []
 
         stats: dict[str, Any] = {}
-        if plugin.memory_store is not None:
-            try:
-                stats = plugin.memory_store.get_stats()
-            except Exception as exc:
-                logger.error(f"[ActiveReply] 读取记忆统计失败: {exc}", exc_info=True)
+        try:
+            stats = self._memory_stats()
+        except Exception as exc:
+            logger.error(f"[ActiveReply] 读取记忆统计失败: {exc}", exc_info=True)
 
         embedding_options = self._embedding_options()
         embedding = {
@@ -193,6 +215,17 @@ class PageApi:
                     "smart_reply": cfg.smart_reply_enabled,
                     "web_search": cfg.web_search.enable,
                     "memory_rag": cfg.memory_rag.enable,
+                },
+                "memory_engine": {
+                    "fts_enabled": bool(
+                        getattr(plugin.memory_store, "fts_enabled", False)
+                    ),
+                    "lexical_recall": cfg.memory_rag.lexical_recall,
+                    "inject_items": cfg.memory_rag.inject_max_items,
+                    "inject_chars": cfg.memory_rag.inject_max_chars,
+                    "online_scan_limit": cfg.memory_rag.online_scan_limit,
+                    "min_similarity": cfg.memory_rag.min_similarity,
+                    "embedding_cache_ttl": cfg.memory_rag.embedding_cache_ttl,
                 },
                 "providers": self._provider_options(),
             }
@@ -304,8 +337,35 @@ class PageApi:
             if independent:
                 if not values:
                     return fail("启用独立配置时至少需要提交一个字段")
-                saved = plugin.group_store.save_overrides(group_id, values, note=note)
+                # 只保存“与全局值不同”的字段。页面会提交完整表单，
+                # 若把未修改的默认值（尤其是记忆 RAG 的默认 False）也写入，
+                # 会导致该群记忆在没有提示的情况下被关闭。
+                global_values = build_global_snapshot(plugin._global_cfg())
+                existing = plugin.group_store.get_overrides(group_id)
+                overrides: dict[str, Any] = {}
+                for spec in GROUP_OVERRIDE_FIELDS:
+                    current = get_by_path(existing, spec.path)
+                    if current is not None:
+                        overrides[spec.path] = current
+                for path, value in values.items():
+                    spec = GROUP_FIELD_BY_PATH.get(str(path))
+                    if spec is None:
+                        continue
+                    coerced = coerce_group_value(spec, value)
+                    if coerced == global_values.get(path):
+                        overrides.pop(path, None)
+                    else:
+                        overrides[path] = coerced
+                if overrides:
+                    saved = plugin.group_store.save_overrides(
+                        group_id, overrides, note=note
+                    )
+                else:
+                    plugin.group_store.save_overrides(group_id, {}, note=note)
+                    plugin.group_store.set_independent(group_id, False, note=note)
+                    saved = {}
             else:
+                plugin.group_store.save_overrides(group_id, {}, note=note)
                 plugin.group_store.set_independent(group_id, False, note=note)
                 saved = {}
         except Exception as exc:
@@ -313,12 +373,23 @@ class PageApi:
             return fail(f"保存失败：{exc}")
 
         plugin.invalidate_config_cache()
+        # 提交值全部等于全局值时会退化为「跟随全局」，返回值必须以实际存储为准，
+        # 否则前端会显示「已独立配置」而后台其实已跟随全局。
+        actual_independent = bool(
+            plugin.group_store.get_meta(group_id).get("independent")
+        )
         logger.info(
             "[ActiveReply] 群配置已保存 | group=%s independent=%s",
             group_id,
-            independent,
+            actual_independent,
         )
-        return ok({"group_id": group_id, "independent": independent, "saved": saved})
+        return ok(
+            {
+                "group_id": group_id,
+                "independent": actual_independent,
+                "saved": saved,
+            }
+        )
 
     async def reset_group(self, group_id: str) -> dict[str, Any]:
         """删除指定群的本地覆盖配置，使其恢复继承全局设置。"""
@@ -340,7 +411,7 @@ class PageApi:
         if store is None:
             return fail("记忆库未初始化")
         try:
-            stats = store.get_stats()
+            stats = self._memory_stats()
             scopes = store.list_group_scopes()
         except Exception as exc:
             logger.error(f"[ActiveReply] 读取记忆统计失败: {exc}", exc_info=True)
@@ -358,6 +429,9 @@ class PageApi:
         keyword = query_get("keyword", "", str)
         group_scope = query_get("group_scope", "", str)
         role_id = query_get("role_id", "", str)
+        memory_type = query_get("memory_type", "", str)
+        identity = query_get("identity", "", str)
+        include_archived = bool(query_get("include_archived", 0, int))
         try:
             data = store.list_memories(
                 page=page or 1,
@@ -365,6 +439,9 @@ class PageApi:
                 keyword=keyword or "",
                 group_scope=group_scope or "",
                 role_id=role_id or "",
+                memory_type=memory_type or "",
+                identity=identity or "",
+                include_archived=include_archived,
             )
         except Exception as exc:
             logger.error(f"[ActiveReply] 读取记忆列表失败: {exc}", exc_info=True)
@@ -378,36 +455,20 @@ class PageApi:
     # 自动记忆
     # ------------------------------------------------------------------ #
     def _auto_memory_state(self) -> dict[str, Any]:
-        """汇总自动抽取配置、记忆来源统计及当日新增数量。"""
-        # 聚合自动抽取参数、记忆来源计数和当日新增量。
+        """返回自动抽取参数与开关状态（统计数字由记忆页统一提供）。"""
+        # 自动抽取参数；统计数字由记忆页统一提供，这里不再重复查询。
         cfg = self.plugin._global_cfg()
-        store = self.plugin.memory_store
-        stats = store.get_stats() if store else {}
-        counts = store.source_counts() if store else {}
-        today_start = 0.0
-        try:
-            now = datetime.datetime.now(self.plugin._tzinfo())
-            today_start = now.replace(
-                hour=0, minute=0, second=0, microsecond=0
-            ).timestamp()
-        except Exception:
-            today_start = 0.0
-        today = store.count_since(today_start) if store else 0
         return {
-            "enabled": bool(cfg.memory_rag.auto_extract_enable),
+            "enabled": bool(
+                cfg.memory_rag.enable and cfg.memory_rag.auto_extract_enable
+            ),
+            "memory_enabled": bool(cfg.memory_rag.enable),
             "provider_id": cfg.memory_rag.auto_extract_provider_id,
-            "every_n": cfg.memory_rag.auto_extract_every_n,
+            "batch_messages": cfg.memory_rag.batch_messages,
             "interval_minutes": cfg.memory_rag.auto_extract_interval_minutes,
-            "window": cfg.memory_rag.auto_extract_window,
+            "private_every_n": cfg.memory_rag.private_extract_every_n,
             "min_confidence": cfg.memory_rag.auto_extract_min_confidence,
             "scope": cfg.memory_rag.auto_extract_scope,
-            "stats": {
-                "total": int(stats.get("total_memories", 0) or 0),
-                "keyword": int(counts.get("keyword", 0)),
-                "model": int(counts.get("model", 0)),
-                "manual": int(counts.get("manual", 0)),
-                "today": int(today),
-            },
             "providers": self._provider_options(),
         }
 
@@ -423,7 +484,7 @@ class PageApi:
         if "enable" not in payload:
             return fail("缺少 enable 参数")
         enable = bool(payload.get("enable"))
-        patch = {"memory_rag": {"auto_extract_enable": enable}}
+        patch = {"memory_rag": {"memory_generation": {"auto_extract_enable": enable}}}
         merged = deep_merge(copy.deepcopy(dict(self.plugin.config)), patch)
         try:
             self.plugin.config.clear()
@@ -456,11 +517,35 @@ class PageApi:
         store = self.plugin.memory_store
         if store is None:
             return fail("记忆库未初始化")
-        removed = store.delete_memory(memory_id)
+        removed = await asyncio.to_thread(store.delete_memory, memory_id)
         if not removed:
             return fail("记忆不存在或已删除")
         logger.info("[ActiveReply] 页面删除记忆 | id=%s", memory_id)
-        return ok({"memory_id": memory_id, "deleted": True})
+        return ok(
+            {
+                "memory_id": memory_id,
+                "deleted": True,
+                "trash_id": await asyncio.to_thread(store.latest_trash_id),
+            }
+        )
+
+    async def rag_restore(self) -> dict[str, Any]:
+        """撤销删除：从回收站恢复一条记忆。"""
+        store = self.plugin.memory_store
+        if store is None:
+            return fail("记忆库未初始化")
+        payload = await read_json()
+        try:
+            trash_id = int(payload.get("trash_id") or 0)
+        except (TypeError, ValueError):
+            return fail("trash_id 无效")
+        if trash_id <= 0:
+            return fail("trash_id 无效")
+        new_id = await asyncio.to_thread(store.restore_memory, trash_id)
+        if new_id is None:
+            return fail("回收站中没有该记录")
+        logger.info("[ActiveReply] 页面撤销删除 | trash=%s new_id=%s", trash_id, new_id)
+        return ok({"memory_id": new_id, "restored": True})
 
     async def rag_cleanup(self) -> dict[str, Any]:
         """在线程池执行旧格式记忆数据清理，避免阻塞事件循环。"""
@@ -474,6 +559,47 @@ class PageApi:
             logger.error(f"[ActiveReply] 清理记忆失败: {exc}", exc_info=True)
             return fail(f"清理失败：{exc}")
         return ok(result)
+
+    async def prompt_preview(self) -> dict[str, Any]:
+        """返回最终提示词（含系统追加规则）供面板展示。"""
+        kind = (
+            "private"
+            if str(query_get("kind", "")).strip().lower() == "private"
+            else "group"
+        )
+        try:
+            return ok(self.plugin.prompt_preview(kind))
+        except Exception as exc:
+            logger.error(f"[ActiveReply] 生成提示词预览失败: {exc}", exc_info=True)
+            return fail(f"生成预览失败：{exc}")
+
+    async def prompt_reset(self) -> dict[str, Any]:
+        """把提示词恢复为内置默认（由前端确认后调用）。"""
+        payload = await read_json()
+        kind = (
+            "private"
+            if str(payload.get("kind") or "").strip().lower() == "private"
+            else "group"
+        )
+        key = "memory_private_prompt" if kind == "private" else "memory_group_prompt"
+        default = (
+            DEFAULT_PRIVATE_SUMMARY_PROMPT
+            if kind == "private"
+            else DEFAULT_GROUP_SUMMARY_PROMPT
+        )
+        section = self.plugin.config.setdefault("memory_rag", {})
+        generation = section.setdefault("memory_generation", {})
+        generation[key] = default
+        warning = ""
+        saver = getattr(self.plugin.config, "save_config", None)
+        if callable(saver):
+            try:
+                saver()
+            except Exception as exc:
+                warning = str(exc)
+                logger.error(f"[ActiveReply] 保存提示词失败: {exc}", exc_info=True)
+        self.plugin.invalidate_config_cache()
+        return ok({"kind": kind, "chars": len(default), "warning": warning})
 
     async def rag_selftest(self) -> dict[str, Any]:
         """记忆 RAG 自检：写入 → 读回 → 语义检索 → 删除一条临时记忆。"""
@@ -510,7 +636,8 @@ class PageApi:
 
         memory_id: int | None = None
         try:
-            memory_id = store.add_memory(
+            memory_id = await asyncio.to_thread(
+                store.add_memory,
                 content="ActiveReply 记忆自检",
                 embedding=vector,
                 role_ids=["selftest"],
@@ -526,14 +653,15 @@ class PageApi:
             return ok({"passed": False, "steps": steps})
 
         try:
-            got = store.get_memory(memory_id or 0)
+            got = await asyncio.to_thread(store.get_memory, memory_id or 0)
             add(
                 "读回记忆",
                 bool(got and got.get("content") == "ActiveReply 记忆自检"),
                 "内容一致" if got else "读回为空",
             )
 
-            hits = store.search_memories(
+            hits = await asyncio.to_thread(
+                store.search_memories,
                 query_embedding=vector,
                 recall_k=5,
                 group_scope="selftest",
@@ -545,13 +673,29 @@ class PageApi:
             add("读回/检索", False, str(exc))
         finally:
             try:
-                removed = store.delete_memory(memory_id or 0)
+                removed = await asyncio.to_thread(store.delete_memory, memory_id or 0)
                 add("清理自检数据", removed, f"删除 id={memory_id}")
             except Exception as exc:
                 add("清理自检数据", False, str(exc))
 
         passed = all(step["ok"] for step in steps)
-        return ok({"passed": passed, "steps": steps})
+        # 提示词自检与存储自检合并成一次「自检」，结果单独成段，互不影响成败判定。
+        try:
+            prompt_result = await plugin.run_prompt_test("group")
+        except Exception as exc:
+            prompt_result = {"ok": False, "error": str(exc)}
+        prompt_block = {
+            "ok": bool(prompt_result.get("ok")),
+            "error": str(prompt_result.get("error") or ""),
+            "version": prompt_result.get("prompt_version"),
+            "model": prompt_result.get("model"),
+            "parser": prompt_result.get("parser"),
+            "elapsed_ms": prompt_result.get("elapsed_ms"),
+            "items": prompt_result.get("items") or [],
+            "evidence_ok": prompt_result.get("evidence_ok"),
+            "raw": str(prompt_result.get("raw") or "")[:2000],
+        }
+        return ok({"passed": passed, "steps": steps, "prompt": prompt_block})
 
     # ------------------------------------------------------------------ #
     # 用户屏蔽

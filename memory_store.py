@@ -13,14 +13,20 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import sqlite3
 import threading
 import time
+from array import array
 from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
+
+from .memory_conflict import entities_overlap, same_kind
+from .memory_scope import ScopeFilter
+from .vector_math import cosine_scores
 
 DEFAULT_SCAN_LIMIT = 5000
 
@@ -54,6 +60,9 @@ class MemoryStore:
         self._lock = threading.RLock()
         self._timezone_name = "Asia/Shanghai"
         self._tzinfo: Any = timezone.utc
+        # FTS5 可用性在 _init_schema 里探测；不可用时词法通道自动降级为空结果。
+        self.fts_enabled = False
+        self.fts_error = ""
         self.set_display_timezone(display_timezone)
         self._init_schema()
         self.normalize_group_scopes()
@@ -103,8 +112,178 @@ class MemoryStore:
                 CREATE INDEX IF NOT EXISTS idx_memories_platform ON memories(platform_id);
                 CREATE INDEX IF NOT EXISTS idx_roles_role ON memory_roles(role_id);
                 CREATE INDEX IF NOT EXISTS idx_roles_memory ON memory_roles(memory_id);
+
+                CREATE TABLE IF NOT EXISTS memory_trash (
+                    trash_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    original_id INTEGER NOT NULL,
+                    payload TEXT NOT NULL,
+                    roles TEXT NOT NULL DEFAULT '[]',
+                    deleted_at REAL NOT NULL
+                );
                 """
             )
+            self._ensure_columns(conn)
+            self._ensure_fts(conn)
+
+    _EXTRA_COLUMNS = {
+        "memory_type": "TEXT NOT NULL DEFAULT 'group'",
+        "sender_id": "TEXT NOT NULL DEFAULT ''",
+        "sender_role": "TEXT NOT NULL DEFAULT 'member'",
+        "source_msg_id": "TEXT NOT NULL DEFAULT ''",
+        "source_time": "REAL NOT NULL DEFAULT 0",
+        "importance": "REAL NOT NULL DEFAULT 0.5",
+        "last_access": "REAL NOT NULL DEFAULT 0",
+        "access_count": "INTEGER NOT NULL DEFAULT 0",
+        "superseded_by": "INTEGER DEFAULT NULL",
+        "archived": "INTEGER NOT NULL DEFAULT 0",
+        # 向量改用二进制存储，避免每次召回都 json.loads 数万字符；JSON 列保留给
+        # 旧库与回收站兼容，读取时优先用 BLOB。
+        "embedding_blob": "BLOB",
+        "embedding_norm": "REAL",
+        # 中文 bigram 文本，供 FTS5 词法通道使用。
+        "grams": "TEXT",
+        # 原子记忆维度：类型、实体、有效期、置信度、抽取批次。
+        "kind": "TEXT NOT NULL DEFAULT 'fact'",
+        "entities": "TEXT NOT NULL DEFAULT '[]'",
+        "valid_until": "REAL DEFAULT NULL",
+        "confidence": "REAL NOT NULL DEFAULT 0.5",
+        "source_batch": "TEXT NOT NULL DEFAULT ''",
+    }
+
+    def _ensure_columns(self, conn: sqlite3.Connection) -> None:
+        """为旧版数据库补齐新增字段（幂等）。"""
+        existing = {
+            str(row["name"])
+            for row in conn.execute("PRAGMA table_info(memories)").fetchall()
+        }
+        for name, ddl in self._EXTRA_COLUMNS.items():
+            if name not in existing:
+                conn.execute(f"ALTER TABLE memories ADD COLUMN {name} {ddl}")
+
+    # ------------------------------------------------------------------ #
+    # 词法索引（FTS5）与二进制向量
+    # ------------------------------------------------------------------ #
+    _GRAM_TOKEN_RE = re.compile(r"[a-z0-9]+|[\u4e00-\u9fff]+")
+
+    @classmethod
+    def _build_grams(cls, text: str) -> str:
+        """把正文切成「英文词 + 中文 bigram」的检索词串。
+
+        FTS5 的 trigram 分词对两个汉字的中文查询不生效（实测 ``火锅`` 匹配不到），
+        因此这里自己生成 bigram，用 unicode61 分词器索引，2 字查询也能命中。
+        """
+        tokens: list[str] = []
+        for match in cls._GRAM_TOKEN_RE.finditer(str(text or "").lower()):
+            segment = match.group(0)
+            if segment[0].isascii():
+                if len(segment) >= 2:
+                    tokens.append(segment)
+                continue
+            if len(segment) == 1:
+                tokens.append(segment)
+            else:
+                tokens.extend(segment[i : i + 2] for i in range(len(segment) - 1))
+        return " ".join(dict.fromkeys(tokens))
+
+    @staticmethod
+    def _encode_vector(vector: list[float]) -> bytes:
+        """把浮点向量编码为小端 float32 BLOB。"""
+        return array("f", [float(value) for value in vector]).tobytes()
+
+    @staticmethod
+    def _decode_vector(raw: Any) -> list[float]:
+        """把 BLOB 还原成浮点列表；格式不符时返回空列表。"""
+        if not raw:
+            return []
+        try:
+            values = array("f")
+            values.frombytes(bytes(raw))
+        except (ValueError, TypeError):
+            return []
+        return [float(value) for value in values]
+
+    def _row_embedding(self, row: sqlite3.Row) -> list[float]:
+        """读取一行记录的记忆向量：优先 BLOB，回退旧版 JSON。"""
+        try:
+            keys = row.keys()
+        except AttributeError:
+            keys = []
+        if "embedding_blob" in keys:
+            vector = self._decode_vector(row["embedding_blob"])
+            if vector:
+                return vector
+        return self._parse_embedding(row["embedding"])
+
+    def _ensure_fts(self, conn: sqlite3.Connection) -> None:
+        """建立记忆全文索引与同步触发器；FTS5 不可用时安静降级。
+
+        外部内容表（content='memories'）只存索引，正文仍以主表为准；触发器
+        保证插入 / 更新 / 删除时索引与主表一致，``rebuild`` 用于整体重建。
+        """
+        try:
+            conn.execute(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5("
+                "content, grams, content='memories', content_rowid='id', "
+                "tokenize='unicode61')"
+            )
+        except sqlite3.DatabaseError as exc:  # pragma: no cover - 依赖 SQLite 构建
+            self.fts_enabled = False
+            self.fts_error = str(exc)
+            return
+        self.fts_enabled = True
+        conn.executescript(
+            """
+            CREATE TRIGGER IF NOT EXISTS memory_fts_ai AFTER INSERT ON memories BEGIN
+              INSERT INTO memory_fts(rowid, content, grams)
+              VALUES (new.id, new.content, coalesce(new.grams, ''));
+            END;
+            CREATE TRIGGER IF NOT EXISTS memory_fts_ad AFTER DELETE ON memories BEGIN
+              INSERT INTO memory_fts(memory_fts, rowid, content, grams)
+              VALUES ('delete', old.id, old.content, coalesce(old.grams, ''));
+            END;
+            CREATE TRIGGER IF NOT EXISTS memory_fts_au
+            AFTER UPDATE OF content, grams ON memories BEGIN
+              INSERT INTO memory_fts(memory_fts, rowid, content, grams)
+              VALUES ('delete', old.id, old.content, coalesce(old.grams, ''));
+              INSERT INTO memory_fts(rowid, content, grams)
+              VALUES (new.id, new.content, coalesce(new.grams, ''));
+            END;
+            """
+        )
+        self._backfill_grams(conn)
+
+    def _backfill_grams(self, conn: sqlite3.Connection, batch: int = 500) -> int:
+        """为旧数据补算 bigram 文本；只有真的补了数据才重建索引。
+
+        旧实现单次只处理 5000 行，库更大时要重启多次才能补齐；这里循环分批，
+        一次启动就能完成，同时避免每次启动都做无谓的全量 rebuild。
+        """
+        size = max(1, int(batch))
+        filled = 0
+        while True:
+            rows = conn.execute(
+                "SELECT id, content FROM memories WHERE grams IS NULL LIMIT ?",
+                (size,),
+            ).fetchall()
+            if not rows:
+                break
+            conn.executemany(
+                "UPDATE memories SET grams = ? WHERE id = ?",
+                [(self._build_grams(row["content"]), int(row["id"])) for row in rows],
+            )
+            filled += len(rows)
+            if len(rows) < size:
+                break
+        if filled:
+            conn.execute("INSERT INTO memory_fts(memory_fts) VALUES('rebuild')")
+        return filled
+
+    def rebuild_fts(self) -> int:
+        """整体重建词法索引，返回补算 bigram 的记录数。"""
+        if not self.fts_enabled:
+            return 0
+        with self._lock, closing(self._connect()) as conn, conn:
+            return self._backfill_grams(conn)
 
     _MESSAGE_TYPE_SEGMENTS = {
         "group",
@@ -144,6 +323,23 @@ class MemoryStore:
                 )
                 changed += 1
         return changed
+
+    def backfill_roles_from_sender(self) -> int:
+        """给没有角色关联的旧记忆补上写入时的发送者（幂等）。
+
+        可见性规则依赖 ``memory_roles`` 判断“本人参与”；v1.1 之前写入的全局
+        记忆可能只有 ``sender_id`` 没有角色行，补不上的仍按不可跨群处理，
+        宁可少召回，也不把别人的记忆带到别的会话。
+        """
+        with self._lock, closing(self._connect()) as conn, conn:
+            before = conn.total_changes
+            conn.execute(
+                "INSERT INTO memory_roles(memory_id, role_id) "
+                "SELECT m.id, m.sender_id FROM memories AS m "
+                "WHERE m.sender_id != '' AND NOT EXISTS ("
+                "SELECT 1 FROM memory_roles AS r WHERE r.memory_id = m.id)"
+            )
+            return int(conn.total_changes - before)
 
     def set_display_timezone(self, timezone_name: str) -> str:
         """设置时间展示使用的时区（与 AstrBot 全局 timezone 保持一致）。"""
@@ -204,6 +400,19 @@ class MemoryStore:
         return vector
 
     @staticmethod
+    def _parse_entities(raw: str | None) -> list[str]:
+        """把实体 JSON 还原成字符串列表；损坏时返回空列表。"""
+        if not raw:
+            return []
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            return []
+        if not isinstance(parsed, list):
+            return []
+        return [str(item).strip() for item in parsed if str(item).strip()][:8]
+
+    @staticmethod
     def _parse_metadata(raw: str | None) -> dict[str, Any]:
         """将扩展元数据 JSON 还原为字典，其他内容返回空字典。"""
         # 将扩展元数据安全还原为字典，未知或损坏内容按空元数据处理。
@@ -252,6 +461,7 @@ class MemoryStore:
     def _row_to_item(self, row: sqlite3.Row, role_ids: list[str]) -> dict[str, Any]:
         """将数据库行转换为包含角色和时区信息的普通字典。"""
         # 把 SQLite 行转换为不依赖 sqlite3.Row 的普通 API 字典。
+        keys = row.keys()
         item: dict[str, Any] = {
             "memory_id": int(row["id"]),
             "content": str(row["content"]),
@@ -263,13 +473,103 @@ class MemoryStore:
             "extra_metadata": self._parse_metadata(row["extra_metadata"]),
             "created_at": float(row["created_at"]),
             "updated_at": float(row["updated_at"]),
+            "memory_type": str(row["memory_type"] or "group")
+            if "memory_type" in keys
+            else "group",
+            "sender_id": str(row["sender_id"] or "") if "sender_id" in keys else "",
+            "sender_role": str(row["sender_role"] or "member")
+            if "sender_role" in keys
+            else "member",
+            "source_msg_id": str(row["source_msg_id"] or "")
+            if "source_msg_id" in keys
+            else "",
+            "source_time": float(row["source_time"] or 0)
+            if "source_time" in keys
+            else 0.0,
+            "importance": float(row["importance"] or 0.5)
+            if "importance" in keys
+            else 0.5,
+            "last_access": float(row["last_access"] or 0)
+            if "last_access" in keys
+            else 0.0,
+            "access_count": int(row["access_count"] or 0)
+            if "access_count" in keys
+            else 0,
+            "superseded_by": (
+                int(row["superseded_by"]) if row["superseded_by"] is not None else None
+            )
+            if "superseded_by" in keys
+            else None,
+            "archived": int(row["archived"] or 0) if "archived" in keys else 0,
+            "kind": str(row["kind"] or "fact") if "kind" in keys else "fact",
+            "entities": self._parse_entities(row["entities"])
+            if "entities" in keys
+            else [],
+            "valid_until": (
+                float(row["valid_until"])
+                if "valid_until" in keys and row["valid_until"] is not None
+                else None
+            ),
+            "confidence": float(row["confidence"] or 0.5)
+            if "confidence" in keys
+            else 0.5,
+            "source_batch": str(row["source_batch"] or "")
+            if "source_batch" in keys
+            else "",
         }
+        item["type_label"] = {
+            "personal": "个人",
+            "group": "群聊",
+            "private": "私聊",
+        }.get(item["memory_type"], "未知")
+        item["identity_label"] = {
+            "owner": "所有者",
+            "group_owner": "群主",
+            "group_admin": "群管理",
+            "member": "群成员",
+        }.get(item["sender_role"], "群成员")
+        if item["source_time"]:
+            item["source_time_iso"] = self.format_timestamp_iso(item["source_time"])
         item.update(self._time_fields(float(row["memory_time"])))
         return item
+
+    def _roles_map(self, ids: list[int]) -> dict[int, list[str]]:
+        """批量取回记忆关联的角色 ID，按 ``memory_id`` 分组。"""
+        if not ids:
+            return {}
+        placeholders = ",".join("?" for _ in ids)
+        with self._lock, closing(self._connect()) as conn:
+            rows = conn.execute(
+                f"SELECT memory_id, role_id FROM memory_roles "
+                f"WHERE memory_id IN ({placeholders}) ORDER BY memory_id, role_id",
+                ids,
+            ).fetchall()
+        grouped: dict[int, list[str]] = {}
+        for row in rows:
+            grouped.setdefault(int(row["memory_id"]), []).append(str(row["role_id"]))
+        return grouped
 
     # ------------------------------------------------------------------ #
     # 写入 / 读取
     # ------------------------------------------------------------------ #
+    def find_exact_memory(self, content: str, group_scope: str = "") -> int | None:
+        """查找同作用域下正文完全相同的未归档记忆，用于快速去重。
+
+        作用域必须精确匹配：否则两个群说同一句话时，后写入的那条会被当成
+        重复丢弃，还会返回别的群的记忆 ID。
+        """
+        text = str(content or "").strip()
+        if not text:
+            return None
+        scope = str(group_scope or "").strip()
+        with self._lock, closing(self._connect()) as conn:
+            row = conn.execute(
+                "SELECT id FROM memories WHERE content = ? AND group_scope = ? "
+                "AND archived = 0 ORDER BY id DESC LIMIT 1",
+                (text, scope),
+            ).fetchone()
+        return int(row["id"]) if row else None
+
     def add_memory(
         self,
         *,
@@ -281,6 +581,17 @@ class MemoryStore:
         group_id: str = "",
         platform_id: str = "",
         extra_metadata: dict[str, Any] | None = None,
+        memory_type: str = "group",
+        sender_id: str = "",
+        sender_role: str = "member",
+        source_msg_id: str = "",
+        source_time: float | None = None,
+        importance: float = 0.5,
+        kind: str = "fact",
+        entities: list[str] | None = None,
+        valid_until: float | None = None,
+        confidence: float = 0.5,
+        source_batch: str = "",
     ) -> int:
         """持久化一条记忆及其角色关联，并返回新记录 ID。
 
@@ -319,6 +630,14 @@ class MemoryStore:
         timestamp, _ = self._normalize_timestamp(raw_time)
         now = time.time()
         metadata = extra_metadata if isinstance(extra_metadata, dict) else {}
+        clean_entities = [
+            str(item).strip()
+            for item in (entities or [])
+            if str(item).strip() and len(str(item).strip()) >= 2
+        ][:8]
+        clean_kind = str(kind or "fact").strip().lower()
+        if clean_kind not in {"fact", "preference", "plan", "episode", "relation"}:
+            clean_kind = "fact"
 
         with self._lock, closing(self._connect()) as conn, conn:
             cursor = conn.execute(
@@ -326,12 +645,16 @@ class MemoryStore:
                 INSERT INTO memories (
                     content, embedding, embedding_dim, memory_time,
                     group_scope, group_id, platform_id, extra_metadata,
-                    created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    created_at, updated_at, memory_type, sender_id, sender_role,
+                    source_msg_id, source_time, importance,
+                    embedding_blob, embedding_norm, grams,
+                    kind, entities, valid_until, confidence, source_batch
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     clean_content,
-                    json.dumps(vector, ensure_ascii=False),
+                    # 向量只存 BLOB；JSON 列留空串，仅供旧库/第三方读取回退。
+                    "",
                     len(vector),
                     timestamp,
                     str(group_scope or "").strip(),
@@ -340,6 +663,20 @@ class MemoryStore:
                     json.dumps(metadata, ensure_ascii=False),
                     now,
                     now,
+                    str(memory_type or "group"),
+                    str(sender_id or "").strip(),
+                    str(sender_role or "member"),
+                    str(source_msg_id or "").strip(),
+                    float(source_time or timestamp),
+                    max(0.0, min(1.0, float(importance))),
+                    self._encode_vector(vector),
+                    math.sqrt(sum(value * value for value in vector)),
+                    self._build_grams(" ".join([clean_content, *clean_entities])),
+                    clean_kind,
+                    json.dumps(clean_entities, ensure_ascii=False),
+                    float(valid_until) if valid_until else None,
+                    max(0.0, min(1.0, float(confidence))),
+                    str(source_batch or ""),
                 ),
             )
             memory_id = int(cursor.lastrowid or 0)
@@ -360,12 +697,7 @@ class MemoryStore:
             return None
         with self._lock, closing(self._connect()) as conn:
             row = conn.execute(
-                """
-                SELECT id, content, embedding_dim, memory_time, group_scope,
-                       group_id, platform_id, extra_metadata, created_at, updated_at
-                FROM memories WHERE id = ?
-                """,
-                (target,),
+                "SELECT * FROM memories WHERE id = ?", (target,)
             ).fetchone()
             if not row:
                 return None
@@ -383,6 +715,9 @@ class MemoryStore:
         keyword: str = "",
         group_scope: str = "",
         role_id: str = "",
+        memory_type: str = "",
+        identity: str = "",
+        include_archived: bool = False,
     ) -> dict[str, Any]:
         """按关键词、作用域和角色过滤记忆，并返回一页结果及分页信息。
 
@@ -422,6 +757,16 @@ class MemoryStore:
                 "WHERE r.memory_id = m.id AND r.role_id = ?)"
             )
             params.append(role_id)
+        memory_type = str(memory_type or "").strip()
+        if memory_type:
+            where.append("m.memory_type = ?")
+            params.append(memory_type)
+        identity = str(identity or "").strip()
+        if identity:
+            where.append("m.sender_role = ?")
+            params.append(identity)
+        if not include_archived:
+            where.append("m.archived = 0")
         where_sql = ("WHERE " + " AND ".join(where)) if where else ""
 
         with self._lock, closing(self._connect()) as conn:
@@ -431,9 +776,7 @@ class MemoryStore:
             total = int(total_row["total"]) if total_row else 0
             rows = conn.execute(
                 f"""
-                SELECT m.id, m.content, m.embedding_dim, m.memory_time,
-                       m.group_scope, m.group_id, m.platform_id,
-                       m.extra_metadata, m.created_at, m.updated_at
+                SELECT m.*
                 FROM memories m {where_sql}
                 ORDER BY m.memory_time DESC, m.id DESC
                 LIMIT ? OFFSET ?
@@ -470,8 +813,7 @@ class MemoryStore:
         }
 
     def delete_memory(self, memory_id: int) -> bool:
-        """删除指定记忆；关联角色由数据库外键级联清理。"""
-        # 删除主记录并依赖外键级联清理关联角色，返回是否删除到记录。
+        """删除记忆；ID 保持稳定不重排，被删内容暂存回收站以便撤销。"""
         try:
             target = int(memory_id)
         except (TypeError, ValueError):
@@ -479,8 +821,239 @@ class MemoryStore:
         if target <= 0:
             return False
         with self._lock, closing(self._connect()) as conn, conn:
-            cursor = conn.execute("DELETE FROM memories WHERE id = ?", (target,))
-            return cursor.rowcount > 0
+            row = conn.execute(
+                "SELECT * FROM memories WHERE id = ?", (target,)
+            ).fetchone()
+            if row is None:
+                return False
+            payload = self._payload_for_trash(row)
+            roles = [
+                str(item["role_id"])
+                for item in conn.execute(
+                    "SELECT role_id FROM memory_roles WHERE memory_id = ?", (target,)
+                ).fetchall()
+            ]
+            conn.execute(
+                "INSERT INTO memory_trash(original_id, payload, roles, deleted_at) "
+                "VALUES (?, ?, ?, ?)",
+                (
+                    target,
+                    json.dumps(payload, ensure_ascii=False),
+                    json.dumps(roles, ensure_ascii=False),
+                    time.time(),
+                ),
+            )
+            conn.execute("DELETE FROM memories WHERE id = ?", (target,))
+        return True
+
+    def _payload_for_trash(self, row: sqlite3.Row) -> dict[str, Any]:
+        """把一行记忆转成可 JSON 序列化的回收站载荷。
+
+        BLOB 无法直接 JSON 化，这里把向量回填成 JSON 文本，恢复时再重新编码；
+        索引列（grams / norm）不需要进回收站，恢复时按正文重算。
+        """
+        payload: dict[str, Any] = {}
+        for key in row.keys():  # noqa: SIM118 - sqlite3.Row 直接迭代会得到值而非列名
+            if key in {"embedding_blob", "embedding_norm", "grams"}:
+                continue
+            payload[key] = row[key]
+        vector = self._row_embedding(row)
+        if vector:
+            payload["embedding"] = json.dumps(vector, ensure_ascii=False)
+        return payload
+
+    def restore_memory(self, trash_id: int) -> int | None:
+        """从回收站恢复一条记忆，返回新 ID。"""
+        with self._lock, closing(self._connect()) as conn, conn:
+            row = conn.execute(
+                "SELECT payload, roles FROM memory_trash WHERE trash_id = ?",
+                (int(trash_id),),
+            ).fetchone()
+            if row is None:
+                return None
+            payload = json.loads(row["payload"])
+            roles = json.loads(row["roles"]) if row["roles"] else []
+            content = str(payload.get("content", ""))
+            vector = self._parse_embedding(payload.get("embedding", "[]"))
+            conn.execute(
+                """
+                INSERT INTO memories (
+                    content, embedding, embedding_dim, memory_time,
+                    group_scope, group_id, platform_id, extra_metadata,
+                    created_at, updated_at, memory_type, sender_id, sender_role,
+                    source_msg_id, source_time, importance,
+                    embedding_blob, embedding_norm, grams,
+                    kind, entities, valid_until, confidence, source_batch
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    content,
+                    payload.get("embedding", "[]"),
+                    payload.get("embedding_dim", 0),
+                    payload.get("memory_time", time.time()),
+                    payload.get("group_scope", ""),
+                    payload.get("group_id", ""),
+                    payload.get("platform_id", ""),
+                    payload.get("extra_metadata", "{}"),
+                    payload.get("created_at", time.time()),
+                    payload.get("updated_at", time.time()),
+                    payload.get("memory_type", "group"),
+                    payload.get("sender_id", ""),
+                    payload.get("sender_role", "member"),
+                    payload.get("source_msg_id", ""),
+                    payload.get("source_time", 0),
+                    payload.get("importance", 0.5),
+                    self._encode_vector(vector) if vector else None,
+                    math.sqrt(sum(value * value for value in vector))
+                    if vector
+                    else None,
+                    self._build_grams(
+                        " ".join(
+                            [content, *self._parse_entities(payload.get("entities"))]
+                        )
+                    ),
+                    payload.get("kind", "fact"),
+                    payload.get("entities", "[]"),
+                    payload.get("valid_until"),
+                    payload.get("confidence", 0.5),
+                    payload.get("source_batch", ""),
+                ),
+            )
+            new_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+            conn.executemany(
+                "INSERT OR IGNORE INTO memory_roles(memory_id, role_id) VALUES (?, ?)",
+                [(new_id, role) for role in roles],
+            )
+            conn.execute(
+                "DELETE FROM memory_trash WHERE trash_id = ?", (int(trash_id),)
+            )
+            return new_id
+
+    def latest_trash_id(self) -> int | None:
+        """返回最近一次删除写入回收站的 ID。"""
+        with self._lock, closing(self._connect()) as conn:
+            row = conn.execute(
+                "SELECT MAX(trash_id) AS tid FROM memory_trash"
+            ).fetchone()
+        return int(row["tid"]) if row and row["tid"] is not None else None
+
+    def bump_access(self, memory_ids: list[int]) -> None:
+        """命中记忆时更新最后访问时间与访问次数。"""
+        ids = [int(item) for item in memory_ids if int(item) > 0]
+        if not ids:
+            return
+        now = time.time()
+        with self._lock, closing(self._connect()) as conn, conn:
+            placeholders = ",".join("?" for _ in ids)
+            conn.execute(
+                f"UPDATE memories SET last_access = ?, access_count = access_count + 1 "
+                f"WHERE id IN ({placeholders})",
+                [now, *ids],
+            )
+
+    def merge_memory(
+        self,
+        memory_id: int,
+        *,
+        content: str = "",
+        embedding: list[float] | None = None,
+        entities: list[str] | None = None,
+        importance: float | None = None,
+        valid_until: float | None = None,
+    ) -> bool:
+        """把新信息合并进已有记忆，保留原 ID。
+
+        用于「同一件事被重新总结」的场景：正文与向量更新为较新版本，
+        实体取并集、重要性取较大值、有效期取较晚者，避免重复行。
+        """
+        try:
+            target = int(memory_id)
+        except (TypeError, ValueError):
+            return False
+        if target <= 0:
+            return False
+        with self._lock, closing(self._connect()) as conn, conn:
+            row = conn.execute(
+                "SELECT * FROM memories WHERE id = ?", (target,)
+            ).fetchone()
+            if row is None:
+                return False
+            new_content = str(content or row["content"]).strip() or row["content"]
+            vector = [float(value) for value in (embedding or self._row_embedding(row))]
+            old_entities = self._parse_entities(row["entities"])
+            merged_entities = list(dict.fromkeys([*old_entities, *(entities or [])]))[
+                :8
+            ]
+            expiry = float(valid_until) if valid_until else None
+            conn.execute(
+                "UPDATE memories SET content = ?, embedding = '', embedding_dim = ?, "
+                "updated_at = ?, importance = MAX(importance, ?), "
+                "valid_until = CASE WHEN ? IS NULL THEN valid_until "
+                "WHEN valid_until IS NULL THEN ? "
+                "ELSE MAX(valid_until, ?) END, "
+                "embedding_blob = ?, embedding_norm = ?, grams = ?, entities = ? "
+                "WHERE id = ?",
+                (
+                    new_content,
+                    len(vector),
+                    time.time(),
+                    float(importance) if importance is not None else 0.0,
+                    expiry,
+                    expiry,
+                    expiry,
+                    self._encode_vector(vector) if vector else None,
+                    math.sqrt(sum(value * value for value in vector))
+                    if vector
+                    else None,
+                    self._build_grams(" ".join([new_content, *merged_entities])),
+                    json.dumps(merged_entities, ensure_ascii=False),
+                    target,
+                ),
+            )
+        return True
+
+    def supersede(self, old_id: int, new_id: int) -> None:
+        """把旧记忆标记为被新记忆取代。"""
+        with self._lock, closing(self._connect()) as conn, conn:
+            conn.execute(
+                "UPDATE memories SET superseded_by = ? WHERE id = ?",
+                (int(new_id), int(old_id)),
+            )
+
+    def archive_stale(self, *, days: float = 20.0, max_importance: float = 0.35) -> int:
+        """归档低重要性且长期未访问的记忆。"""
+        cutoff = time.time() - max(1.0, float(days)) * 86400
+        with self._lock, closing(self._connect()) as conn, conn:
+            cursor = conn.execute(
+                "UPDATE memories SET archived = 1 "
+                "WHERE archived = 0 AND importance <= ? "
+                "AND COALESCE(NULLIF(last_access, 0), memory_time) < ?",
+                (float(max_importance), cutoff),
+            )
+            return int(cursor.rowcount or 0)
+
+    def archive_expired(self, now: float | None = None) -> int:
+        """把有效期已过的计划/事件归档（不删除，仍可回溯）。"""
+        cutoff = float(now if now is not None else time.time())
+        with self._lock, closing(self._connect()) as conn, conn:
+            cursor = conn.execute(
+                "UPDATE memories SET archived = 1 WHERE archived = 0 "
+                "AND valid_until IS NOT NULL AND valid_until < ?",
+                (cutoff,),
+            )
+            return int(cursor.rowcount or 0)
+
+    @staticmethod
+    def should_supersede(
+        old_kind: Any,
+        old_entities: Any,
+        new_kind: Any,
+        new_entities: Any,
+    ) -> bool:
+        """新记忆能否取代相似旧记忆：同类型且实体有交集（规则见 memory_conflict）。"""
+        return same_kind(old_kind, new_kind) and entities_overlap(
+            old_entities, new_entities
+        )
 
     def find_similar_memory(
         self,
@@ -489,53 +1062,62 @@ class MemoryStore:
         group_scope: str = "",
         threshold: float = 0.92,
         scan_limit: int = 2000,
-        include_global: bool = False,
     ) -> dict[str, Any] | None:
         """在限定作用域的近期记忆中查找最相似项，用于避免重复写入。
 
+        作用域语义与 ``search_memories(scope_mode="exact")`` 一致：非空作用域
+        匹配「本作用域 + 全局记忆」，空作用域只匹配全局记忆。空作用域若不限制
+        过滤，写一条全局记忆时会和别的群的记忆比较，进而把它当作冲突项取代掉。
+        已归档或已被取代的记忆不参与比较：否则新记忆会被误判为「已有记忆」
+        而丢弃，或再次取代一条早已失效的旧记忆。
+
         Args:
             embedding: 待比较的查询向量。
-            group_scope: 记忆作用域；为空时不限制作用域。
+            group_scope: 记忆作用域；为空表示这是全局记忆。
             threshold: 相似度最低阈值。
             scan_limit: 最多扫描的近期记录数。
-            include_global: 有指定作用域时是否仅检索该作用域，不含全局记忆。
 
         Returns:
-            达到阈值的最佳记忆摘要；没有匹配项时返回 None。
+            达到阈值的最佳记忆摘要（含 ``kind`` 与 ``entities``）；没有匹配项
+            时返回 None。
         """
         if not embedding:
             return None
-        where = ""
-        params: list[Any] = []
         scope = str(group_scope or "").strip()
-        if scope and not include_global:
-            where = " WHERE m.group_scope = ? OR m.group_scope = ''"
-            params.append(scope)
-        elif scope and include_global:
-            where = " WHERE m.group_scope = ?"
-            params.append(scope)
+        if scope:
+            where = " WHERE (m.group_scope = ? OR m.group_scope = '')"
+            params: list[Any] = [scope]
+        else:
+            where = " WHERE m.group_scope = ''"
+            params = []
+        where += " AND m.archived = 0 AND m.superseded_by IS NULL"
         sql = (
-            "SELECT m.id, m.content, m.embedding, m.group_scope, m.memory_time "
+            "SELECT m.id, m.content, m.embedding, m.embedding_blob, "
+            "m.group_scope, m.memory_time, m.kind, m.entities "
             f"FROM memories m{where} ORDER BY m.memory_time DESC LIMIT ?"
         )
         params.append(max(1, int(scan_limit)))
-        best: tuple[float, sqlite3.Row] | None = None
         with self._lock, closing(self._connect()) as conn:
-            for row in conn.execute(sql, params).fetchall():
-                vector = self._parse_embedding(row["embedding"])
-                if not vector or len(vector) != len(embedding):
-                    continue
-                score = self._cosine_similarity(vector, embedding)
-                if score >= threshold and (best is None or score > best[0]):
-                    best = (score, row)
-        if best is None:
+            rows = conn.execute(sql, params).fetchall()
+        if not rows:
             return None
-        row = best[1]
+        # 与召回共用批量余弦（numpy 可用时一次矩阵乘法）；维度不一致记 -1。
+        scores = cosine_scores(
+            [float(value) for value in embedding],
+            [row["embedding_blob"] or row["embedding"] for row in rows],
+        )
+        best_index = max(range(len(rows)), key=lambda index: scores[index])
+        best_score = scores[best_index]
+        if best_score < threshold:
+            return None
+        row = rows[best_index]
         return {
             "memory_id": int(row["id"]),
             "content": row["content"],
             "group_scope": row["group_scope"],
-            "similarity": round(best[0], 4),
+            "kind": row["kind"],
+            "entities": self._parse_entities(row["entities"]),
+            "similarity": round(best_score, 4),
         }
 
     def source_counts(self) -> dict[str, int]:
@@ -578,6 +1160,17 @@ class MemoryStore:
             role_row = conn.execute(
                 "SELECT COUNT(DISTINCT role_id) AS cnt FROM memory_roles"
             ).fetchone()
+            type_rows = conn.execute(
+                "SELECT memory_type, COUNT(*) AS cnt FROM memories "
+                "WHERE archived = 0 GROUP BY memory_type"
+            ).fetchall()
+            identity_rows = conn.execute(
+                "SELECT sender_role, COUNT(*) AS cnt FROM memories "
+                "WHERE archived = 0 GROUP BY sender_role"
+            ).fetchall()
+            archived_row = conn.execute(
+                "SELECT COUNT(*) AS cnt FROM memories WHERE archived = 1"
+            ).fetchone()
             range_row = conn.execute(
                 "SELECT MIN(memory_time) AS oldest, MAX(memory_time) AS latest "
                 "FROM memories"
@@ -593,7 +1186,35 @@ class MemoryStore:
             if range_row and range_row["latest"] is not None
             else None
         )
+        type_counts = {
+            str(row["memory_type"] or "group"): int(row["cnt"]) for row in type_rows
+        }
+        identity_counts = {
+            str(row["sender_role"] or "member"): int(row["cnt"])
+            for row in identity_rows
+        }
         return {
+            "type_counts": {
+                "personal": type_counts.get("personal", 0),
+                "group": type_counts.get("group", 0),
+                "private": type_counts.get("private", 0),
+                "unknown": max(
+                    0,
+                    total
+                    - sum(
+                        type_counts.get(key, 0)
+                        for key in ("personal", "group", "private")
+                    )
+                    - (int(archived_row["cnt"]) if archived_row else 0),
+                ),
+            },
+            "identity_counts": {
+                "owner": identity_counts.get("owner", 0),
+                "group_owner": identity_counts.get("group_owner", 0),
+                "group_admin": identity_counts.get("group_admin", 0),
+                "member": identity_counts.get("member", 0),
+            },
+            "archived_count": int(archived_row["cnt"]) if archived_row else 0,
             "total_memories": total,
             "group_scope_count": int(scope_row["cnt"]) if scope_row else 0,
             "group_id_count": int(group_row["cnt"]) if group_row else 0,
@@ -608,6 +1229,43 @@ class MemoryStore:
             ),
             "display_timezone": self._timezone_name,
         }
+
+    def consolidation_candidates(
+        self, *, older_than_days: float = 7.0, group_scope: str = "", limit: int = 80
+    ) -> list[dict[str, Any]]:
+        """返回可参与巩固的旧记忆（含 embedding 与角色）。"""
+        cutoff = time.time() - max(1.0, float(older_than_days)) * 86400
+        where = ["m.archived = 0", "m.superseded_by IS NULL", "m.memory_time < ?"]
+        params: list[Any] = [cutoff]
+        if group_scope:
+            where.append("m.group_scope = ?")
+            params.append(str(group_scope))
+        sql = (
+            "SELECT m.* FROM memories m WHERE "
+            + " AND ".join(where)
+            + " ORDER BY m.memory_time ASC LIMIT ?"
+        )
+        params.append(max(1, int(limit)))
+        with self._lock, closing(self._connect()) as conn:
+            rows = conn.execute(sql, params).fetchall()
+            ids = [int(row["id"]) for row in rows]
+            roles_map: dict[int, list[str]] = {}
+            if ids:
+                placeholders = ",".join("?" for _ in ids)
+                for item in conn.execute(
+                    f"SELECT memory_id, role_id FROM memory_roles "
+                    f"WHERE memory_id IN ({placeholders})",
+                    ids,
+                ).fetchall():
+                    roles_map.setdefault(int(item["memory_id"]), []).append(
+                        str(item["role_id"])
+                    )
+        items = []
+        for row in rows:
+            item = self._row_to_item(row, roles_map.get(int(row["id"]), []))
+            item["embedding"] = self._row_embedding(row)
+            items.append(item)
+        return items
 
     def list_group_scopes(self) -> list[str]:
         """按字典序返回最多 200 个非空记忆作用域。"""
@@ -638,6 +1296,8 @@ class MemoryStore:
         sort_order: str = "desc",
         max_results: int = 10,
         scan_limit: int | None = None,
+        scope_mode: str = "all",
+        scope_filter: ScopeFilter | None = None,
     ) -> list[dict[str, Any]]:
         """先按结构化条件筛选，再可选地执行有限窗口内的语义召回。
 
@@ -661,6 +1321,11 @@ class MemoryStore:
             sort_order: ``asc`` 正序，其他值按倒序处理。
             max_results: 最终最大结果数；小于等于 0 时不截断结果。
             scan_limit: SQL 阶段的最大候选数量；未指定时采用实例默认值。
+            scope_mode: ``all`` 时空作用域表示不限制（供控制台全库列表使用）；
+                ``exact`` 时空作用域只匹配全局记忆（``group_scope = ''``），
+                自动回忆必须用这一档，否则会把别的群的记忆当成全局记忆召回。
+            scope_filter: 可见性条件；传入后忽略 ``group_scope`` / ``scope_mode``，
+                自动回忆与模型工具统一走这一条路径。
 
         Returns:
             记忆摘要字典列表，语义检索项额外含 ``similarity`` 分数。
@@ -668,11 +1333,24 @@ class MemoryStore:
         roles = self._normalize_role_ids(role_ids or [])
         mode = "all" if str(role_match_mode).strip().lower() == "all" else "any"
 
-        where: list[str] = []
+        where: list[str] = ["m.archived = 0", "m.superseded_by IS NULL"]
         params: list[Any] = []
-        if group_scope:
+        # 有效期过滤：过期的计划/事件不再参与召回，fact 类没有有效期。
+        where.append("(m.valid_until IS NULL OR m.valid_until >= ?)")
+        params.append(time.time())
+        if scope_filter is not None:
+            # 统一可见性：本会话 ∪ 本人参与。条件由 memory_scope 生成，
+            # 与工具侧的 is_visible 共用同一条规则。
+            clause, values = scope_filter.clause("m")
+            where.append(clause)
+            params.extend(values)
+        elif group_scope:
             where.append("m.group_scope = ?")
             params.append(str(group_scope).strip())
+        elif str(scope_mode).strip().lower() == "exact":
+            # 空作用域在 exact 档表示「全局记忆」，必须精确匹配，不能用
+            # 省略条件代替——那会扫描所有群/私聊的记忆，造成跨群串味。
+            where.append("m.group_scope = ''")
         if group_id:
             where.append("m.group_id = ?")
             params.append(str(group_id).strip())
@@ -704,66 +1382,72 @@ class MemoryStore:
 
         # 只在 SQL 中生成筛选子句，所有外部值仍通过 params 绑定；LIMIT 也受
         # scan_limit 约束，避免在 Python 层一次性载入整个记忆库再做排序。
-        sql = (
-            "SELECT m.id, m.content, m.embedding, m.embedding_dim, m.memory_time, "
-            "m.group_scope, m.group_id, m.platform_id, m.extra_metadata, "
-            "m.created_at, m.updated_at FROM memories m"
-        )
-        if where:
-            sql += " WHERE " + " AND ".join(where)
-        sql += " ORDER BY m.memory_time DESC LIMIT ?"
+        where_sql = (" WHERE " + " AND ".join(where)) if where else ""
+        base_sql = "SELECT m.* FROM memories m" + where_sql
         limit = (
             self.default_scan_limit if scan_limit is None else max(1, int(scan_limit))
         )
         params.append(limit)
 
-        with self._lock, closing(self._connect()) as conn:
-            rows = conn.execute(sql, params).fetchall()
-            if not rows:
-                return []
-            ids = [int(row["id"]) for row in rows]
-            placeholders = ",".join("?" for _ in ids)
-            role_rows = conn.execute(
-                f"SELECT memory_id, role_id FROM memory_roles "
-                f"WHERE memory_id IN ({placeholders}) ORDER BY memory_id, role_id",
-                ids,
-            ).fetchall()
-
-        roles_map: dict[int, list[str]] = {}
-        for role_row in role_rows:
-            roles_map.setdefault(int(role_row["memory_id"]), []).append(
-                str(role_row["role_id"])
-            )
-
-        # 没有查询向量时 similarity 保持为 None，后续自然改用时间排序；
-        # 向量检索则先筛出 recall_k 个最相关项，再执行用户要求的最终排序。
         has_query = bool(query_embedding)
         query_vec = [float(value) for value in (query_embedding or [])]
 
-        candidates: list[dict[str, Any]] = []
-        for row in rows:
-            memory_id = int(row["id"])
-            item = self._row_to_item(row, roles_map.get(memory_id, []))
-            item["similarity"] = (
-                self._cosine_similarity(
-                    query_vec, self._parse_embedding(row["embedding"])
-                )
-                if has_query
-                else None
-            )
-            candidates.append(item)
-
         if has_query:
-            candidates.sort(
-                key=lambda item: (
-                    item["similarity"]
-                    if isinstance(item["similarity"], (int, float))
-                    else -1.0
-                ),
-                reverse=True,
+            # 只取 id 与向量先算相似度，再取回前 K 条完整行：
+            # 避免为上千条候选构造 item，也避免把正文整页读进内存。
+            light_sql = (
+                "SELECT m.id AS id, m.embedding AS embedding, "
+                "m.embedding_blob AS embedding_blob FROM memories m"
+                + where_sql
+                + " ORDER BY m.memory_time DESC LIMIT ?"
+            )
+            with self._lock, closing(self._connect()) as conn:
+                light_rows = conn.execute(light_sql, params).fetchall()
+            if not light_rows:
+                return []
+            scores = cosine_scores(
+                query_vec,
+                [row["embedding_blob"] or row["embedding"] for row in light_rows],
+            )
+            order = sorted(
+                range(len(light_rows)), key=lambda index: scores[index], reverse=True
             )
             if recall_k > 0:
-                candidates = candidates[: int(recall_k)]
+                order = order[: int(recall_k)]
+            selected_ids = [int(light_rows[index]["id"]) for index in order]
+            score_map = {int(light_rows[index]["id"]): scores[index] for index in order}
+            with self._lock, closing(self._connect()) as conn:
+                placeholders = ",".join("?" for _ in selected_ids)
+                row_map = {
+                    int(row["id"]): row
+                    for row in conn.execute(
+                        f"SELECT m.* FROM memories m WHERE m.id IN ({placeholders})",
+                        selected_ids,
+                    ).fetchall()
+                }
+            roles_map = self._roles_map(selected_ids)
+            candidates: list[dict[str, Any]] = []
+            for memory_id in selected_ids:
+                row = row_map.get(memory_id)
+                if row is None:
+                    continue
+                item = self._row_to_item(row, roles_map.get(memory_id, []))
+                item["similarity"] = score_map.get(memory_id, -1.0)
+                candidates.append(item)
+        else:
+            with self._lock, closing(self._connect()) as conn:
+                rows = conn.execute(
+                    base_sql + " ORDER BY m.memory_time DESC LIMIT ?", params
+                ).fetchall()
+            if not rows:
+                return []
+            ids = [int(row["id"]) for row in rows]
+            roles_map = self._roles_map(ids)
+            candidates = []
+            for row in rows:
+                item = self._row_to_item(row, roles_map.get(int(row["id"]), []))
+                item["similarity"] = None
+                candidates.append(item)
 
         reverse = str(sort_order).strip().lower() != "asc"
         if str(sort_by).strip().lower() == "relevance" and has_query:
@@ -781,6 +1465,68 @@ class MemoryStore:
         if max_results > 0:
             return candidates[: int(max_results)]
         return candidates
+
+    def search_lexical(
+        self,
+        query: str,
+        *,
+        group_scope: str = "",
+        scope_mode: str = "exact",
+        limit: int = 20,
+        scope_filter: ScopeFilter | None = None,
+    ) -> list[dict[str, Any]]:
+        """用 bigram 全文索引做关键词召回，不调用 embedding。
+
+        只返回未归档、未被取代的记忆；作用域语义与 ``search_memories`` 一致。
+        FTS5 不可用或查询没有有效检索词时返回空列表，调用方据此回退到向量检索。
+        """
+        grams = self._build_grams(query)
+        if not grams or not self.fts_enabled:
+            return []
+        tokens = grams.split(" ")[:16]
+        expression = " OR ".join(f'"{token}"' for token in tokens)
+        # FTS5 的 MATCH 左操作数必须是表名本身，不能写成别名。
+        where = ["memory_fts MATCH ?", "m.archived = 0", "m.superseded_by IS NULL"]
+        where.append("(m.valid_until IS NULL OR m.valid_until >= ?)")
+        params: list[Any] = [f"grams:({expression})", time.time()]
+        if scope_filter is not None:
+            clause, values = scope_filter.clause("m")
+            where.append(clause)
+            params.extend(values)
+        else:
+            scope = str(group_scope or "").strip()
+            if scope:
+                where.append("m.group_scope = ?")
+                params.append(scope)
+            elif str(scope_mode).strip().lower() == "exact":
+                where.append("m.group_scope = ''")
+        params.append(max(1, int(limit)))
+        sql = (
+            "SELECT m.* FROM memory_fts f JOIN memories m ON m.id = f.rowid "
+            "WHERE " + " AND ".join(where) + " ORDER BY f.rank LIMIT ?"
+        )
+        with self._lock, closing(self._connect()) as conn:
+            try:
+                rows = conn.execute(sql, params).fetchall()
+            except sqlite3.DatabaseError:
+                return []
+            if not rows:
+                return []
+            ids = [int(row["id"]) for row in rows]
+            placeholders = ",".join("?" for _ in ids)
+            role_rows = conn.execute(
+                f"SELECT memory_id, role_id FROM memory_roles "
+                f"WHERE memory_id IN ({placeholders}) ORDER BY memory_id, role_id",
+                ids,
+            ).fetchall()
+        roles_map: dict[int, list[str]] = {}
+        for role_row in role_rows:
+            roles_map.setdefault(int(role_row["memory_id"]), []).append(
+                str(role_row["role_id"])
+            )
+        return [
+            self._row_to_item(row, roles_map.get(int(row["id"]), [])) for row in rows
+        ]
 
     # ------------------------------------------------------------------ #
     # 维护

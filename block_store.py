@@ -152,10 +152,14 @@ class BlockStore:
     # 配置同步
     # ------------------------------------------------------------------ #
     def sync_from_config(self, user_ids: tuple[str, ...] | list[str]) -> None:
-        """让全局记录与插件配置的黑名单列表保持一致。"""
+        """把配置里的黑名单补录为全局屏蔽记录（只增不删）。
+
+        配置列表只是历史兼容入口，页面与指令添加的记录带原因、时长和来源，
+        不能因为配置里没有对应 ID 就被删掉。移除屏蔽请走页面或指令。
+        """
         wanted = [str(uid).strip() for uid in user_ids if str(uid).strip()]
         with self._lock:
-            existing = {entry["user_id"]: entry for entry in self._global}
+            existing = {entry["user_id"] for entry in self._global}
             changed = False
             for user_id in wanted:
                 if user_id not in existing:
@@ -171,11 +175,6 @@ class BlockStore:
                         }
                     )
                     changed = True
-            keep = set(wanted)
-            new_global = [e for e in self._global if e["user_id"] in keep]
-            if len(new_global) != len(self._global):
-                changed = True
-                self._global = new_global
             if changed:
                 self._save()
 
