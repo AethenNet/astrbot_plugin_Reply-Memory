@@ -6,8 +6,9 @@
 
 from __future__ import annotations
 
+from astrbot.api import logger
+
 import json
-import logging
 import math
 import re
 import threading
@@ -15,7 +16,6 @@ import time
 from pathlib import Path
 from typing import Any
 
-logger = logging.getLogger(__name__)
 
 STORE_VERSION = 1
 USER_ID_RE = re.compile(r"^[A-Za-z0-9]+$")

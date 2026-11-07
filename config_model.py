@@ -6,16 +6,16 @@
 
 from __future__ import annotations
 
+from astrbot.api import logger
+
 import hashlib
 import json
-import logging
 import math
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
-logger = logging.getLogger(__name__)
 
 DEFAULT_WEB_SEARCH_SYSTEM_PROMPT = (
     "You are a web research assistant. Use live web search/browsing when answering. "

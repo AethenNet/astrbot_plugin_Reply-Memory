@@ -11,9 +11,10 @@
 
 from __future__ import annotations
 
+from astrbot.api import logger
+
 import base64
 import json
-import logging
 import math
 import os
 import re
@@ -62,7 +63,6 @@ _PREVIOUS_CONTENT_LIMIT = 3
 _PREVIOUS_CONTENT_MAX_LEN = 500
 _PREVIOUS_EVIDENCE_MAX_LEN = 200
 
-logger = logging.getLogger(__name__)
 
 
 def compute_effective_importance(
