@@ -10,6 +10,7 @@ Quart 的 ``request`` 全局对象。本模块在导入时选择可用实现，�
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 try:  # AstrBot >= 4.14 左右提供的新 API
@@ -49,33 +50,97 @@ def query_get(name: str, default: Any = None, cast: Any = None) -> Any:
         return default
 
 
+def header_get(name: str, default: str = "") -> str:
+    """读取请求头，宿主不支持 headers 或读取异常时返回默认值。
+
+    开发者令牌改走 ``X-Dev-Token`` 请求头后，各版本请求对象的 headers
+    实现差异（属性缺失、大小写敏感、非映射对象）都收敛在这里，避免
+    handler 里散落 try/except。
+    """
+    if _request is None:
+        return default
+    try:
+        headers = getattr(_request, "headers", None)
+        if headers is None:
+            return default
+        getter = getattr(headers, "get", None)
+        if not callable(getter):
+            return default
+        value = getter(name, default)
+    except Exception:
+        return default
+    return default if value is None else str(value)
+
+
+class JsonBodyError(ValueError):
+    """请求体存在但不是合法 JSON 对象。
+
+    与「请求体缺失/为空」区分开：后者仍返回调用方给的默认字典，前者由
+    handler 转成明确的“请求体不是合法 JSON”错误，避免排障时被误报成
+    “缺少参数”。
+    """
+
+
+async def _read_raw_body() -> str | None:
+    """尽量读取原始请求体文本；宿主不提供读取接口时返回 None。"""
+    # Quart 的 get_data() 与新版 AstrBot 请求对象都可能有该方法；取不到时
+    # 交给下面的 json()/get_json() 回退分支处理。
+    get_data = getattr(_request, "get_data", None)
+    if not callable(get_data):
+        return None
+    try:
+        raw = await get_data()
+    except Exception:
+        return None
+    if isinstance(raw, bytes):
+        return raw.decode("utf-8", "replace")
+    if isinstance(raw, str):
+        return raw
+    return None
+
+
 async def read_json(default: dict[str, Any] | None = None) -> dict[str, Any]:
     """读取并规范化 JSON 请求体，确保 handler 总是收到字典。
 
-    新版 AstrBot 与 Quart 的解析方法和默认值参数不同，因此分别调用各自 API；
-    请求对象不可用、解析抛错或正文顶层不是对象时，返回调用方提供的字典默认值。
-    若默认值本身不是字典，则安全回落为空字典，避免 handler 收到不符合约定的类型。
+    新版 AstrBot 与 Quart 的解析方法和默认值参数不同，因此分别调用各自 API。
+    请求对象不可用、正文为空或顶层不是对象时返回调用方提供的字典默认值；
+    正文存在但 JSON 语法错误时抛出 :class:`JsonBodyError`，由 handler 返回
+    统一错误响应。若默认值本身不是字典，则安全回落为空字典。
 
     Args:
-        default: 请求无法解析时使用的默认字典。
+        default: 请求体缺失或为空时使用的默认字典。
 
     Returns:
         解析得到的 JSON 对象，或规范化后的默认字典。
+
+    Raises:
+        JsonBodyError: 请求体存在但不是合法 JSON。
     """
     fallback = default if isinstance(default, dict) else {}
     if _request is None:
         return fallback
-    data: Any = None
-    if NEW_WEB_API:
-        try:
-            data = await _request.json(default=fallback)
-        except Exception:
+    text = await _read_raw_body()
+    if text is not None:
+        if not text.strip():
             return fallback
-    else:  # pragma: no cover - 旧版本分支
         try:
+            data: Any = json.loads(text)
+        except (TypeError, ValueError) as exc:
+            raise JsonBodyError(f"请求体不是合法 JSON：{exc}") from exc
+        return data if isinstance(data, dict) else fallback
+    # 旧宿主没有原始正文读取接口，无法区分「空正文」与「语法错误」；
+    # 统一按语法错误上报，避免把用户输入问题误报成缺少参数。
+    try:
+        if NEW_WEB_API:
+            try:
+                data = await _request.json()
+            except TypeError:
+                # 个别版本要求显式传 default 关键字。
+                data = await _request.json(default=fallback)
+        else:  # pragma: no cover - 旧版本分支
             data = await _request.get_json()
-        except Exception:
-            return fallback
+    except Exception as exc:
+        raise JsonBodyError(f"请求体不是合法 JSON：{exc}") from exc
     return data if isinstance(data, dict) else fallback
 
 

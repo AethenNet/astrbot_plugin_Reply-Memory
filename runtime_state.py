@@ -9,6 +9,24 @@ from __future__ import annotations
 import time
 from collections import OrderedDict, defaultdict
 
+# F48：调试开关集合的容量上限。它与 origin_lru 独立，因为用户手动开启的
+# 调试状态不应因其它会话活跃而被静默关闭；超过上限时淘汰最久未开启的来源。
+_DEBUG_ORIGINS_LIMIT = 200
+
+
+def _new_turn_usage() -> dict[str, int]:
+    """本轮 token/召回指标的空白桶。"""
+    return {
+        "input_cached": 0,
+        "input_other": 0,
+        "output": 0,
+        "calls": 0,
+        "memory_hits": 0,
+        "lexical_hits": 0,
+        "recall_ms": 0,
+        "embedding_cache_hit": 0,
+    }
+
 
 class RuntimeState:
     """管理进程内短期数据，并按 AstrBot 会话来源隔离所有记录。
@@ -38,25 +56,14 @@ class RuntimeState:
         # 主动回复触发计数
         self.reply_counters: dict[str, int] = defaultdict(int)
         # 本轮 token 用量（按来源累计）
-        self.turn_usage: dict[str, dict[str, int]] = defaultdict(
-            lambda: {
-                "input_cached": 0,
-                "input_other": 0,
-                "output": 0,
-                "calls": 0,
-                "memory_hits": 0,
-                "lexical_hits": 0,
-                "recall_ms": 0,
-                "embedding_cache_hit": 0,
-            }
-        )
+        self.turn_usage: dict[str, dict[str, int]] = defaultdict(_new_turn_usage)
         # 查询向量缓存：query hash -> (vector, 写入时间)。全局共享，按 TTL 与条数淘汰，
         # 同一条问题在短时间内重复出现时不必再请求 embedding 服务。
         self.embedding_cache: OrderedDict[str, tuple[list[float], float]] = (
             OrderedDict()
         )
-        # 回复调试开关（按来源）
-        self.debug_origins: set[str] = set()
+        # 回复调试开关（按来源）；F48：有界 LRU，长期运行不会无界增长
+        self.debug_origins: OrderedDict[str, None] = OrderedDict()
         # 待发送的调试报告
         self.pending_report: dict[str, dict] = {}
         # 本轮执行日志
@@ -69,6 +76,8 @@ class RuntimeState:
         self.turn_started_at: dict[str, float] = {}
         # 上一轮 system 段指纹，用于判断前缀缓存是否还能命中
         self.last_system_hash: dict[str, int] = {}
+        # 空闲兜底上次触发时间，避免同一次空闲反复总结
+        self.gap_flushed_at: dict[str, float] = {}
         # 自动记忆：抽取计数与上次抽取时间
         self.extract_counters: dict[str, int] = defaultdict(int)
         self.last_extract_at: dict[str, float] = {}
@@ -100,6 +109,7 @@ class RuntimeState:
         self.last_chat_at.pop(origin, None)
         self.last_extract_msg.pop(origin, None)
         self.last_system_hash.pop(origin, None)
+        self.gap_flushed_at.pop(origin, None)
 
     def touch_origin(self, origin: str, max_origins: int) -> None:
         """刷新来源的最近使用顺序，并按来源总数上限执行 LRU 淘汰。
@@ -124,21 +134,18 @@ class RuntimeState:
     def reset_turn(self, origin: str) -> None:
         """新的一轮开始：清空用量与执行日志。"""
         self.turn_started_at[origin] = time.time()
-        self.turn_usage[origin] = {
-            "input_cached": 0,
-            "input_other": 0,
-            "output": 0,
-            "calls": 0,
-            "memory_hits": 0,
-            "lexical_hits": 0,
-            "recall_ms": 0,
-            "embedding_cache_hit": 0,
-        }
+        self.turn_usage[origin] = _new_turn_usage()
         self.turn_logs[origin] = []
 
     def bump_metric(self, origin: str, key: str, value: int = 1) -> None:
-        """累加本轮的自定义指标（召回命中、耗时、缓存命中）。"""
-        bucket = self.turn_usage[origin]
+        """累加本轮的自定义指标（召回命中、耗时、缓存命中）。
+
+        后台写入可能发生在 ``reset_turn`` 之前或该来源已被 LRU 淘汰之后，
+        因此缺桶时创建一个只含该指标的桶，而不是抛 ``KeyError``。
+        """
+        bucket = self.turn_usage.get(origin)
+        if bucket is None:
+            bucket = self.turn_usage[origin] = {}
         bucket[key] = int(bucket.get(key, 0)) + int(value)
 
     # ------------------------------------------------------------------ #
@@ -167,18 +174,6 @@ class RuntimeState:
         while len(self.embedding_cache) > max(1, int(max_size)):
             self.embedding_cache.popitem(last=False)
 
-    def cache_clear_embeddings(self) -> None:
-        """清空查询向量缓存（数据目录切换或提供商变更时调用）。"""
-        self.embedding_cache.clear()
-
-    def add_usage(self, origin: str, usage: object) -> None:
-        """累加一次模型调用的 token 用量（兼容不同版本的 usage 结构）。"""
-        bucket = self.turn_usage[origin]
-        bucket["input_cached"] += int(getattr(usage, "input_cached", 0) or 0)
-        bucket["input_other"] += int(getattr(usage, "input_other", 0) or 0)
-        bucket["output"] += int(getattr(usage, "output", 0) or 0)
-        bucket["calls"] += 1
-
     def add_usage_totals(
         self, origin: str, cached: int, other: int, output: int
     ) -> None:
@@ -189,30 +184,24 @@ class RuntimeState:
         bucket["output"] += max(int(output or 0), 0)
         bucket["calls"] += 1
 
-    def log_line(self, origin: str, line: str) -> None:
-        """将非空执行日志追加到指定来源的当前轮次。"""
-        # 忽略空日志，防止调试报告出现无意义的空条目。
-        if line:
-            self.turn_logs[origin].append(str(line))
-
     def set_debug(self, origin: str, enabled: bool) -> None:
         """启用或关闭指定来源的回复用量调试。"""
         # 调整该来源的 token 调试状态；该集合只存在于当前进程。
+        if not origin:
+            return
         if enabled:
-            self.debug_origins.add(origin)
+            self.debug_origins.pop(origin, None)
+            self.debug_origins[origin] = None
+            # F48：与 origin_lru 解耦的调试集合同样需要容量上限。
+            while len(self.debug_origins) > _DEBUG_ORIGINS_LIMIT:
+                self.debug_origins.popitem(last=False)
         else:
-            self.debug_origins.discard(origin)
+            self.debug_origins.pop(origin, None)
 
     def is_debug(self, origin: str) -> bool:
         """判断指定来源是否开启用量调试。"""
         # 查询当前来源是否启用回复调试报告。
         return origin in self.debug_origins
-
-    def cleanup_origin(self, origin: str) -> None:
-        """彻底清除来源状态及其 LRU 记录。"""
-        # 完整清理来源状态并将其从 LRU 队列移除。
-        self._evict_origin(origin)
-        self.origin_lru.pop(origin, None)
 
     # ------------------------------------------------------------------ #
     # 便捷读写
@@ -293,11 +282,6 @@ class RuntimeState:
         return {
             name: qq_list[0] for name, qq_list in buckets.items() if len(qq_list) == 1
         }
-
-    def known_sender(self, origin: str, msg_id: str) -> str:
-        """按消息 ID 查发送者 ID；未知消息返回空字符串。"""
-        # 查询消息对应的发送者；未知消息返回空字符串。
-        return self.message_senders.get(origin, {}).get(str(msg_id), "")
 
     def reset_counter(self, origin: str) -> None:
         """重置指定来源累计的主动回复消息数。"""

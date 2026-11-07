@@ -116,25 +116,36 @@ class ScopeFilter:
         return "(" + " OR ".join(branches) + ")", params
 
     def is_visible(self, record: Mapping[str, Any]) -> bool:
-        """按同一条规则判断一条已取出的记忆是否可见。"""
+        """按同一条规则判断一条已取出的记忆是否可见。
+
+        逐分支与 :meth:`clause` 对齐：只有 ``clause()`` 会命中的记录才返回
+        True（M-16 之外的可见性一致性修复；此前 global 模式先判作用域相等，
+        会让对象判定看到 SQL 永远查不到的同会话记忆）。
+        """
         scope = str(record.get("group_scope") or "").strip()
-        if scope and scope == self.current_scope:
+        if self.mode == MODE_GROUP:
+            return bool(self.current_scope) and scope == self.current_scope
+        if self.mode == MODE_GLOBAL:
+            if scope:
+                return False
+            return self._participant_visible(record)
+        if self.current_scope and scope == self.current_scope:
             return True
         if not self.uses_personal:
             return False
-        if self.mode == MODE_GROUP:
-            return False
-        if self.mode == MODE_GLOBAL and scope:
-            return False
         if scope and not self.allow_private and is_private_scope(scope):
+            return False
+        return self._participant_visible(record)
+
+    def _participant_visible(self, record: Mapping[str, Any]) -> bool:
+        """参与者通道判定：只认 ``memory_roles``，与 SQL 子查询保持一致。"""
+        if not self.uses_personal:
             return False
         roles = record.get("related_role_ids") or record.get("role_ids") or ()
         try:
-            if self.sender_id in {str(role) for role in roles}:
-                return True
+            return self.sender_id in {str(role) for role in roles}
         except TypeError:
-            pass
-        return str(record.get("sender_id") or "").strip() == self.sender_id
+            return False
 
     def describe(self) -> str:
         """生成日志用的简短描述，避免把完整参数打进日志。"""

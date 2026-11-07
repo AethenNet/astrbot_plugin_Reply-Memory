@@ -12,10 +12,69 @@
  * 已持久化数据。各视图函数只负责当前页面区域，避免一次操作重建无关页面。
  */
 
-const UI_BUILD = 22;
+const UI_BUILD = 30;
 console.info(`[ActiveReply] UI build ${UI_BUILD}`);
 
 const bridge = window.AstrBotPluginView || window.AstrBotPluginPage || null;
+
+/**
+ * 键盘检测基线（r3.3w）：iframe 被宿主 adjustResize 时 innerHeight 与
+ * visualViewport.height 会同步变小，两者差值恒为 0，不能用差值判断键盘。
+ * 这里记录「无键盘时」的视口高度基线，当前高度明显小于基线才认为键盘展开。
+ */
+let keyboardBaselineHeight = 0;
+let keyboardBaselineTimer = 0;
+
+function currentViewportHeight() {
+  const vv = window.visualViewport;
+  const inner = Number(window.innerHeight) || 0;
+  const visual = vv ? Number(vv.height) || 0 : inner;
+  return Math.min(inner, visual);
+}
+
+function isInputFocused() {
+  const focused = document.activeElement;
+  if (!focused) return false;
+  const tag = String(focused.tagName || "").toUpperCase();
+  return tag === "INPUT" || tag === "TEXTAREA" || Boolean(focused.isContentEditable);
+}
+
+/** 软键盘是否处于展开状态。 */
+function isKeyboardViewportOpen() {
+  if (keyboardBaselineHeight <= 0) return false;
+  return currentViewportHeight() < keyboardBaselineHeight - 60;
+}
+
+/** 延后重算键盘基线（键盘收起/旋转后调用；输入框聚焦时不更新）。 */
+function scheduleBaselineRefresh() {
+  clearTimeout(keyboardBaselineTimer);
+  keyboardBaselineTimer = window.setTimeout(() => {
+    if (isInputFocused()) return;
+    const height = currentViewportHeight();
+    if (height > 0) keyboardBaselineHeight = height;
+  }, 220);
+}
+
+/** 重新计算顶部胶囊占位高度（键盘/旋转改变视口后需要刷新）。 */
+function refreshTopbarHeight() {
+  const controls = document.querySelector(".floating-controls");
+  if (!controls) return;
+  // 抽屉/详情打开时 .floating-controls 带 transform，getBoundingClientRect 不可信。
+  if (
+    document.body.classList.contains("drawer-open") ||
+    document.body.classList.contains("detail-open")
+  ) {
+    return;
+  }
+  const pane = document.getElementById("main-pane");
+  if (pane && pane.classList.contains("is-pushed")) return;
+  const rect = controls.getBoundingClientRect();
+  if (!rect || rect.height <= 0) return;
+  document.documentElement.style.setProperty(
+    "--topbar-h",
+    `${Math.round(rect.bottom)}px`
+  );
+}
 
 /**
  * 页面唯一的前端状态源：视图数据、编辑中的配置值与记忆列表筛选条件均保存在此处。
@@ -53,8 +112,20 @@ const state = {
     role: "",
     memoryType: "",
     identity: "",
+    // r3.3l：生命周期筛选（即将过期/已过期/低价值将归档/长期未访问）。
+    lifecycle: "",
+    // r3.3：改为「只看已归档」开关，请求时传 archived_only=1。
+    archivedOnly: false,
+    // 批量选择：当前页条目与已选 ID。
+    selectMode: false,
+    selected: new Set(),
+    items: [],
     scopes: [],
+    // r3.3l：服务端返回的当前生效遗忘规则（用于顶部摘要与时间线）。
+    rules: null,
   },
+  // r3.3：开发者模式鉴权状态；令牌只保存在内存中，进入/离开页面都会清空。
+  dev: { token: "", authed: false },
 };
 
 const PROVIDER_PATHS = new Set([
@@ -135,6 +206,8 @@ function askConfirm(message, options = {}) {
       modal.setAttribute("aria-hidden", "true");
       okBtn.removeEventListener("click", onOk);
       cancelBtn.removeEventListener("click", onCancel);
+      // 确认按钮不是提交按钮：点完立即解除加载锁，避免挡住下一次确认弹窗。
+      unlockButton(okBtn);
       resolve(value);
     };
     const onOk = () => finish(true);
@@ -142,22 +215,6 @@ function askConfirm(message, options = {}) {
     okBtn.addEventListener("click", onOk);
     cancelBtn.addEventListener("click", onCancel);
   });
-}
-
-/** 切 Tab 后把 Tab 下方的设置内容滚到顶栏下方。 */
-function scrollPageTop() {
-  const view = document.querySelector(".view.active") || document;
-  const form = view.querySelector("#global-form, #group-form, .form-body");
-  if (!form) {
-    window.scrollTo({ top: 0, behavior: "smooth" });
-    return;
-  }
-  try {
-    form.scrollIntoView({ behavior: "smooth", block: "start" });
-  } catch (error) {
-    const y = form.getBoundingClientRect().top + window.scrollY - 200;
-    window.scrollTo({ top: Math.max(0, y), behavior: "smooth" });
-  }
 }
 
 /** 显示短暂的成功或错误提示，并重置之前启动的隐藏计时器。 */
@@ -170,6 +227,11 @@ function toast(message, isError = false) {
   toastTimer = setTimeout(() => node.classList.remove("show"), 2400);
 }
 
+/** 进行中的接口请求数；按钮加载锁据此判断“请求是否真的结束”（F42）。 */
+let apiInFlight = 0;
+/** 已发起的接口请求总数，用于判断点击后是否真的发出了请求。 */
+let apiStartedCount = 0;
+
 /**
  * 经 AstrBot 插件视图 bridge 调用接口，并统一处理 success/error 包装。
  * @throws {Error} 页面未在 AstrBot 内打开，或接口返回失败时抛出。
@@ -180,22 +242,47 @@ async function callApi(method, endpoint, payload) {
   if (!bridge) {
     throw new Error("请在 AstrBot 面板中打开该页面");
   }
-  const response =
-    method === "GET"
-      ? await bridge.apiGet(endpoint, payload || {})
-      : await bridge.apiPost(endpoint, payload || {});
-  if (response && response.success === false) {
-    throw new Error(response.error || "请求失败");
+  apiInFlight += 1;
+  apiStartedCount += 1;
+  try {
+    const response =
+      method === "GET"
+        ? await bridge.apiGet(endpoint, payload || {})
+        : await bridge.apiPost(endpoint, payload || {});
+    if (response && response.success === false) {
+      throw new Error(response.error || "请求失败");
+    }
+    if (response && response.data !== undefined) {
+      return response.data;
+    }
+    return response;
+  } finally {
+    apiInFlight = Math.max(0, apiInFlight - 1);
+    // 请求结束（成功或失败）后立即尝试解锁；未满最短展示时长的按钮由
+    // 轮询计时器在到点后释放。
+    releaseFinishedButtonLocks();
   }
-  if (response && response.data !== undefined) {
-    return response.data;
-  }
-  return response;
 }
 
 /** 将计数格式化为当前语言环境的千位分隔数字。 */
 function formatNumber(value) {
   return Number(value || 0).toLocaleString("zh-CN");
+}
+
+/** 把秒级时间戳格式化为时刻文本；缺失或非法值返回 "-"（今天只显示 HH:MM）。 */
+function formatClockTime(seconds) {
+  const value = Number(seconds || 0);
+  if (!Number.isFinite(value) || value <= 0) return "-";
+  const date = new Date(value * 1000);
+  if (Number.isNaN(date.getTime())) return "-";
+  const pad = (part) => String(part).padStart(2, "0");
+  const clock = `${pad(date.getHours())}:${pad(date.getMinutes())}`;
+  const now = new Date();
+  const sameDay =
+    date.getFullYear() === now.getFullYear() &&
+    date.getMonth() === now.getMonth() &&
+    date.getDate() === now.getDate();
+  return sameDay ? clock : `${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${clock}`;
 }
 
 /** 清除配置提示末尾多余的中文/英文句号，统一表单文案样式。 */
@@ -232,20 +319,55 @@ function setPath(obj, path, value) {
   current[keys[keys.length - 1]] = value;
 }
 
-/** 构造 QQ 群头像地址；调用处负责在加载失败时设置占位图。 */
+/** 固定占位图：任何头像处理失败时的兜底，保证页面渲染不中断。 */
+const SAFE_AVATAR_FALLBACK =
+  "data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='100' height='100'%3E%3Crect width='100' height='100' rx='26' fill='%233b82f6'/%3E%3Ctext x='50' y='64' font-size='46' text-anchor='middle' fill='%23fff' font-family='sans-serif'%3E%23%3C/text%3E%3C/svg%3E";
+
+/** 生成 QQ 群头像地址；只接受纯数字群号，其它值回退本地占位图。 */
 function avatarUrl(groupId) {
-  return `https://p.qlogo.cn/gh/${encodeURIComponent(groupId)}/${encodeURIComponent(groupId)}/100`;
+  const gid = String(groupId || "").trim();
+  return /^\d{5,20}$/.test(gid)
+    ? `https://p.qlogo.cn/gh/${gid}/${gid}/100`
+    : "";
 }
 
-/** 生成无需远程请求的 SVG 首字占位头像。 */
+/** 把任意字符串修成合法的 UTF-16；孤立代理项会让 encodeURIComponent 抛错。 */
+function wellFormedText(value) {
+  const text = String(value || "");
+  if (typeof text.toWellFormed === "function") return text.toWellFormed();
+  // 兼容旧浏览器：手工配对代理项，避免正则后行断言在旧内核上直接语法报错。
+  let output = "";
+  for (let index = 0; index < text.length; index += 1) {
+    const code = text.charCodeAt(index);
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const next = text.charCodeAt(index + 1);
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        output += text[index] + text[index + 1];
+        index += 1;
+      }
+      continue;
+    }
+    if (code >= 0xdc00 && code <= 0xdfff) continue;
+    output += text[index];
+  }
+  return output;
+}
+
+/** 生成无需远程请求的 SVG 首字占位头像；按完整码点取字，emoji 不会被截断。 */
 function fallbackAvatar(name) {
-  const letter = String(name || "#").slice(0, 1) || "#";
+  const text = wellFormedText(name).trim() || "#";
+  const letter = Array.from(text)[0] || "#";
   const svg =
     '<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100">' +
     '<rect width="100" height="100" rx="26" fill="#3b82f6"/>' +
     `<text x="50" y="64" font-size="46" text-anchor="middle" fill="#fff" font-family="sans-serif">${escapeHtml(letter)}</text>` +
     "</svg>";
-  return `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`;
+  try {
+    return `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`;
+  } catch (error) {
+    // 极端输入（孤立代理项等）不能让一次头像渲染中断整个群列表。
+    return SAFE_AVATAR_FALLBACK;
+  }
 }
 
 /* ------------------------------------------------------------------ */
@@ -332,21 +454,88 @@ function cycleTheme() {
 /* 抽屉与视图切换                                                      */
 /* ------------------------------------------------------------------ */
 /** 切换主视图与导航选中态，并按页面类型触发对应数据加载。 */
+let scrolledRaf = 0;
+
+/** Tab 栏贴到浮动顶栏时扩大渐隐，其余时间保持 10px 常态。 */
+function updateTabsAtTop() {
+  // 键盘展开时视口仍在动画中，算出的吸顶/渐变高度不可信且会制造合成层抖动。
+  if (isKeyboardViewportOpen()) return;
+  const active = document.querySelector(".view.active");
+  const tabs = active ? active.querySelector(".tabs.seg") : null;
+  let atTop = false;
+  let fadeH = 0;
+  if (tabs) {
+    const capsule = document.querySelector(".menu-capsule");
+    const capBottom = capsule ? capsule.getBoundingClientRect().bottom : 0;
+    const rect = tabs.getBoundingClientRect();
+    // 触发窗口必须包含整行 Tab 的高度：实机截图里 Tab 顶在胶囊下方约 26px 时
+    // 只差 +4 的判定不成立，条件类永远不触发，高度修复也就不会生效
+    atTop = rect.top <= capBottom + rect.height + 8;
+    // 盖住整个 Tab 行（到 Tab 底部），再加 10px 渐隐；只盖胶囊+10 会让 Tab 下半截露出来
+    fadeH = Math.max(capBottom + 10, rect.bottom + 10);
+  }
+  document.body.classList.toggle("tabs-at-top", atTop);
+  if (atTop) {
+    document.body.style.setProperty("--tabs-fade-h", `${Math.round(fadeH)}px`);
+  } else {
+    document.body.style.removeProperty("--tabs-fade-h");
+  }
+}
+
+/** 页面是否已滚离顶部：控制顶部渐隐，避免正文穿到浮层按钮下面。 */
+function updateScrolledClass() {
+  document.body.classList.toggle("scrolled", window.scrollY > 8);
+  updateTabsAtTop();
+}
+
+let panelClosingTimer = 0;
+
+/** 面板回位期间隐藏顶部渐隐，等卡片/遮罩动效结束再按滚动状态淡入，避免闪一下。 */
+function beginPanelClose() {
+  document.body.classList.add("panel-closing");
+  clearTimeout(panelClosingTimer);
+  panelClosingTimer = setTimeout(() => {
+    document.body.classList.remove("panel-closing");
+    updateScrolledClass();
+  }, 470);
+}
+
+function scheduleScrolledClass() {
+  if (scrolledRaf) return;
+  scrolledRaf = requestAnimationFrame(() => {
+    scrolledRaf = 0;
+    updateScrolledClass();
+  });
+}
+
 function switchView(name) {
   state.view = name;
-  scrollPageTop();
   document.querySelectorAll(".view").forEach((node) => {
     node.classList.toggle("active", node.id === `view-${name}`);
   });
   document.querySelectorAll(".nav-item").forEach((node) => {
     node.classList.toggle("active", node.dataset.view === name);
   });
+  updateScrolledClass();
+  pushScrollY = 0;
   closeDrawer();
+  // r3.4o：切页不再自动滚动到表单位置，避免设置页 Tab 栏被强制吸顶跳转；
+  // 页面保持进入前的滚动位置。
+  if (apiInFlight === 0 && lockedButtons.size) {
+    Array.from(lockedButtons.keys()).forEach((button) => unlockButton(button));
+  }
+  recoverUiState("switch-view");
+  // r3.3：开发者页每次进入都必须重新输入密钥，离开时立即清掉本地令牌；
+  // dev 分支不自动加载任何数据，只把焦点放到密钥输入框。
+  resetDevGate();
+  // r3.3w：不再自动 focus 密钥输入框——无手势自动 focus 会直接弹系统键盘，
+  // 是开发者页触发视口错位/键盘卡死的高频路径。
   if (name === "overview") {
     void loadOverview();
   } else if (name === "groups") {
     void loadGroups();
   } else if (name === "rag") {
+    syncRagArchivedButton();
     void loadAutoMemory();
     void loadRagStats(true);
     void loadRagList();
@@ -362,7 +551,7 @@ let themeMorph = null;
 const MENU_PATH_D = "M4 5h16M4 12h16M4 19h16";
 const CLOSE_PATH_D = "M18 6L6 18M6 6l12 12";
 
-/** 延迟载入 Morphicons 菜单形变动画；依赖失败时保留静态图标能力。 */
+/** 延迟载入 Morphicons 菜单/主题形变动画；依赖失败时保留静态图标能力。 */
 async function initMorphIcons() {
   try {
     const { createMorph } = await import("./vendor/morphicons/dom.js");
@@ -396,22 +585,244 @@ function setMenuMorph(open) {
   if (path) path.setAttribute("d", next);
 }
 
-/** 展开侧边栏并同步遮罩、无障碍状态和菜单图标。 */
+let pushScrollY = 0;
+
+/** 卡片锁成 100dvh 时，用内容位移补偿页面滚动，视觉上停在原位。 */
+function setContentScrollOffset(scrollY) {
+  const content = document.querySelector("#main-pane > .content");
+  if (!content) return;
+  content.style.transform = scrollY ? `translateY(${-scrollY}px)` : "";
+}
+
+/** 展开侧边栏并同步遮罩与无障碍状态。 */
 function openDrawer() {
+  // 键盘未收起时不做程序化滚动 + transform（WebView 视口错位高发组合）。
+  if (document.activeElement && document.activeElement !== document.body) {
+    document.activeElement.blur?.();
+  }
+  // 挤压效果:主内容区加 .is-pushed 向右平移并缩小成卡片;保持原来的卡片缩小动画
+  if (!$("drawer").classList.contains("open")) {
+    pushScrollY = window.scrollY || 0;
+  }
+  window.scrollTo(0, 0);
+  updateScrolledClass();
+  $("main-pane").classList.add("is-pushed");
+  setContentScrollOffset(pushScrollY);
+  document.body.classList.add("drawer-open");
   $("drawer").classList.add("open");
   $("drawer").setAttribute("aria-hidden", "false");
   $("scrim").classList.add("show");
   $("menu-btn").setAttribute("aria-expanded", "true");
+  $("menu-btn").setAttribute("aria-label", "关闭菜单");
   setMenuMorph(true);
 }
 
-/** 关闭侧边栏并恢复遮罩、按钮无障碍状态与菜单图标。 */
+/** 关闭侧边栏并恢复遮罩与按钮无障碍状态。 */
 function closeDrawer() {
+  const wasOpen = $("drawer").classList.contains("open");
+  beginPanelClose();
+  const pane = $("main-pane");
+  // 手势中断等异常路径也要清掉内联位移,否则卡片会停在半开位置
+  pane.style.transition = "";
+  pane.style.transform = "";
+  pane.style.borderRadius = "";
+  pane.style.boxShadow = "";
+  const veil = document.querySelector(".pane-veil");
+  if (veil) veil.style.opacity = "";
+  const drawer = $("drawer");
+  if (drawer) {
+    drawer.style.transition = "";
+    drawer.style.transform = "";
+  }
+  clearFloatingControlsInline();
+  pane.classList.remove("is-pushed");
+  setContentScrollOffset(0);
+  document.body.classList.remove("drawer-open");
+  if (wasOpen) window.scrollTo(0, pushScrollY);
+  updateScrolledClass();
   $("drawer").classList.remove("open");
   $("drawer").setAttribute("aria-hidden", "true");
   $("scrim").classList.remove("show");
   $("menu-btn").setAttribute("aria-expanded", "false");
+  $("menu-btn").setAttribute("aria-label", "打开菜单");
   setMenuMorph(false);
+}
+
+/* ------------------------------------------------------------------ */
+/* 挤压手势：从屏幕左边缘右滑，把主面板推开露出抽屉                    */
+/* ------------------------------------------------------------------ */
+const OPEN_RATIO = 0.78; // 抽屉占屏宽比例(与 --drawer-w 保持一致)
+const PANE_RADIUS = 22; // 推开后的卡片圆角(与 CSS --pane-radius 一致)
+const DRAWER_SCALE = 0.95; // Push Drawer：侧栏 95%→100%，主面板 100%→95%
+const OPEN_THRESHOLD = 0.3; // 滑过屏宽 30% 视为完全打开
+let dragState = null;
+
+/** 完全打开时主面板应右移的距离。 */
+function paneOpenWidth() {
+  return Math.round(window.innerWidth * OPEN_RATIO);
+}
+
+/** 抽屉当前是否处于打开状态。 */
+function isDrawerOpen() {
+  return $("drawer").classList.contains("open");
+}
+
+/** 拖拽过程中实时设置主面板位移、圆角与阴影(随距离渐变)。 */
+function dragPaneTo(offsetX) {
+  const pane = $("main-pane");
+  const width = paneOpenWidth() || 1;
+  const offset = Math.max(0, Math.min(offsetX, width));
+  const progress = offset / width;
+  pane.style.transition = "none";
+  const scale = 1 - (1 - DRAWER_SCALE) * progress;
+  pane.style.transform = `translateX(${offset}px) scale(${scale.toFixed(3)})`;
+  const drawer = $("drawer");
+  if (drawer) {
+    drawer.style.transition = "none";
+    drawer.style.transform = `translateX(${(-(1 - progress) * 100).toFixed(2)}%) scale(${(DRAWER_SCALE + (1 - DRAWER_SCALE) * progress).toFixed(3)})`;
+  }
+  pane.style.borderRadius =
+    progress > 0 ? `${Math.round(PANE_RADIUS * progress)}px` : "";
+  pane.style.boxShadow =
+    progress > 0
+      ? `-12px 0 44px rgba(0, 0, 0, ${(0.12 * progress).toFixed(3)})`
+      : "";
+  const veil = document.querySelector(".pane-veil");
+  if (veil) {
+    veil.style.transition = "none";
+    veil.style.opacity = progress.toFixed(3);
+  }
+  const controls = document.querySelector(".floating-controls");
+  if (controls) {
+    controls.style.transition = "none";
+    controls.style.transform = `translateX(${offset}px) scale(${scale.toFixed(3)})`;
+  }
+}
+
+/** 清理浮层按钮的拖拽内联样式；开关动作结束后交还给 body 类。 */
+function clearFloatingControlsInline() {
+  const controls = document.querySelector(".floating-controls");
+  if (!controls) return;
+  controls.style.transition = "";
+  controls.style.transform = "";
+}
+
+/** 手势结束：清理内联样式,超过阈值则完全打开,否则回弹关闭。 */
+function endPaneDrag(commit) {
+  const pane = $("main-pane");
+  pane.style.transition = "";
+  pane.style.transform = "";
+  pane.style.borderRadius = "";
+  pane.style.boxShadow = "";
+  const drawer = $("drawer");
+  if (drawer) {
+    drawer.style.transition = "";
+    drawer.style.transform = "";
+  }
+  const veil = document.querySelector(".pane-veil");
+  if (veil) {
+    veil.style.transition = "";
+    veil.style.opacity = "";
+  }
+  clearFloatingControlsInline();
+  if (commit) openDrawer();
+  else closeDrawer();
+}
+
+/** 绑定 Pointer Events 手势(同时覆盖鼠标与触摸)。 */
+function bindPushGesture() {
+  const pane = $("main-pane");
+  const edge = $("pane-edge");
+  if (!pane || !edge) return;
+  edge.addEventListener("pointerdown", (event) => {
+    if (isDrawerOpen()) return;
+    if (event.pointerType === "mouse" && event.button !== 0) return;
+    dragState = { startX: event.clientX, moved: 0 };
+    try {
+      edge.setPointerCapture(event.pointerId);
+    } catch (error) {
+      /* 老浏览器不支持指针捕获时忽略 */
+    }
+  });
+  edge.addEventListener("pointermove", (event) => {
+    if (!dragState) return;
+    const delta = event.clientX - dragState.startX;
+    dragState.moved = Math.max(dragState.moved, delta);
+    dragPaneTo(delta);
+    if (delta > 8 && event.cancelable) event.preventDefault();
+  });
+  edge.addEventListener("pointerup", (event) => {
+    if (!dragState) return;
+    const delta = Math.max(dragState.moved, event.clientX - dragState.startX);
+    dragState = null;
+    endPaneDrag(delta > window.innerWidth * OPEN_THRESHOLD);
+  });
+  edge.addEventListener("pointercancel", () => {
+    if (!dragState) return;
+    dragState = null;
+    endPaneDrag(false);
+  });
+}
+
+/** 从推开状态左滑收回：在露出的卡片区域拖动，松手按 30% 阈值吸附。 */
+function bindCloseGesture() {
+  const scrim = $("scrim");
+  if (!scrim) return;
+  let drag = null;
+  let suppressClick = false;
+  let clickTimer = null;
+
+  scrim.addEventListener("pointerdown", (event) => {
+    if (!isDrawerOpen()) return;
+    if ($("detail").classList.contains("open")) return; // 详情打开时只接受点击关闭
+    if (event.pointerType === "mouse" && event.button !== 0) return;
+    drag = { startX: event.clientX, moved: 0 };
+    try {
+      scrim.setPointerCapture(event.pointerId);
+    } catch (error) {
+      /* 老浏览器不支持指针捕获时忽略 */
+    }
+  });
+  scrim.addEventListener("pointermove", (event) => {
+    if (!drag) return;
+    const delta = drag.startX - event.clientX;
+    if (delta <= 0) return;
+    drag.moved = Math.max(drag.moved, delta);
+    if (drag.moved > 8) {
+      suppressClick = true;
+      clearTimeout(clickTimer);
+    }
+    dragPaneTo(paneOpenWidth() - delta);
+    if (event.cancelable) event.preventDefault();
+  });
+  scrim.addEventListener("pointerup", (event) => {
+    if (!drag) return;
+    const moved = Math.max(drag.moved, drag.startX - event.clientX);
+    drag = null;
+    if (moved <= 8) return; // 没移动：当作点击，交给 click 关闭
+    endPaneDrag(moved <= window.innerWidth * OPEN_THRESHOLD);
+    // 拖拽后浏览器不一定会补发 click，超时后自动解除抑制
+    clearTimeout(clickTimer);
+    clickTimer = setTimeout(() => {
+      suppressClick = false;
+    }, 400);
+  });
+  scrim.addEventListener("pointercancel", () => {
+    if (!drag) return;
+    drag = null;
+    endPaneDrag(true);
+  });
+  scrim.addEventListener("click", () => {
+    if (suppressClick) {
+      suppressClick = false;
+      return;
+    }
+    if ($("detail").classList.contains("open")) {
+      closeDetail();
+      return;
+    }
+    closeDrawer();
+  });
 }
 
 /* ------------------------------------------------------------------ */
@@ -437,8 +848,11 @@ function ragEmbeddingHint(embedding) {
 /** 在全局配置的 Embedding 控件下列出已发现的 provider 和模型名。 */
 function decorateEmbeddingHint() {
   if (!state.embeddingProviders.length) return;
+  // 字段实际路径为 memory_rag.memory_control.embedding_provider_id（schema 缩进
+  // 过一层），旧选择器里的 memory_rag.embedding_provider_id 永远匹配不到，
+  // 提示因此从未显示。这里改用后缀匹配，schema 再次搬迁也不会失效。
   const control = document.querySelector(
-    '#global-form [data-global-row="memory_rag.embedding_provider_id"] .control'
+    '#global-form [data-global-row$="embedding_provider_id"] .control'
   );
   if (!control || control.querySelector(".embedding-options")) return;
   const text = state.embeddingProviders
@@ -447,18 +861,83 @@ function decorateEmbeddingHint() {
     .join("、");
   const hint = document.createElement("span");
   hint.className = "field-hint embedding-options";
-  hint.textContent = `当前可用：${text}（填模型名或 ID 均可）`;
+  hint.textContent = `当前可用：${text}（留空自动选择第一个可用）`;
   control.appendChild(hint);
 }
 
 /** 生成一张统一样式的状态卡 HTML，调用方传入已确定的展示内容。 */
 function statusCard(label, value, hint, tone = "") {
+  // 参考图 B:左指标名 15px + 次级说明,右数值 17px/600 + 可选彩色小徽标(tone: on / off)
   return `
-    <div class="status-card">
-      <div class="label">${escapeHtml(label)}</div>
-      <div class="value ${tone}">${value}</div>
-      ${hint ? `<div class="hint">${escapeHtml(hint)}</div>` : ""}
+    <div class="row status-row">
+      <div class="row-main">
+        <span class="row-label">${escapeHtml(label)}</span>
+        ${hint ? `<span class="row-sub">${escapeHtml(hint)}</span>` : ""}
+      </div>
+      <div class="row-value ${tone}">${tone ? `<i class="badge ${tone}"></i>` : ""}${value}</div>
     </div>`;
+}
+
+/** 渲染状态页「本轮记忆」读数：召回耗时、注入条数、降级原因与后台抽取。 */
+function renderMemoryMetrics(metrics) {
+  const container = $("overview-metrics");
+  if (!container) return;
+  // 数据来自 /overview 的 data.metrics（不是 data.stats）；缺字段一律按 0/空对象降级。
+  const data = metrics && typeof metrics === "object" ? metrics : {};
+  const autoExtract =
+    data.auto_extract && typeof data.auto_extract === "object"
+      ? data.auto_extract
+      : {};
+  const number = (value) => {
+    const parsed = Number(value || 0);
+    return Number.isFinite(parsed) ? parsed : 0;
+  };
+  const recallMs = number(data.recall_ms);
+  const memoryHits = number(data.memory_hits);
+  const deadlineHits = number(data.recall_deadline_hit);
+  const embeddingTimeouts = number(data.embedding_timeout);
+  const pendingMessages = number(autoExtract.pending_messages);
+  // 分阶段耗时与并行丢弃：page_api 白名单后才会出现，缺失时按 0 处理且不占位。
+  const embeddingWasted = number(data.embedding_wasted);
+  const lexicalMs = number(data.lexical_ms);
+  const embeddingMs = number(data.embedding_ms);
+  const vectorMs = number(data.vector_ms);
+  const lexicalTimeouts = number(data.lexical_timeout);
+
+  const reasons = [];
+  if (deadlineHits > 0) reasons.push(`召回超时 ${formatNumber(deadlineHits)} 次`);
+  if (embeddingTimeouts > 0) {
+    reasons.push(`Embedding 超时 ${formatNumber(embeddingTimeouts)} 次`);
+  }
+  if (lexicalTimeouts > 0) {
+    reasons.push(`词法超时 ${formatNumber(lexicalTimeouts)} 次`);
+  }
+  const recallHints = [`本轮注入 ${formatNumber(memoryHits)} 条记忆`];
+  if (lexicalMs > 0) recallHints.push(`词法 ${formatNumber(lexicalMs)}ms`);
+  if (embeddingMs > 0) recallHints.push(`向量化 ${formatNumber(embeddingMs)}ms`);
+  if (vectorMs > 0) recallHints.push(`语义 ${formatNumber(vectorMs)}ms`);
+  const degraded = Boolean(data.degraded);
+  const hasMetrics = Object.keys(data).length > 0 && Boolean(data.origin);
+  let statusBadge = '<span class="tag on">正常</span>';
+  if (!hasMetrics) statusBadge = '<span class="tag off">—</span>';
+  else if (degraded) statusBadge = '<span class="tag warn">降级</span>';
+  const statusHints = [];
+  if (degraded) statusHints.push(reasons.length ? reasons.join(" · ") : "本轮发生降级");
+  if (embeddingWasted > 0) {
+    statusHints.push(`并行丢弃 ${formatNumber(embeddingWasted)} 次`);
+  }
+  let statusHint = statusHints.length ? statusHints.join(" · ") : "本轮未触发降级";
+  if (!hasMetrics) statusHint = "暂无本轮召回数据";
+
+  container.innerHTML = [
+    statusCard("记忆召回", `${formatNumber(recallMs)} ms`, recallHints.join(" · ")),
+    statusCard("召回状态", statusBadge, statusHint),
+    statusCard(
+      "后台抽取",
+      `${formatNumber(pendingMessages)} 条待抽取`,
+      `最近抽取：${formatClockTime(autoExtract.last_at)}`
+    ),
+  ].join("");
 }
 
 /** 获取插件概览数据并刷新状态页与侧边栏群列表。 */
@@ -485,22 +964,25 @@ function renderOverview(data) {
   $("drawer-version").textContent = `v${data.version || "-"} · UI${UI_BUILD}`;
 
   const modeLabel = s.mode === "model_choice" ? "模型判定" : "概率";
+  const onOff = (flag) => (flag ? "on" : "off");
   $("status-grid").innerHTML = [
     statusCard(
       "主动回复",
       s.active_reply ? "已开启" : "已关闭",
       s.active_reply ? `当前方式：${modeLabel}` : "可在群配置中单独开启",
-      s.active_reply ? "" : "muted"
+      onOff(s.active_reply)
     ),
     statusCard(
       "群聊上下文增强",
       s.context ? "已开启" : "已关闭",
-      s.react_pattern ? "React Pattern 已开启" : "React Pattern 未开启"
+      s.react_pattern ? "React Pattern 已开启" : "React Pattern 未开启",
+      onOff(s.context)
     ),
     statusCard(
       "智能回复",
       s.smart_reply ? "生效中" : "未生效",
-      s.react_pattern ? "@ 与引用解析" : "需要 React Pattern"
+      s.react_pattern ? "@ 与引用解析" : "需要 React Pattern",
+      onOff(s.smart_reply)
     ),
     statusCard(
       "记忆条目",
@@ -511,15 +993,24 @@ function renderOverview(data) {
       "记忆 RAG",
       s.memory_rag ? "已开启" : "已关闭",
       ragEmbeddingHint(data.embedding),
-      s.memory_rag ? "" : "muted"
+      onOff(s.memory_rag)
     ),
     statusCard(
       "联网搜索",
       s.web_search ? "已开启" : "已关闭",
-      s.web_search ? "模型可调用 grok_web_search" : "需要时可在全局设置中启用"
+      s.web_search ? "模型可调用 grok_web_search" : "需要时可在全局设置中启用",
+      onOff(s.web_search)
     ),
   ].join("");
 
+  // 本轮记忆读数:数据来源是 /overview 的 data.metrics,不是 data.stats。
+  renderMemoryMetrics(data.metrics);
+
+  // 记忆库统计:一张分组卡内的多行;0 条时切换为参考图 A 的空状态(静态节点只切 hidden)
+  const statsEmpty = !Number(stats.total_memories);
+  $("overview-stats").classList.toggle("hidden", statsEmpty);
+  $("overview-stats-empty").classList.toggle("hidden", !statsEmpty);
+  $("overview-stats-refresh").onclick = () => void loadOverview(true);
   $("overview-stats").innerHTML = [
     ["记忆总数", stats.total_memories],
     ["群范围", stats.group_scope_count],
@@ -528,13 +1019,14 @@ function renderOverview(data) {
   ]
     .map(
       ([title, value]) => `
-      <div class="stat-box">
-        <div class="n">${formatNumber(value)}</div>
-        <div class="t">${escapeHtml(title)}</div>
+      <div class="row stat-line">
+        <span class="row-label">${escapeHtml(title)}</span>
+        <span class="row-value">${formatNumber(value)}</span>
       </div>`
     )
     .join("");
 
+  // 全局开关:布尔值渲染成只读(灰化)iOS 开关,不再用彩色徽标
   const switches = [
     ["主动回复", s.active_reply],
     ["群聊上下文增强", s.context],
@@ -546,28 +1038,41 @@ function renderOverview(data) {
   $("overview-switches").innerHTML = switches
     .map(
       ([label, enabled]) => `
-      <li>
-        <span>${escapeHtml(label)}</span>
-        <span class="tag ${enabled ? "on" : "off"}">${enabled ? "开启" : "关闭"}</span>
+      <li class="row">
+        <span class="row-label">${escapeHtml(label)}</span>
+        <label class="switch readonly" aria-label="${escapeHtml(label)}：${enabled ? "开启" : "关闭"}">
+          <input type="checkbox" disabled ${enabled ? "checked" : ""} />
+          <span class="slider"></span>
+        </label>
       </li>`
     )
     .join("");
 
+  // 最近活跃群:横向条(头像 40 + 群名 13);无数据时显示空状态并复用「前往群配置」
   const groups = (data.groups || []).filter((item) => item.messaged);
-  $("overview-groups").innerHTML = groups.length
-    ? groups
-        .map(
-          (item) => `
-        <button class="group-pill" data-gid="${escapeHtml(item.group_id)}">
-          ${escapeHtml(item.name || item.group_id)}
-        </button>`
-        )
-        .join("")
-    : '<p class="muted small">还没有收到过任何群消息</p>';
+  $("overview-groups").parentElement.classList.toggle("hidden", !groups.length);
+  $("overview-groups-empty").classList.toggle("hidden", groups.length > 0);
+  $("overview-groups-go").onclick = () => {
+    state.currentGroupId = "";
+    switchView("groups");
+  };
+  $("overview-groups").innerHTML = groups
+    .map((item) => {
+      const label = item.name || item.group_id;
+      return `
+        <button class="group-pill" data-gid="${escapeHtml(item.group_id)}" title="${escapeHtml(label)}">
+          <img class="mini-avatar" data-avatar="${escapeHtml(item.group_id)}"
+               data-name="${escapeHtml(label)}" alt="" />
+          <span>${escapeHtml(label)}</span>
+        </button>`;
+    })
+    .join("");
 
   $("overview-groups")
     .querySelectorAll(".group-pill")
     .forEach((btn) => {
+      const img = btn.querySelector("img[data-avatar]");
+      if (img) bindAvatar(img, img.dataset.avatar, img.dataset.name);
       btn.addEventListener("click", () => {
         switchView("groups");
         void openGroup(btn.dataset.gid);
@@ -583,13 +1088,34 @@ function groupDisplayName(item) {
   return item && item.name ? item.name : "未命名群";
 }
 
-/** 绑定远程 QQ 群头像和一次性错误回退，避免破图图标留在列表中。 */
+/**
+ * 绑定群头像：优先加载 QQ 群头像，失败或群号不合法时用本地 SVG 占位图。
+ *
+ * 头像加载失败只影响当前图片，不能中断整页渲染（此前 emoji 群名会触发
+ * `URI malformed`，导致群列表加载报错）。
+ */
 function bindAvatar(img, groupId, name) {
-  img.src = avatarUrl(groupId);
-  img.onerror = () => {
+  if (!img) return;
+  let fallback = SAFE_AVATAR_FALLBACK;
+  try {
+    fallback = fallbackAvatar(name || groupId);
+  } catch (error) {
+    fallback = SAFE_AVATAR_FALLBACK;
+  }
+  const setFallback = () => {
     img.onerror = null;
-    img.src = fallbackAvatar(name);
+    img.src = fallback;
   };
+  try {
+    img.onerror = setFallback;
+    // 不把控制台页面地址作为 Referer 发给头像 CDN。
+    img.referrerPolicy = "no-referrer";
+    img.loading = "lazy";
+    const remote = avatarUrl(groupId);
+    img.src = remote || fallback;
+  } catch (error) {
+    setFallback();
+  }
 }
 
 /** 渲染抽屉内的快捷群列表，并绑定头像回退和打开群配置事件。 */
@@ -639,8 +1165,29 @@ function renderGroupList() {
 
   const container = $("group-items");
   if (!groups.length) {
-    container.innerHTML =
-      '<p class="muted small pad">没有匹配的群，可以直接在右侧输入群号打开</p>';
+    // 空列表:居中空状态(参考图 A),按钮复用现有「清除搜索 / 刷新」逻辑,不新增接口
+    container.innerHTML = `
+      <div class="empty-state">
+        <div class="empty-icon">${icon("users")}</div>
+        <h3>${keyword ? "没有匹配的群" : "暂无群"}</h3>
+        <p class="muted">${
+          keyword
+            ? "换个关键词试试，或直接在右侧输入群号打开"
+            : "收到群消息后会自动出现，也可以在右侧输入群号"
+        }</p>
+        <button type="button" class="primary pill-btn" id="group-empty-action">${
+          keyword ? "清除搜索" : "刷新列表"
+        }</button>
+      </div>`;
+    $("group-empty-action").addEventListener("click", () => {
+      if (keyword) {
+        state.groupSearch = "";
+        $("group-search").value = "";
+        renderGroupList();
+      } else {
+        void loadGroups(true);
+      }
+    });
     renderDrawerGroups();
     return;
   }
@@ -658,6 +1205,7 @@ function renderGroupList() {
           <span class="gid">${escapeHtml(item.group_id)}</span>
         </span>
         <span class="dot ${item.active_reply ? "on" : ""}"></span>
+        ${icon("right").replace('class="icon"', 'class="icon chevron"')}
       </button>`
     )
     .join("");
@@ -677,6 +1225,7 @@ async function loadGroups(force = false) {
     renderGroupList();
     return;
   }
+  showGroupsSkeleton();
   try {
     const data = await callApi("GET", "groups", force ? { force: 1 } : {});
     state.groups = data.groups || [];
@@ -701,6 +1250,29 @@ function fieldVisible(field, values) {
   return true;
 }
 
+/** 生成 embedding provider 下拉；值为 provider ID，留空表示自动取第一个可用。 */
+function embeddingProviderOptions(selected) {
+  const providers = state.embeddingProviders || [];
+  const options = [`<option value="">自动（第一个可用）</option>`];
+  providers.forEach((item) => {
+    const id = String(item.id || "").trim();
+    if (!id) return;
+    const label = embeddingLabel(item) || id;
+    options.push(
+      `<option value="${escapeHtml(id)}" ${
+        id === selected ? "selected" : ""
+      }>${escapeHtml(label)}</option>`
+    );
+  });
+  // 配置里可能是当前不可用的旧 ID，保留它以免保存时被悄悄改掉。
+  if (selected && !providers.some((item) => String(item.id || "").trim() === selected)) {
+    options.push(
+      `<option value="${escapeHtml(selected)}" selected>${escapeHtml(selected)}</option>`
+    );
+  }
+  return options.join("");
+}
+
 /** 生成 provider 下拉选项，同时保留当前配置中已不可用的旧 ID。 */
 function providerOptions(selected) {
   const options = [
@@ -718,6 +1290,14 @@ function providerOptions(selected) {
     );
   }
   return options.join("");
+}
+
+/** 设置行布局:开关行(右对齐)/ 行内行(下拉、滑块、短文本)/ 堆叠行(多行文本)。 */
+function rowLayout(type) {
+  if (type === "bool") return "row-switch";
+  if (type === "text" || type === "list" || type === "dict") return "row-stack";
+  if (type === "int" || type === "float") return "row-range";
+  return "row-inline";
 }
 
 /** 按群覆盖字段元数据生成开关、选项、滑块或文本控件。 */
@@ -749,9 +1329,9 @@ function buildControl(field, value) {
   if (field.kind === "int" || field.kind === "float") {
     const step = field.step || (field.kind === "int" ? 1 : 0.1);
     return `
-      <span class="range-value" data-for="${path}">${value}</span>
       <input type="range" data-path="${path}" data-kind="${field.kind}"
-        min="${field.min}" max="${field.max}" step="${step}" value="${value}" />`;
+        min="${field.min}" max="${field.max}" step="${step}" value="${value}" />
+      <span class="range-value" data-for="${path}">${value}</span>`;
   }
   if (field.kind === "text") {
     return `<textarea data-path="${path}" data-kind="text">${escapeHtml(value || "")}</textarea>`;
@@ -769,7 +1349,7 @@ function renderGroupPanel() {
   $("group-empty").classList.add("hidden");
   $("group-panel").classList.remove("hidden");
   $("group-name").textContent = data.name || "未命名群";
-  $("group-id").textContent = `QQ群 ${data.group_id}`;
+  $("group-id").textContent = String(data.group_id);
   bindAvatar($("group-avatar"), data.group_id, data.name || "");
   $("independent-toggle").checked = independent;
   $("save-hint").textContent = independent
@@ -784,9 +1364,7 @@ function renderGroupPanel() {
     const rows = fields
       .map(
         (field) => `
-        <div class="form-row row-${
-          field.kind === "bool" ? "switch" : "stack"
-        }" data-row="${field.path}" ${
+        <div class="row form-row ${rowLayout(field.kind)}" data-row="${field.path}" ${
           fieldVisible(field, values) ? "" : 'style="display:none"'
         }>
           <label>${escapeHtml(field.label)}</label>
@@ -801,7 +1379,9 @@ function renderGroupPanel() {
       .join("");
     return `<div class="tab-panel ${
       state.currentTab === group.tab ? "active" : ""
-    }" data-panel="${group.tab}"><div class="form-group section-card">${rows}</div></div>`;
+    }" data-panel="${group.tab}"><h4>${escapeHtml(
+      group.title
+    )}</h4><div class="form-group section-card group-card">${rows}</div></div>`;
   }).join("");
 
   const blockPanel = `
@@ -853,17 +1433,36 @@ function renderGroupPanel() {
 /** 在下一帧将当前活动 Tab 滚入其横向滚动容器的可视范围。 */
 function ensureTabVisible(containerId) {
   requestAnimationFrame(() => {
+    const container = $(containerId);
     const el = document.querySelector(`#${containerId} .tab.active`);
-    if (el && typeof el.scrollIntoView === "function") {
-      el.scrollIntoView({ inline: "nearest", block: "nearest" });
+    if (!container || !el) return;
+    // r3.3t：只做 Tab 条横向滚动，绝不触发页面纵向滚动（scrollIntoView 会连带滚动页面）。
+    const containerRect = container.getBoundingClientRect();
+    const tabRect = el.getBoundingClientRect();
+    if (tabRect.left < containerRect.left) {
+      container.scrollLeft -= containerRect.left - tabRect.left;
+    } else if (tabRect.right > containerRect.right) {
+      container.scrollLeft += tabRect.right - containerRect.right;
     }
   });
 }
 
 /** 平滑滚动横向 Tab，使刚切换的分区落在容器中央。 */
 function centerTab(tab) {
-  if (!tab || typeof tab.scrollIntoView !== "function") return;
-  tab.scrollIntoView({ behavior: "smooth", inline: "center", block: "nearest" });
+  if (!tab) return;
+  const container = tab.closest(".tabs");
+  if (!container) return;
+  const containerRect = container.getBoundingClientRect();
+  const tabRect = tab.getBoundingClientRect();
+  const target =
+    container.scrollLeft +
+    (tabRect.left - containerRect.left) -
+    (containerRect.width - tabRect.width) / 2;
+  try {
+    container.scrollTo({ left: Math.max(0, target), behavior: "smooth" });
+  } catch (error) {
+    container.scrollLeft = Math.max(0, target);
+  }
 }
 
 /** 通过移除并重加 CSS 类重新播放分区切换过渡动画。 */
@@ -877,7 +1476,7 @@ function playTabSwitch(el) {
 /** 更新群级配置 Tab 与对应内容面板的活动状态。 */
 function switchTab(name) {
   state.currentTab = name;
-  scrollPageTop();
+  // r3.3t：切换 Tab 不再滚动页面；只切换面板，保持用户当前滚动位置。
   document.querySelectorAll("#group-tabs .tab").forEach((tab) => {
     tab.classList.toggle("active", tab.dataset.tab === name);
   });
@@ -933,7 +1532,7 @@ function shakeIndependent() {
   void wrap.offsetWidth;
   wrap.classList.add("shake");
   setTimeout(() => wrap.classList.remove("shake"), 800);
-  toast("请先打开「独立配置」，再保存或恢复", true);
+  toast("当前未开启「独立配置」，请先勾选后再保存或恢复", true);
 }
 
 /** 加载指定群配置，更新当前群状态并渲染可编辑的群面板。 */
@@ -1043,10 +1642,17 @@ function buildSchemaControl(meta, value, path) {
         <span class="slider"></span>
       </label>`;
   }
-  if (meta._special === "select_provider") {
-    return `<select data-global-path="${path}" data-global-type="str">${providerOptions(
-      value || ""
-    )}</select>`;
+  // _special 有两种取值：select_provider（文本模型）与
+  // select_provider:embedding（Embedding 提供商）。schema 里 Embedding 用的是
+  // 带后缀的写法，旧代码只认全等 "select_provider"，导致该字段退化成纯文本框。
+  const special = String(meta._special || "");
+  if (special === "select_provider" || special.startsWith("select_provider:")) {
+    const kind = special.split(":")[1] || "";
+    const options =
+      kind === "embedding"
+        ? embeddingProviderOptions(value || "")
+        : providerOptions(value || "");
+    return `<select data-global-path="${path}" data-global-type="str">${options}</select>`;
   }
   if (Array.isArray(meta.options) && meta.options.length) {
     const labels = Array.isArray(meta.labels) ? meta.labels : [];
@@ -1066,9 +1672,9 @@ function buildSchemaControl(meta, value, path) {
     const max = Number(slider.max ?? 100);
     const step = Number(slider.step ?? (type === "int" ? 1 : 0.1));
     return `
-      <span class="range-value" data-for-global="${path}">${value ?? min}</span>
       <input type="range" data-global-path="${path}" data-global-type="${type}"
-        min="${min}" max="${max}" step="${step}" value="${value ?? min}" />`;
+        min="${min}" max="${max}" step="${step}" value="${value ?? min}" />
+      <span class="range-value" data-for-global="${path}">${value ?? min}</span>`;
   }
   if (type === "text") {
     return `<textarea data-global-path="${path}" data-global-type="text">${escapeHtml(
@@ -1097,8 +1703,133 @@ const HIDDEN_GLOBAL_PATHS = new Set([
   "memory_rag.memory_generation.auto_extract_enable",
 ]);
 
+/** 页面内数字键盘状态（r3.3w）：替代系统软键盘，避免输入后 WebView 视口错位。 */
+let editingRangeValue = false;
+
+/** 点击滑动控件旁的数值：原位切换成原生数字输入框编辑。 */
+function startRangeValueEdit(span) {
+  if (!span || editingRangeValue) return;
+  const isGlobal = span.hasAttribute("data-for-global");
+  const path = isGlobal
+    ? span.getAttribute("data-for-global")
+    : span.getAttribute("data-for");
+  if (!path) return;
+  const selector = isGlobal
+    ? '#global-form input[type="range"][data-global-path]'
+    : '#group-form input[type="range"][data-path]';
+  const slider = Array.from(document.querySelectorAll(selector)).find((item) =>
+    isGlobal ? item.dataset.globalPath === path : item.dataset.path === path
+  );
+  if (!slider) return;
+  const min = Number(slider.min);
+  const max = Number(slider.max);
+  const kind = slider.dataset.kind || slider.dataset.globalType || "float";
+  const original = span.textContent;
+  const input = document.createElement("input");
+  input.type = "number";
+  input.className = "range-value-input";
+  input.min = String(min);
+  input.max = String(max);
+  // 不按滑杆 step 取整，允许任意数值（最多 3 位小数）。
+  input.step = "any";
+  input.inputMode = "decimal";
+  input.value = String(slider.value);
+  editingRangeValue = true;
+  span.classList.add("editing");
+  span.textContent = "";
+  span.appendChild(input);
+  // r3.4s：只唤起键盘，不滚动页面。
+  const editScrollY = Math.max(0, Number(window.scrollY) || 0);
+  try {
+    input.focus({ preventScroll: true });
+  } catch (error) {
+    input.focus();
+  }
+  input.select();
+  requestAnimationFrame(() => {
+    if (Math.abs(window.scrollY - editScrollY) > 1) {
+      window.scrollTo(0, editScrollY);
+    }
+  });
+  let done = false;
+  const finish = (commit) => {
+    if (done) return;
+    done = true;
+    editingRangeValue = false;
+    span.classList.remove("editing");
+    if (!commit) {
+      span.textContent = original;
+      return;
+    }
+    let value = Number(input.value);
+    if (!Number.isFinite(value)) {
+      span.textContent = original;
+      return;
+    }
+    value = Math.min(max, Math.max(min, value));
+    value = Math.round(value * 1000) / 1000;
+    const display = String(value);
+    const stepAttr = slider.getAttribute("step");
+    slider.dataset.exactValue = display;
+    slider.step = "any";
+    slider.value = display;
+    span.textContent = display;
+    slider.dataset.programmaticEdit = "1";
+    slider.dispatchEvent(new Event("input", { bubbles: true }));
+    slider.dispatchEvent(new Event("change", { bubbles: true }));
+    delete slider.dataset.programmaticEdit;
+    if (stepAttr !== null) slider.setAttribute("step", stepAttr);
+    else slider.removeAttribute("step");
+    attachRangeExactListener(slider, path, isGlobal);
+    // 显示层按类型规范化：int 显示整数，float 最多 3 位小数。
+    span.textContent = kind === "int" ? String(Math.round(value)) : display;
+  };
+  input.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      finish(true);
+    } else if (event.key === "Escape") {
+      event.preventDefault();
+      finish(false);
+    }
+  });
+  input.addEventListener("blur", () => finish(true));
+}
+
+/** 为滑块安装「拖拽时清理手输精确值 + 规范化显示」的监听（只装一次）。 */
+function attachRangeExactListener(slider, path, isGlobal) {
+  if (slider.dataset.exactListener === "1") return;
+  slider.dataset.exactListener = "1";
+  slider.addEventListener("input", () => {
+    if (slider.dataset.programmaticEdit === "1") return;
+    delete slider.dataset.exactValue;
+    const numeric = Number(slider.value);
+    if (!Number.isFinite(numeric)) return;
+    const lo = Number(slider.min);
+    const hi = Number(slider.max);
+    let normalized = Math.min(hi, Math.max(lo, numeric));
+    const kind = slider.dataset.kind || slider.dataset.globalType || "float";
+    normalized =
+      kind === "int"
+        ? Math.round(normalized)
+        : Math.round(normalized * 1000) / 1000;
+    const label = isGlobal
+      ? document.querySelector(`.range-value[data-for-global="${path}"]`)
+      : document.querySelector(`.range-value[data-for="${path}"]`);
+    if (label) label.textContent = String(normalized);
+  });
+}
+
+/** 渲染全局表单时的 schema 区块。 */
 function renderSchemaBlock(schema, scopeValues, prefix) {
+  // 参考图 B:连续的叶子字段合成一张分组卡(.group-card);嵌套 object 的标题放在卡外上方并降一级
   let html = "";
+  let rows = "";
+  const flush = () => {
+    if (!rows) return;
+    html += `<div class="form-group section-card group-card">${rows}</div>`;
+    rows = "";
+  };
   for (const [key, meta] of Object.entries(schema)) {
     if (!meta || typeof meta !== "object") continue;
     const path = prefix ? `${prefix}.${key}` : key;
@@ -1108,9 +1839,13 @@ function renderSchemaBlock(schema, scopeValues, prefix) {
         scopeValues[key] && typeof scopeValues[key] === "object"
           ? scopeValues[key]
           : {};
-      html += `<div class="form-group"><h4>${escapeHtml(
+      flush();
+      const nestedHint = meta.hint
+        ? `<p class="nested-hint">${escapeHtml(cleanHint(meta.hint))}</p>`
+        : "";
+      html += `<div class="form-group nested"><h4>${escapeHtml(
         meta.description || key
-      )}</h4>${renderSchemaBlock(meta.items, child, path)}</div>`;
+      )}</h4>${nestedHint}${renderSchemaBlock(meta.items, child, path)}</div>`;
       continue;
     }
     // 条件字段也要渲染出来，只是默认隐藏：这样用户切换下拉时能立刻显示/隐藏
@@ -1125,15 +1860,15 @@ function renderSchemaBlock(schema, scopeValues, prefix) {
     const hint = meta.hint
       ? `<p class="row-hint">${escapeHtml(cleanHint(meta.hint))}</p>`
       : "";
-    html += `
-      <div class="form-row ${
-        meta.type === "bool" ? "row-switch" : "row-stack"
-      }" data-global-row="${path}"${condAttr}${style}>
+    const layout = rowLayout(String(meta.type || "string"));
+    rows += `
+      <div class="row form-row ${layout}" data-global-row="${path}"${condAttr}${style}>
         <label>${escapeHtml(meta.description || key)}</label>
         <div class="control">${buildSchemaControl(meta, scopeValues[key], path)}</div>
         ${hint}
       </div>`;
   }
+  flush();
   return html;
 }
 
@@ -1155,6 +1890,7 @@ function rerenderActiveGlobalPanel() {
     renderSchemaBlock(meta.items, scope, key);
   bindGlobalInputs();
   refreshGlobalConditions();
+  decorateEmbeddingHint();
 }
 
 /** 根据已填写的全局配置值同步 schema 条件字段的显示状态。 */
@@ -1234,7 +1970,7 @@ function globalSections() {
 /** 切换全局设置的活动 Tab 和相应配置面板。 */
 function switchGlobalTab(key) {
   state.globalTab = key;
-  scrollPageTop();
+  // r3.3t：切换 Tab 不再滚动页面；只切换面板，保持用户当前滚动位置。
   document.querySelectorAll("#global-tabs .tab").forEach((tab) => {
     tab.classList.toggle("active", tab.dataset.gtab === key);
   });
@@ -1269,14 +2005,11 @@ function renderGlobalForm() {
           ? state.globalValues[key]
           : {};
       const body = renderSchemaBlock(meta.items, scope, key);
-      const nested = Object.values(meta.items || {}).some(
-        (item) => item && item.type === "object" && item.items
-      );
       return `<div class="tab-panel ${
         index === 0 ? "active" : ""
-      }" data-gpanel="${escapeHtml(key)}">${
-        nested ? body : `<div class="form-group section-card">${body}</div>`
-      }</div>`;
+      }" data-gpanel="${escapeHtml(key)}"><h4>${escapeHtml(
+        meta.description || key
+      )}</h4>${body}</div>`;
     })
     .join("");
 
@@ -1286,6 +2019,8 @@ function renderGlobalForm() {
     : sections[0][0];
   switchGlobalTab(activeKey);
   ensureTabVisible("global-tabs");
+  // 表单重绘会丢掉动态提示，重绘后重新补上 Embedding 可用列表。
+  decorateEmbeddingHint();
 }
 
 /** 递归提取 schema 默认值并复制数组/对象，避免共享引用被表单修改。 */
@@ -1314,7 +2049,6 @@ async function loadGlobal() {
     state.embeddingProviders =
       data.embedding_providers || state.embeddingProviders;
     renderGlobalForm();
-    decorateEmbeddingHint();
     $("global-hint").textContent = "";
   } catch (error) {
     $("global-tabs").innerHTML = "";
@@ -1346,7 +2080,11 @@ function collectGlobalValues() {
     if (type === "bool") {
       value = input.checked;
     } else if (type === "int" || type === "float") {
-      value = Number(input.value);
+      // r3.3u：用户手输的精确值优先（避免 range 恢复 step 后被吸附）。
+      value =
+        input.dataset.exactValue !== undefined
+          ? Number(input.dataset.exactValue)
+          : Number(input.value);
     } else if (type === "list") {
       value = input.value
         .split(/[\n,，]/)
@@ -1392,6 +2130,44 @@ async function saveGlobal() {
 /* ------------------------------------------------------------------ */
 /* 记忆 RAG                                                            */
 /* ------------------------------------------------------------------ */
+/** 渲染「当前遗忘规则」摘要：TTL、衰减、归档阈值与巩固周期（r3.3l）。 */
+function renderRagRules(rules) {
+  const box = $("rag-rules");
+  if (!box) return;
+  if (!rules || typeof rules !== "object") {
+    box.textContent = "";
+    return;
+  }
+  const base = rules.ttl_base || {};
+  const days = (value) => (Number(value) > 0 ? `${Number(value)}天` : "永久");
+  const ttlText = rules.ttl_adaptive
+    ? `TTL 计划${days(base.plan)} / 事件${days(base.episode)} / 偏好${days(
+        base.preference
+      )} / 关系${days(base.relation)} / 事实${days(base.fact)}（自适应）`
+    : "TTL 使用旧版按类型硬过期";
+  const decayText = rules.decay_enable
+    ? `重要性每天衰减 ${(Number(rules.decay_rate || 0) * 100).toFixed(
+        2
+      )}%（下限 ${Number(rules.decay_floor || 0).toFixed(2)}）`
+    : "重要性不随时间衰减";
+  const archiveText = rules.archive_enable
+    ? `低价值（有效重要性 ≤ ${Number(rules.archive_importance || 0).toFixed(
+        2
+      )}）且 ${Number(rules.archive_days)} 天未访问归档`
+    : "低价值归档关闭";
+  const retention = Number(rules.archive_retention_days || 0);
+  const retentionText =
+    retention > 0 ? `归档保留 ${retention} 天后物理清理` : "归档永久保留";
+  const consolidation = rules.consolidation_enable
+    ? `每 ${Number(rules.consolidation_interval_days)} 天巩固一次`
+    : "巩固关闭";
+  box.innerHTML =
+    "<b>遗忘规则：</b>" +
+    [ttlText, decayText, archiveText, retentionText, consolidation]
+      .map((text) => escapeHtml(text))
+      .join(" · ");
+}
+
 /** 加载记忆统计；需要筛选器选项时同时更新可用群作用域。 */
 async function loadRagStats(updateScopes = false) {
   try {
@@ -1403,13 +2179,19 @@ async function loadRagStats(updateScopes = false) {
       if (select) {
         select.innerHTML = [
           `<option value="">全部群范围</option>`,
-          ...state.rag.scopes.map(
-            (scope) =>
-              `<option value="${escapeHtml(scope)}">${escapeHtml(scope)}</option>`
-          ),
+          // r3.3j：可单独筛选全局层记忆（群作用域为空）。
+          `<option value="__global__">全局</option>`,
+          ...state.rag.scopes.map((scope) => {
+            const scopeLabel = ragScopeLabel(scope) || scope;
+            return `<option value="${escapeHtml(scope)}">${escapeHtml(
+              scopeLabel
+            )}</option>`;
+          }),
         ].join("");
       }
     }
+    state.rag.rules = data.rules || null;
+    renderRagRules(state.rag.rules);
     renderStatsTray(stats);
     renderSourceCard(stats);
   } catch (error) {
@@ -1432,6 +2214,23 @@ function renderStatsTray(stats) {
     ["今日新增", formatNumber(stats.today), ""],
     ["关键词记忆", formatNumber(sources.keyword), ""],
     ["模型抽取", formatNumber(sources.model), ""],
+    // r3.3k：遗忘可见性（即将过期 / 已过期未归档 / 已归档）。
+    ["即将过期", formatNumber(stats.expiring_soon), "7 天内"],
+    ["已过期未归档", formatNumber(stats.expired_active), "等待归档"],
+    ["已归档", formatNumber(stats.archived_count), "不再召回"],
+    // r3.3l：最近 7 天新归档（遗忘）数量与原因分布。
+    [
+      "本周遗忘",
+      formatNumber(stats.weekly_forgotten),
+      Object.entries(stats.weekly_by_reason || {})
+        .map(
+          ([reason, count]) =>
+            `${ARCHIVE_REASON_LABELS[reason] || escapeHtml(String(reason))} ${formatNumber(
+              count
+            )}`
+        )
+        .join(" · "),
+    ],
   ];
   const expanded = card.dataset.expanded === "1";
   card.innerHTML = `
@@ -1511,52 +2310,266 @@ function renderSourceCard(stats) {
   });
 }
 
-/** 渲染分页记忆记录，并为详情与删除按钮绑定对应操作。 */
+/** 记忆类型白名单：只有已知枚举才能拼进 CSS 类名（F44）。 */
+const MEMORY_TYPE_CLASSES = new Set(["personal", "group", "private"]);
+
+/** 归档原因文案（由服务端写入 archive_reason；旧数据为空）。 */
+const ARCHIVE_REASON_LABELS = {
+  expired: "过期",
+  stale: "低价值",
+  consolidation: "巩固",
+  manual: "手动",
+};
+
+/** 角色徽标：值来自记忆元数据，只使用固定文案与固定类名，避免被投毒。 */
+const ROLE_BADGES = {
+  owner: { label: "所有者", cls: "role-owner" },
+  group_owner: { label: "群主", cls: "role-group_owner" },
+  group_admin: { label: "群管", cls: "role-group_admin" },
+  member: { label: "群成员", cls: "role-member" },
+};
+
+/** 稳定参与者标签：昵称#后四位；没有身份记录时用「用户#后四位」。 */
+function participantLabel(id, participantIdentities) {
+  const target = String(id || "").trim();
+  if (!target) return "-";
+  const list = Array.isArray(participantIdentities) ? participantIdentities : [];
+  const found = list.find(
+    (entry) => entry && String(entry.sender_id || "").trim() === target
+  );
+  if (!found) return `用户#${target.slice(-4)}`;
+  if (found.is_bot) return "我";
+  const name = String(found.display_name || "").trim();
+  if (!name || name === target) return `用户#${target.slice(-4)}`;
+  return `${name}#${target.slice(-4)}`;
+}
+
+/** 渲染「徽标 + 稳定参与者标签」列表；所有文本都必须转义（F02）。 */
+function renderRoleBadges(roleIds, identities, participantIdentities) {
+  const ids = Array.isArray(roleIds) ? roleIds : [];
+  if (!ids.length) return '<span class="muted">-</span>';
+  const map = identities && typeof identities === "object" ? identities : {};
+  const badges = ids.map((id) => {
+    const role = String(map[id] || "member");
+    const meta = ROLE_BADGES[role] || ROLE_BADGES.member;
+    const label = participantLabel(id, participantIdentities);
+    return (
+      '<span class="role-badge">' +
+      `<span class="pill ${meta.cls}">${escapeHtml(meta.label)}</span>` +
+      `<span class="mono role-id">${escapeHtml(label)}</span>` +
+      "</span>"
+    );
+  });
+  return `<span class="mem-role-badges">${badges.join("")}</span>`;
+}
+
+/** 记忆 kind 的固定徽标：只允许白名单，避免记忆内容注入类名。 */
+const MEMORY_KIND_BADGES = {
+  episode: { label: "事件", cls: "kind-episode" },
+  plan: { label: "计划", cls: "kind-plan" },
+  preference: { label: "偏好", cls: "kind-preference" },
+  relation: { label: "关系", cls: "kind-relation" },
+  fact: { label: "事实", cls: "kind-fact" },
+};
+
+function memoryKindBadge(item, isAtom) {
+  const kind = String(item.kind || "fact").toLowerCase();
+  const meta = MEMORY_KIND_BADGES[kind] || MEMORY_KIND_BADGES.fact;
+  const atom = isAtom ? '<span class="pill atom-mark">原子</span>' : "";
+  return `<span class="pill ${meta.cls}">${meta.label}</span>${atom}`;
+}
+
+function memoryEpisodeId(extraMetadata) {
+  const raw = extraMetadata && extraMetadata.episode_id;
+  const id = Number(raw);
+  return Number.isInteger(id) && id > 0 ? id : null;
+}
+
+/** 卡片时间：2026-11-07T08:50:56 -> 2026-11-7 08:50:56。 */
+function formatMemoryCardTime(value) {
+  const text = String(value || "").replace("T", " ");
+  const match = text.match(
+    /^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})/
+  );
+  if (!match) return text.slice(0, 19) || "-";
+  const [, year, month, day, hour, minute, second] = match;
+  return `${year}-${Number(month)}-${Number(day)} ${hour}:${minute}:${second}`;
+}
+
+/** 渲染分页记忆记录，并为详情、归档/恢复与删除按钮绑定对应操作。 */
 function renderRagRows(items) {
   const body = $("rag-body");
-  const roleLabels = {
-    owner: "所有者",
-    group_owner: "群主",
-    group_admin: "群管理",
-    member: "群成员",
-  };
   const typeLabels = {
     personal: "个人",
     group: "群聊",
     private: "私聊",
   };
   if (!Array.isArray(items) || !items.length) {
+    body.closest("table")?.classList.toggle("is-selecting", state.rag.selectMode);
     body.innerHTML =
       '<tr><td colspan="4" class="muted center pad">当前筛选条件下没有记忆</td></tr>';
+    syncRagBulkBar();
     return;
   }
+  // 同页内按 episode_id 分组：episode 作为父卡片，原子记忆折叠进父卡片。
+  const episodeIds = new Set(
+    items
+      .filter((item) => String(item.kind || "").toLowerCase() === "episode")
+      .map((item) => String(item.memory_id))
+  );
+  const atomsByEpisode = new Map();
+  for (const item of items) {
+    const extra = item.extra_metadata && typeof item.extra_metadata === "object"
+      ? item.extra_metadata
+      : {};
+    const episodeId = memoryEpisodeId(extra);
+    if (episodeId && episodeIds.has(String(episodeId))) {
+      const key = String(episodeId);
+      if (!atomsByEpisode.has(key)) atomsByEpisode.set(key, []);
+      atomsByEpisode.get(key).push(item);
+    }
+  }
+  const groupedAtomIds = new Set(
+    [...atomsByEpisode.values()].flat().map((item) => String(item.memory_id))
+  );
   body.innerHTML = items
+    .filter((item) => !groupedAtomIds.has(String(item.memory_id)))
     .map((item) => {
       const role = item.sender_role || "member";
-      const type = item.memory_type || "group";
+      // 记忆类型可能来自被投毒的记忆行：类名只允许已知枚举（F44）。
+      const rawType = String(item.memory_type || "group").toLowerCase();
+      const type = MEMORY_TYPE_CLASSES.has(rawType) ? rawType : "unknown";
       const superseded = item.superseded_by
         ? '<span class="pill type-invalid">已失效</span>'
         : "";
-      const time = escapeHtml(
-        (item.memory_time_iso || "-").replace("T", " ").slice(0, 19)
-      );
-      const meta = item.extra_metadata || {};
-      const identities = { ...(meta.role_identities || {}) };
+      // 已归档记忆复用灰色 pill 样式；列表行与展开详情都能看到标记。
+      const isArchived = Boolean(item.archived);
+      const archiveReason = String(item.archive_reason || "");
+      const archived = isArchived
+        ? `<span class="pill type-invalid">已归档${
+            ARCHIVE_REASON_LABELS[archiveReason]
+              ? `·${ARCHIVE_REASON_LABELS[archiveReason]}`
+              : ""
+          }</span>`
+        : "";
+      // r3.3k：遗忘可见性（即将过期 / 已过期未归档）。
+      const daysLeft =
+        typeof item.days_left === "number" ? item.days_left : null;
+      let forgettingPill = "";
+      if (!isArchived && item.expired) {
+        forgettingPill =
+          '<span class="pill pill-danger" title="有效期已过，等待维护任务归档">已过期待归档</span>';
+      } else if (!isArchived && daysLeft !== null && daysLeft <= 7) {
+        forgettingPill = `<span class="pill pill-warn" title="有效期剩余 ${Math.max(
+          0,
+          daysLeft
+        )} 天">剩 ${Math.max(0, daysLeft)} 天</span>`;
+      }
+      const time = escapeHtml(formatMemoryCardTime(item.memory_time_iso || ""));
+      const cardGroupId = String(item.group_id || "").trim();
+      const cardGroupName = String(item.group_name || "").trim();
+      const cardScope = cardGroupId
+        ? `${cardGroupName || "群聊"} ${cardGroupId}`
+        : "全局";
+      const extraMetadata =
+        item.extra_metadata && typeof item.extra_metadata === "object"
+          ? item.extra_metadata
+          : {};
+      const identityMap =
+        extraMetadata.role_identities &&
+        typeof extraMetadata.role_identities === "object"
+          ? extraMetadata.role_identities
+          : {};
+      const identities = { ...identityMap };
       if (item.sender_id && item.sender_role) {
         identities[item.sender_id] = item.sender_role;
       }
-      const roleText = (item.related_role_ids || [])
-        .map((id) => `${roleLabels[identities[id] || "member"] || "群成员"} ${id}`)
-        .join("、");
+      // 角色与 QQ 号分列展示：徽标用固定文案，ID 统一转义（F02）。
+      const episodeId = memoryEpisodeId(extraMetadata);
+      const isAtom = episodeId !== null;
+      const isEpisode = String(item.kind || "").toLowerCase() === "episode";
+      const children = isEpisode
+        ? atomsByEpisode.get(String(item.memory_id)) || []
+        : [];
+      const kindBadge = memoryKindBadge(item, isAtom && !isEpisode);
+      const atomCount = children.length
+        ? `<span class="pill atom-count">+${children.length} 原子</span>`
+        : "";
+      const orphanAtom =
+        isAtom && !episodeIds.has(String(episodeId))
+          ? `<span class="muted small mono">↳ #${escapeHtml(episodeId)}</span>`
+          : "";
+      const childrenHtml = children.length
+        ? `<div class="mem-atoms"><div class="mem-atoms-title">原子记忆 · ${children.length} 条</div>${children
+            .map((child) => {
+              const childMeta =
+                child.extra_metadata && typeof child.extra_metadata === "object"
+                  ? child.extra_metadata
+                  : {};
+              return `<div class="mem-atom-card">
+                <div class="mem-atom-head">${memoryKindBadge(child, true)}<span class="mono muted">#${escapeHtml(child.memory_id)}</span>
+                <span class="muted small">置信度 ${Number(
+                  childMeta.confidence ?? 0
+                ).toFixed(2)}</span></div>
+                <p class="mem-atom-content">${escapeHtml(child.content)}</p>
+                <div class="mem-atom-actions">
+                  <button class="link-btn icon-action" title="详情" aria-label="详情" data-detail="${escapeHtml(
+                    child.memory_id
+                  )}">${icon("eye")}</button>
+                  <button class="link-btn icon-action" title="原始消息" aria-label="原始消息" data-source="${escapeHtml(
+                    child.memory_id
+                  )}">${icon("message")}</button>
+                  ${
+                    child.archived
+                      ? `<button class="link-btn icon-action" title="恢复" aria-label="恢复" data-unarchive="${escapeHtml(
+                          child.memory_id
+                        )}">${icon("reset")}</button>
+                         <button class="link-btn icon-action danger" title="彻底删除" aria-label="彻底删除" data-purge="${escapeHtml(
+                           child.memory_id
+                         )}">${icon("trash")}</button>`
+                      : `<button class="link-btn icon-action" title="归档" aria-label="归档" data-archive="${escapeHtml(
+                          child.memory_id
+                        )}">${icon("archive")}</button>
+                         <button class="link-btn icon-action danger" title="删除" aria-label="删除" data-delete="${escapeHtml(
+                           child.memory_id
+                         )}">${icon("trash")}</button>`
+                  }
+                </div>
+              </div>`;
+            })
+            .join("")}</div>`
+        : "";
+      const roleBadges = renderRoleBadges(
+        item.related_role_ids,
+        identities,
+        extraMetadata.participant_identities
+      );
       const confidence =
-        meta.confidence !== undefined && meta.confidence !== null
-          ? Number(meta.confidence).toFixed(2)
+        extraMetadata.confidence !== undefined && extraMetadata.confidence !== null
+          ? Number(extraMetadata.confidence).toFixed(2)
           : "-";
+      const kindClass =
+        MEMORY_KIND_BADGES[String(item.kind || "fact").toLowerCase()]?.cls ||
+        MEMORY_KIND_BADGES.fact.cls;
+      const selected = state.rag.selected.has(String(item.memory_id));
+      const selectionClass = state.rag.selectMode
+        ? ` is-selecting${selected ? " selected" : ""}`
+        : "";
       return `
-      <tr class="mem-row" data-mem-row="${escapeHtml(item.memory_id)}">
-        <td class="mono" data-label="ID">${escapeHtml(item.memory_id)}</td>
+      <tr class="mem-row ${kindClass}${selectionClass}" data-mem-row="${escapeHtml(item.memory_id)}">
+        <td class="mono" data-label="ID">${
+          state.rag.selectMode
+            ? `<button class="mem-check${selected ? " checked" : ""}" type="button" data-select="${escapeHtml(
+                item.memory_id
+              )}" aria-pressed="${selected ? "true" : "false"}" aria-label="选择记忆 ${escapeHtml(
+                item.memory_id
+              )}"><svg class="icon" aria-hidden="true"><use href="#i-select"></use></svg></button>`
+            : ""
+        }<span class="mem-id-prefix">ID：</span><span class="mem-id-value">${escapeHtml(
+          item.memory_id
+        )}</span>${kindBadge}${atomCount}${archived}${forgettingPill}${orphanAtom}</td>
         <td class="mono small" data-label="时间">${time}</td>
-        <td class="mono" data-label="群范围">${escapeHtml(item.group_scope || "-")}</td>
+        <td class="mono" data-label="群范围">${escapeHtml(cardScope)}</td>
         <td class="mem-toggle-cell">
           <button class="icon-btn mem-toggle" type="button" data-toggle="${escapeHtml(
             item.memory_id
@@ -1567,31 +2580,76 @@ function renderRagRows(items) {
         <td colspan="4">
           <div class="mem-detail-body">
             <div class="mem-detail-meta">
-              <span class="pill type-${type}">${typeLabels[type] || "未知"}</span>
+              <span class="pill type-${type}">${escapeHtml(
+                typeLabels[type] || "未知"
+              )}</span>
+              ${kindBadge}
               ${superseded}
+              ${archived}
               <span class="muted small">置信度：${confidence}</span>
-              <span class="muted small">角色：${roleText || "-"}</span>
+              ${
+                item.effective_importance !== undefined
+                  ? `<span class="muted small" title="按时间衰减后的有效重要性">有效重要性：${Number(
+                      item.effective_importance
+                    ).toFixed(2)}</span>`
+                  : ""
+              }
+              ${
+                item.valid_until
+                  ? `<span class="muted small">有效期：${escapeHtml(
+                      String(item.valid_until_iso || "").slice(0, 10) || "-"
+                    )}${
+                      item.expired
+                        ? "（已过期）"
+                        : daysLeft !== null
+                          ? `（剩 ${Math.max(0, daysLeft)} 天）`
+                          : ""
+                    }</span>`
+                  : '<span class="muted small">有效期：永久</span>'
+              }
+              <span class="mem-role"><span class="muted small">角色：</span>${roleBadges}</span>
             </div>
             <p class="mem-detail-content">${escapeHtml(item.content)}</p>
             <div class="mem-detail-actions">
-              <button class="link-btn" data-detail="${escapeHtml(item.memory_id)}">${icon(
-                "eye"
-              )}详情</button>
-              <button class="link-btn" data-source="${escapeHtml(item.memory_id)}">${icon(
-                "inbox"
-              )}原始消息</button>
-              <button class="link-btn danger" data-delete="${escapeHtml(
-                item.memory_id
-              )}">${icon("trash")}删除</button>
+              <div class="mem-action-group" role="group" aria-label="记忆操作">
+                <button class="link-btn action-segment" title="详情" aria-label="详情" data-detail="${escapeHtml(
+                  item.memory_id
+                )}">${icon("eye")}</button>
+                <button class="link-btn action-segment" title="原始消息" aria-label="原始消息" data-source="${escapeHtml(
+                  item.memory_id
+                )}">${icon("message")}</button>
+                ${
+                  isArchived
+                    ? `<button class="link-btn action-segment" title="恢复" aria-label="恢复" data-unarchive="${escapeHtml(
+                        item.memory_id
+                      )}">${icon("reset")}</button>
+                <button class="link-btn action-segment danger" title="彻底删除" aria-label="彻底删除" data-purge="${escapeHtml(
+                  item.memory_id
+                )}">${icon("trash")}</button>`
+                    : `<button class="link-btn action-segment" title="归档" aria-label="归档" data-archive="${escapeHtml(
+                        item.memory_id
+                      )}">${icon("archive")}</button>
+                <button class="link-btn action-segment danger" title="删除" aria-label="删除" data-delete="${escapeHtml(
+                  item.memory_id
+                )}">${icon("trash")}</button>`
+                }
+              </div>
             </div>
+            ${childrenHtml}
           </div>
         </td>
       </tr>`;
     })
     .join("");
 
+  body.closest("table")?.classList.toggle("is-selecting", state.rag.selectMode);
+  syncRagBulkBar();
   body.querySelectorAll(".mem-row").forEach((row) => {
     row.addEventListener("click", () => {
+      if (state.rag.selectMode) {
+        toggleRagSelected(row.dataset.memRow);
+        return;
+      }
       const detail = body.querySelector(
         `[data-mem-detail="${CSS.escape(row.dataset.memRow)}"]`
       );
@@ -1610,6 +2668,61 @@ function renderRagRows(items) {
   body.querySelectorAll("[data-delete]").forEach((btn) => {
     btn.addEventListener("click", () => void deleteMemory(btn.dataset.delete));
   });
+  // r3.3：归档记忆可恢复或彻底删除，未归档记忆可归档（删除仍走回收站 + 撤销）。
+  body.querySelectorAll("[data-archive]").forEach((btn) => {
+    btn.addEventListener("click", () => void archiveMemory(btn.dataset.archive));
+  });
+  body.querySelectorAll("[data-unarchive]").forEach((btn) => {
+    btn.addEventListener("click", () =>
+      void unarchiveMemory(btn.dataset.unarchive)
+    );
+  });
+  body.querySelectorAll("[data-purge]").forEach((btn) => {
+    btn.addEventListener("click", () => void purgeMemory(btn.dataset.purge));
+  });
+}
+
+/** 把一条原始记录渲染成聊天气泡。 */
+function sourceMessageHtml(raw) {
+  const text = String(raw || "").trim();
+  const match = text.match(
+    /^\[([^\]]+)\]\s*(?:\(([^)]*)\))?\s*(#[^\s:]+)?\s*:?\s*([\s\S]*)$/
+  );
+  if (!match) {
+    return `<div class="source-msg source-msg-plain"><p>${escapeHtml(
+      text || "（空消息）"
+    )}</p></div>`;
+  }
+  const identity = String(match[1] || "").split("/");
+  const time = identity.length >= 3 ? identity.pop() : "";
+  const uid = identity.length >= 2 ? identity.pop() : "";
+  const name = identity.join("/") || "未知";
+  const role = String(match[2] || "").trim();
+  const msgId = String(match[3] || "").trim();
+  const body = String(match[4] || "").trim();
+  return `<article class="source-msg">
+    <header class="source-msg-head">
+      <span class="source-name">${escapeHtml(name)}</span>
+      ${role ? `<span class="source-role">${escapeHtml(role)}</span>` : ""}
+      ${time ? `<time class="source-time">${escapeHtml(time)}</time>` : ""}
+    </header>
+    <p class="source-text">${escapeHtml(body || "（空消息）")}</p>
+    <footer class="source-msg-foot">
+      ${uid ? `<span>UID ${escapeHtml(uid)}</span>` : ""}
+      ${msgId ? `<span>${escapeHtml(msgId)}</span>` : ""}
+    </footer>
+  </article>`;
+}
+
+/** JSON 轻量高亮；输入已转义，避免破坏 HTML。 */
+function highlightJson(json) {
+  const escaped = escapeHtml(json);
+  return escaped
+    .replace(/(&quot;.*?&quot;)(\s*:)/g, '<span class="json-key">$1</span>$2')
+    .replace(/(:\s*)(&quot;.*?&quot;)/g, '$1<span class="json-string">$2</span>')
+    .replace(/(:\s*)(-?\d+(?:\.\d+)?)([,}])/g, '$1<span class="json-number">$2</span>$3')
+    .replace(/(:\s*)(true|false)([,}])/g, '$1<span class="json-bool">$2</span>$3')
+    .replace(/(:\s*)(null)([,}])/g, '$1<span class="json-null">$2</span>$3');
 }
 
 /** 展示记忆关联的原始消息证据。 */
@@ -1621,23 +2734,37 @@ async function showSource(memoryId) {
     const sourceMessages = Array.isArray(meta.source_messages)
       ? meta.source_messages
       : [];
-    const lines = [
-      `记忆 ID：${item.memory_id}`,
-      `来源消息 ID：${item.source_msg_id || "-"}`,
-      `发送者：${item.sender_id || "-"}`,
-      `记忆时间：${item.memory_time_iso || "-"}`,
-      "",
-      "原始消息记录：",
-      ...(sourceMessages.length
-        ? sourceMessages
-        : quotes.length
-        ? quotes.map((quote) => `- ${quote}`)
-        : ["（未记录原文）"]),
-    ];
+    const extraction = meta.extraction || {};
+    const extractionLine = extraction.window
+      ? `抽取窗口：${extraction.window} 条 → 有效 ${extraction.filtered} 条 → 送入 ${extraction.model_lines} 条（字数上限 ${extraction.char_limit}${extraction.truncated ? "，已截断" : ""}）`
+      : "";
+    const selfLine = meta.self_participated ? "机器人参与：是" : "";
+    const records = sourceMessages.length ? sourceMessages : quotes;
+    const threadHtml = records.length
+      ? records.map((record) => sourceMessageHtml(record)).join("")
+      : `<div class="source-empty">未记录原文</div>`;
+    const summary = [
+      ["记忆 ID", `#${escapeHtml(item.memory_id)}`],
+      ["来源消息 ID", escapeHtml(item.source_msg_id || "-")],
+      ["发送者", escapeHtml(item.sender_id || "-")],
+      ["记忆时间", escapeHtml(item.memory_time_iso || "-")],
+    ]
+      .map(
+        ([label, value]) =>
+          `<div class="source-summary-item"><span>${label}</span><strong class="mono">${value}</strong></div>`
+      )
+      .join("");
     $("detail-title").textContent = "原始消息";
-    $("detail-body").textContent = lines.join("\n");
-    $("detail").classList.add("open");
-    $("detail").setAttribute("aria-hidden", "false");
+    $("detail-body").classList.add("detail-rich");
+    $("detail-body").innerHTML = `
+      <div class="source-sheet">
+        <div class="source-summary">${summary}</div>
+        ${extractionLine ? `<div class="source-window">${escapeHtml(extractionLine)}</div>` : ""}
+        ${selfLine ? `<div class="source-window">${escapeHtml(selfLine)}</div>` : ""}
+        <div class="source-section-title">原始消息记录 <em>${records.length} 条</em></div>
+        <div class="source-thread">${threadHtml}</div>
+      </div>`;
+    openDetailPanel();
   } catch (error) {
     toast(error.message || "读取原始消息失败", true);
   }
@@ -1648,12 +2775,6 @@ const AUTO_SCOPE_LABELS = {
   global: "仅全局",
   group: "仅本群",
 };
-
-/** 将数据库中的自动记忆来源标识转换为界面中文标签。 */
-function autoSourceLabel(source) {
-  const map = { model: "模型抽取", keyword: "关键词", manual: "手动", selftest: "自检" };
-  return map[source] || source || "手动";
-}
 
 /** 获取自动记忆的当前开关、参数和来源统计。 */
 /* ------------------------------------------------------------------ */
@@ -1790,10 +2911,14 @@ async function onBlockAddGlobal() {
     $("block-user").value = "";
     $("block-reason").value = "";
     $("block-duration").value = "0";
-    if (scope === "all") {
-      void loadBlocks();
-    } else {
+    // 无论加的是全局还是「仅本群」，都重新拉取屏蔽列表：此前只有 scope=all
+    // 才刷新，按群添加后页面看起来像没生效（F41）。
+    void loadBlocks();
+    if (scope === "group") {
       toast(`已加入群 ${groupId} 的屏蔽列表`, false);
+      if ((state.currentGroup || {}).group_id === groupId) {
+        void loadGroupBlocks();
+      }
     }
   } catch (error) {
     toast(error.message || "添加失败", true);
@@ -1919,8 +3044,149 @@ async function toggleAutoMemory() {
   }
 }
 
+/** 记忆来源筛选值的中文名（与筛选弹窗选项一致）。 */
+const RAG_SOURCE_LABELS = {
+  personal: "个人",
+  group: "群聊",
+  private: "私聊",
+  unknown: "未知",
+};
+
+/** 参与者身份筛选值的中文名（与筛选弹窗选项一致）。 */
+const RAG_IDENTITY_LABELS = {
+  owner: "所有者",
+  group_owner: "群主",
+  group_admin: "群管理",
+  member: "群成员",
+};
+
+/** 生命周期筛选值的中文名（与筛选弹窗选项一致）。 */
+const RAG_LIFECYCLE_LABELS = {
+  expiring: "即将过期",
+  expired: "已过期",
+  stale: "低价值将归档",
+  cold: "长期未访问",
+};
+
+/**
+ * 把规范作用域显示成无平台前缀的群号：
+ *   ``SnowLuma:996392557`` → ``996392557``；
+ *   ``SnowLuma:private:10001`` → ``私聊 10001``；空作用域返回空串。
+ */
+function ragScopeLabel(scope) {
+  const text = String(scope || "").trim();
+  if (!text) return "";
+  if (text === "__global__") return "全局";
+  const parts = text.split(":").filter((part) => part);
+  if (!parts.length) return text;
+  const tail = parts[parts.length - 1];
+  if (parts.some((part) => String(part).toLowerCase() === "private")) {
+    return `私聊 ${tail}`;
+  }
+  return tail;
+}
+
+/**
+ * 汇总「筛选弹窗」里生效的条件，供按钮显示与 title 提示。
+ * 关键词/角色输入框本身已经展示内容，不重复放进按钮文案。
+ * 输出顺序：参与者身份 → 记忆来源 → 群号，例如「群主 群聊 996392557」。
+ */
+function ragFilterSummary() {
+  const parts = [];
+  if (state.rag.identity) {
+    parts.push(RAG_IDENTITY_LABELS[state.rag.identity] || state.rag.identity);
+  }
+  if (state.rag.memoryType) {
+    parts.push(RAG_SOURCE_LABELS[state.rag.memoryType] || state.rag.memoryType);
+  }
+  if (state.rag.scope) {
+    const scopeLabel = ragScopeLabel(state.rag.scope);
+    if (scopeLabel) parts.push(scopeLabel);
+  }
+  if (state.rag.lifecycle) {
+    parts.push(
+      RAG_LIFECYCLE_LABELS[state.rag.lifecycle] || state.rag.lifecycle
+    );
+  }
+  return parts;
+}
+
+/** 把当前筛选内容同步到「筛选」按钮（无筛选时恢复为「筛选」）。 */
+function syncRagFilterButton() {
+  const button = $("rag-search");
+  const label = $("rag-filter-label");
+  if (!button || !label) return;
+  const parts = ragFilterSummary();
+  const active = parts.length > 0;
+  const summary = parts.join(" ");
+  button.classList.toggle("has-filters", active);
+  label.textContent = active ? summary : "筛选";
+  button.title = active ? `当前筛选：${summary}（点击修改）` : "筛选记忆";
+  button.setAttribute(
+    "aria-label",
+    active ? `筛选，当前条件：${summary}` : "筛选记忆"
+  );
+}
+
 /** 以当前页码、关键词、群范围和角色筛选条件加载记忆列表。 */
+/** 记忆列表骨架：尺寸/行距与真实三行卡片一致。 */
+function ragSkeletonRows(count = 6) {
+  return Array.from(
+    { length: count },
+    () => `<tr class="mem-row skeleton-mem-row" aria-hidden="true">
+      <td colspan="4" class="skeleton-mem-cell">
+        <span class="skeleton skeleton-line skeleton-line-id"></span>
+        <span class="skeleton skeleton-line skeleton-line-time"></span>
+        <span class="skeleton skeleton-line skeleton-line-scope"></span>
+        <span class="skeleton skeleton-arrow"></span>
+      </td>
+    </tr>`
+  ).join("");
+}
+
+function showRagSkeleton() {
+  const body = $("rag-body");
+  if (body) body.innerHTML = ragSkeletonRows(6);
+}
+
+/** 抽屉群列表骨架：行高与真实群条目一致。 */
+function drawerSkeletonRows(count = 5) {
+  return Array.from(
+    { length: count },
+    () => `<div class="drawer-group skeleton-drawer-row" aria-hidden="true">
+      <span class="skeleton skeleton-avatar"></span>
+      <span class="skeleton skeleton-name"></span>
+      <span class="skeleton skeleton-dot"></span>
+    </div>`
+  ).join("");
+}
+
+function showGroupsSkeleton() {
+  const drawer = $("drawer-groups");
+  if (drawer) drawer.innerHTML = drawerSkeletonRows(5);
+  const list = $("group-items");
+  if (list) {
+    list.innerHTML = `<div class="skeleton-group-list">${Array.from(
+      { length: 5 },
+      () => `<div class="group-item skeleton-group-item" aria-hidden="true">
+        <span class="skeleton skeleton-avatar"></span>
+        <span class="skeleton-group-text">
+          <span class="skeleton skeleton-name"></span>
+          <span class="skeleton skeleton-gid"></span>
+        </span>
+        <span class="skeleton skeleton-dot"></span>
+      </div>`
+    ).join("")}</div>`;
+  }
+}
+
 async function loadRagList() {
+  showRagSkeleton();
+  if (state.rag.selectMode) {
+    state.rag.selected.clear();
+    syncRagBulkBar();
+  }
+  syncRagFilterButton();
   const params = {
     page: state.rag.page,
     page_size: state.rag.pageSize,
@@ -1929,13 +3195,31 @@ async function loadRagList() {
   if (state.rag.scope) params.group_scope = state.rag.scope;
   if (state.rag.role) params.role_id = state.rag.role;
   if (state.rag.memoryType) params.memory_type = state.rag.memoryType;
+  // r3.3m：「已归档」视图下生命周期筛选无意义（后端也会忽略，这里同步隐藏）。
+  if (state.rag.lifecycle && !state.rag.archivedOnly) {
+    params.lifecycle = state.rag.lifecycle;
+  }
   if (state.rag.identity) params.identity = state.rag.identity;
+  // r3.3：只查看已归档记录时传 archived_only，不再使用旧的 include_archived。
+  if (state.rag.archivedOnly) params.archived_only = 1;
   try {
     const data = await callApi("GET", "rag/list", params);
     state.rag.total = Number(data.total || 0);
     state.rag.hasMore = Boolean(data.has_more);
-    renderRagRows(data.items || []);
     const totalPages = Math.max(1, Math.ceil(state.rag.total / state.rag.pageSize));
+    // r3.3m：删除/归档最后一页的最后一条后，页码自动回收到有效范围。
+    if (state.rag.page > totalPages && !state.rag.clamping) {
+      state.rag.clamping = true;
+      state.rag.page = totalPages;
+      try {
+        await loadRagList();
+      } finally {
+        state.rag.clamping = false;
+      }
+      return;
+    }
+    state.rag.items = Array.isArray(data.items) ? data.items : [];
+    renderRagRows(state.rag.items);
     $("rag-page-info").textContent = `第 ${state.rag.page} / ${totalPages} 页 · 共 ${formatNumber(
       state.rag.total
     )} 条`;
@@ -1946,23 +3230,396 @@ async function loadRagList() {
   }
 }
 
+/** 从关键词/角色输入框同步筛选条件，并从第一页重查（r3.3 快捷搜索）。 */
+function quickSearchRag() {
+  const keyword = $("rag-keyword");
+  const role = $("rag-role");
+  state.rag.keyword = keyword ? keyword.value.trim() : state.rag.keyword;
+  state.rag.role = role ? role.value.trim() : state.rag.role;
+  state.rag.page = 1;
+  void loadRagList();
+}
+
+/** 同步「已归档」按钮的高亮态与 aria-pressed。 */
+function syncRagArchivedButton() {
+  const button = $("rag-archived-btn");
+  if (!button) return;
+  const active = Boolean(state.rag.archivedOnly);
+  button.classList.toggle("active", active);
+  button.setAttribute("aria-pressed", active ? "true" : "false");
+}
+
+/** 切换「已归档」过滤：只看归档记录或回到正常列表（r3.3）。 */
+function toggleRagArchived() {
+  if (state.rag.selectMode) {
+    state.rag.selectMode = false;
+    state.rag.selected.clear();
+  }
+  state.rag.archivedOnly = !state.rag.archivedOnly;
+  if (state.rag.archivedOnly) {
+    // r3.3m：已归档视图与生命周期筛选互斥，避免组合出恒空结果。
+    state.rag.lifecycle = "";
+    const select = $("filter-lifecycle");
+    if (select) select.value = "";
+  }
+  state.rag.page = 1;
+  syncRagArchivedButton();
+  void loadRagList();
+}
+
+/** 同步批量选择按钮与批量操作栏的状态。 */
+function syncRagSelectButton() {
+  const button = $("rag-select-btn");
+  if (!button) return;
+  const active = Boolean(state.rag.selectMode);
+  button.classList.toggle("active", active);
+  button.setAttribute("aria-pressed", active ? "true" : "false");
+  button.title = active ? "退出批量选择" : "批量选择";
+}
+
+function syncRagBulkBar() {
+  const bar = $("rag-bulk-bar");
+  if (!bar) return;
+  bar.hidden = !state.rag.selectMode;
+  const count = state.rag.selected.size;
+  const countLabel = $("rag-bulk-count");
+  if (countLabel) countLabel.textContent = `已选 ${count} 条`;
+  const archiveBtn = $("rag-bulk-archive");
+  if (archiveBtn) {
+    archiveBtn.textContent = state.rag.archivedOnly ? "取消归档" : "归档";
+    archiveBtn.disabled = count === 0;
+  }
+  const deleteBtn = $("rag-bulk-delete");
+  if (deleteBtn) deleteBtn.disabled = count === 0;
+  syncRagSelectButton();
+}
+
+/** 进入/退出批量选择模式；进入时清空旧选择。 */
+function toggleRagSelectMode(force) {
+  const next = typeof force === "boolean" ? force : !state.rag.selectMode;
+  if (next === state.rag.selectMode) return;
+  state.rag.selectMode = next;
+  state.rag.selected.clear();
+  renderRagRows(state.rag.items);
+  syncRagBulkBar();
+}
+
+/** 切换单条记忆的勾选状态。 */
+function toggleRagSelected(memoryId) {
+  const id = String(memoryId);
+  if (!id) return;
+  if (state.rag.selected.has(id)) state.rag.selected.delete(id);
+  else state.rag.selected.add(id);
+  const row = document.querySelector(
+    `.mem-row[data-mem-row="${CSS.escape(id)}"]`
+  );
+  const selected = state.rag.selected.has(id);
+  row?.classList.toggle("selected", selected);
+  const check = row?.querySelector("[data-select]");
+  if (check) {
+    check.classList.toggle("checked", selected);
+    check.setAttribute("aria-pressed", selected ? "true" : "false");
+  }
+  syncRagBulkBar();
+}
+
+/** 批量归档/取消归档已选记忆。 */
+async function bulkArchiveSelected() {
+  const ids = [...state.rag.selected];
+  if (!ids.length) return;
+  const archivedMode = state.rag.archivedOnly;
+  const verb = archivedMode ? "取消归档" : "归档";
+  const confirmed = await askConfirm(
+    `${verb}已选的 ${ids.length} 条记忆？`,
+    archivedMode ? {} : { danger: false }
+  );
+  if (!confirmed) return;
+  let ok = 0;
+  let failed = 0;
+  for (const id of ids) {
+    try {
+      await callApi(
+        "POST",
+        `rag/${encodeURIComponent(id)}/${archivedMode ? "unarchive" : "archive"}`,
+        {}
+      );
+      ok += 1;
+    } catch {
+      failed += 1;
+    }
+  }
+  state.rag.selected.clear();
+  state.rag.selectMode = false;
+  renderRagRows(state.rag.items);
+  syncRagBulkBar();
+  await loadRagStats(false);
+  await loadRagList();
+  toast(
+    failed
+      ? `${verb}完成 ${ok} 条，失败 ${failed} 条`
+      : `已${verb} ${ok} 条`
+  );
+}
+
+/** 批量删除已选记忆（进入回收站，可单条撤销）。 */
+async function bulkDeleteSelected() {
+  const ids = [...state.rag.selected];
+  if (!ids.length) return;
+  const confirmed = await askConfirm(
+    `删除已选的 ${ids.length} 条记忆？删除后进入回收站。`,
+    { danger: true }
+  );
+  if (!confirmed) return;
+  let ok = 0;
+  let failed = 0;
+  const trashIds = [];
+  for (const id of ids) {
+    try {
+      const data = await callApi(
+        "POST",
+        `rag/${encodeURIComponent(id)}/delete`,
+        {}
+      );
+      if (data && data.trash_id) trashIds.push(data.trash_id);
+      ok += 1;
+    } catch {
+      failed += 1;
+    }
+  }
+  state.rag.selected.clear();
+  state.rag.selectMode = false;
+  renderRagRows(state.rag.items);
+  syncRagBulkBar();
+  await loadRagStats(false);
+  await loadRagList();
+  showSnackbar(
+    failed ? `已删除 ${ok} 条，失败 ${failed} 条` : `已删除 ${ok} 条`,
+    trashIds
+  );
+}
+
 /** 查询并在详情抽屉中展示指定记忆的完整 JSON 内容。 */
 async function showMemory(memoryId) {
   try {
     const data = await callApi("GET", `rag/${encodeURIComponent(memoryId)}`);
-    $("detail-title").textContent = "记忆详情";
-    $("detail-body").textContent = JSON.stringify(data, null, 2);
-    $("detail").classList.add("open");
-    $("detail").setAttribute("aria-hidden", "false");
+    const rules = state.rag.rules || {};
+    const meta =
+      data.extra_metadata && typeof data.extra_metadata === "object"
+        ? data.extra_metadata
+        : {};
+    const reason = String(data.archive_reason || "");
+    const archiveText = data.archived
+      ? `${data.archived_at_iso || "-"}（${ARCHIVE_REASON_LABELS[reason] || "已归档"}）`
+      : data.expired
+        ? "已过期，等待维护任务（每小时）归档"
+        : data.valid_until
+          ? `有效期 ${String(data.valid_until_iso || "").slice(0, 19)} 到期后 1 小时内`
+          : `低价值且 ${Number(rules.archive_days ?? 30)} 天未访问时（维护任务每小时）`;
+    const validityText = data.valid_until
+      ? `${String(data.valid_until_iso || "").slice(0, 19)}${
+          data.expired
+            ? "（已过期）"
+            : typeof data.days_left === "number"
+              ? `（剩 ${Math.max(0, data.days_left)} 天）`
+              : ""
+        }`
+      : "永久（该类型不写有效期）";
+    const kind = String(data.kind || "fact").toLowerCase();
+    const atoms = Array.isArray(data.atoms) ? data.atoms : [];
+    const topics = Array.isArray(meta.topics)
+      ? meta.topics.map(String).filter(Boolean)
+      : [];
+    const entities = Array.isArray(meta.entities)
+      ? meta.entities.map(String).filter(Boolean)
+      : [];
+    const childTags = atoms.flatMap((atom) => {
+      const childMeta =
+        atom.extra_metadata && typeof atom.extra_metadata === "object"
+          ? atom.extra_metadata
+          : {};
+      const values = [];
+      if (Array.isArray(childMeta.topics)) values.push(...childMeta.topics);
+      if (Array.isArray(childMeta.entities)) values.push(...childMeta.entities);
+      return values.map(String).filter(Boolean);
+    });
+    const tags = [...new Set([...topics, ...entities, ...childTags])].slice(0, 12);
+    const isAtomDetail = Boolean(meta.episode_id);
+    const kindBadge = memoryKindBadge(data, isAtomDetail);
+    const createdAt = String(data.created_at_iso || "-").replace("T", " ").slice(0, 19);
+    const updatedAt = String(
+      data.updated_at_iso || data.memory_time_iso || data.created_at_iso || "-"
+    )
+      .replace("T", " ")
+      .slice(0, 19);
+    const persona = String(meta.persona_name || meta.persona_id || "").trim();
+    const origin = String(meta.origin || "").trim();
+    const facts = atoms.length
+      ? atoms
+      : kind === "episode"
+        ? []
+        : [{ memory_id: data.memory_id, kind, content: data.content, extra_metadata: meta }];
+    const factsHtml = facts.length
+      ? `<ul class="detail-facts">${facts
+          .map((fact) => {
+            const factMeta =
+              fact.extra_metadata && typeof fact.extra_metadata === "object"
+                ? fact.extra_metadata
+                : {};
+            return `<li class="detail-fact">
+              <span class="mono muted">#${escapeHtml(fact.memory_id)}</span>
+              ${memoryKindBadge(fact, true)}
+              <span>${escapeHtml(fact.content)}</span>
+            </li>`;
+          })
+          .join("")}</ul>`
+      : '<p class="muted">暂无原子事实</p>';
+    const tagsHtml = tags.length
+      ? `<div class="detail-tags">${tags
+          .map((tag) => `<span class="detail-tag">${escapeHtml(tag)}</span>`)
+          .join("")}</div>`
+      : '<p class="muted">无主题标签</p>';
+    const episodeHtml = data.episode
+      ? `<section class="detail-section"><h4>所属事件</h4>
+          <a class="detail-link" href="#" data-detail="${escapeHtml(
+            data.episode.memory_id
+          )}">#${escapeHtml(data.episode.memory_id)} ${escapeHtml(
+            data.episode.content || ""
+          )}</a></section>`
+      : "";
+    const timeline = [
+      `写入：${data.created_at_iso || "-"}${
+        data.memory_time_iso
+          ? `（发生 ${String(data.memory_time_iso).replace("T", " ").slice(0, 19)}）`
+          : ""
+      }`,
+      `重要性：原始 ${Number(data.importance ?? 0).toFixed(2)} → 当前有效 ${Number(
+        data.effective_importance ?? data.importance ?? 0
+      ).toFixed(2)}`,
+      `召回：${formatNumber(data.access_count || 0)} 次${
+        data.last_access_iso
+          ? `（最近 ${String(data.last_access_iso).replace("T", " ").slice(0, 19)}）`
+          : ""
+      }`,
+      `有效期：${validityText}`,
+      `预计归档：${archiveText}`,
+      data.archived
+        ? `归档时间：${data.archived_at_iso || "-"}（原因：${
+            ARCHIVE_REASON_LABELS[reason] || "已归档"
+          }）`
+        : "",
+    ].filter(Boolean);
+
+    $("detail-title").textContent = `记忆详情 #${data.memory_id || memoryId}`;
+    $("detail-body").classList.add("detail-rich");
+    $("detail-body").innerHTML = `
+      <div class="detail-hero">
+        <div class="detail-hero-id mono">#${escapeHtml(data.memory_id || memoryId)}</div>
+        <div class="detail-hero-badges">${kindBadge}
+          <span class="pill type-${escapeHtml(
+            MEMORY_TYPE_CLASSES.has(String(data.memory_type || "").toLowerCase())
+              ? String(data.memory_type).toLowerCase()
+              : "unknown"
+          )}">${escapeHtml(data.memory_type || "group")}</span>
+        </div>
+      </div>
+      <section class="detail-section">
+        <h4>基本信息</h4>
+        <div class="detail-meta-grid">
+          <div><span>会话 ID</span><strong class="mono">${escapeHtml(origin || "-")}</strong></div>
+          <div><span>人格 ID</span><strong>${escapeHtml(persona || "未记录")}</strong></div>
+          <div><span>创建时间</span><strong class="mono">${escapeHtml(createdAt)}</strong></div>
+          <div><span>更新时间</span><strong class="mono">${escapeHtml(updatedAt)}</strong></div>
+          <div><span>置信度</span><strong>${Number(meta.confidence ?? 0).toFixed(2)}</strong></div>
+          <div><span>群范围</span><strong class="mono">${escapeHtml(
+            String(data.group_scope || "").trim() || "全局"
+          )}</strong></div>
+        </div>
+      </section>
+      <section class="detail-section">
+        <h4>关键事实</h4>
+        ${factsHtml}
+      </section>
+      ${episodeHtml}
+      <section class="detail-section">
+        <h4>主题</h4>
+        ${tagsHtml}
+      </section>
+      <section class="detail-section">
+        <h4>正文</h4>
+        <p class="detail-content">${escapeHtml(data.content || "")}</p>
+      </section>
+      <section class="detail-section">
+        <h4>遗忘时间线</h4>
+        <pre class="detail-timeline mono">${escapeHtml(timeline.join("\n"))}</pre>
+      </section>
+      <details class="detail-raw">
+        <summary>原始记录</summary>
+        <div class="raw-json-card">
+          <div class="raw-json-head"><span>JSON</span><button type="button" class="raw-copy" data-copy-raw>复制</button></div>
+          <pre class="raw-json mono">${highlightJson(JSON.stringify(data, null, 2))}</pre>
+        </div>
+      </details>`;
+    $("detail-body").querySelectorAll("[data-detail]").forEach((link) => {
+      link.addEventListener("click", (event) => {
+        event.preventDefault();
+        void showMemory(link.dataset.detail);
+      });
+    });
+    $("detail-body").querySelectorAll("[data-copy-raw]").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        try {
+          await navigator.clipboard.writeText(JSON.stringify(data, null, 2));
+          toast("原始 JSON 已复制");
+        } catch {
+          toast("复制失败，请长按选择", true);
+        }
+      });
+    });
+    openDetailPanel();
   } catch (error) {
     toast(error.message || "加载详情失败", true);
   }
 }
 
-/** 关闭记忆详情/自检共用的侧边抽屉。 */
+/** 打开记忆详情/自检抽屉：和汉堡菜单一样从左侧挤出主页面。 */
+function openDetailPanel() {
+  if (document.activeElement && document.activeElement !== document.body) {
+    document.activeElement.blur?.();
+  }
+  const detail = $("detail");
+  if (isDrawerOpen()) closeDrawer();
+  if (!detail.classList.contains("open")) {
+    pushScrollY = window.scrollY || 0;
+  }
+  window.scrollTo(0, 0);
+  updateScrolledClass();
+  $("main-pane").classList.add("is-pushed");
+  setContentScrollOffset(pushScrollY);
+  document.body.classList.add("detail-open");
+  detail.classList.add("open");
+  detail.setAttribute("aria-hidden", "false");
+  $("scrim").classList.add("show");
+  // 详情侧栏没有自己的 ×：汉堡按钮变成 ×，并用它关闭
+  setMenuMorph(true);
+  $("menu-btn").setAttribute("aria-expanded", "true");
+  $("menu-btn").setAttribute("aria-label", "关闭详情");
+}
+
+/** 关闭记忆详情/自检抽屉，页面滚动位置保持不变。 */
 function closeDetail() {
+  const wasOpen = $("detail").classList.contains("open");
+  beginPanelClose();
   $("detail").classList.remove("open");
   $("detail").setAttribute("aria-hidden", "true");
+  $("main-pane").classList.remove("is-pushed");
+  setContentScrollOffset(0);
+  document.body.classList.remove("detail-open");
+  $("scrim").classList.remove("show");
+  setMenuMorph(false);
+  $("menu-btn").setAttribute("aria-expanded", "false");
+  $("menu-btn").setAttribute("aria-label", "打开菜单");
+  if (wasOpen) window.scrollTo(0, pushScrollY);
+  updateScrolledClass();
 }
 
 let snackbarTimer = null;
@@ -1973,7 +3630,12 @@ function showSnackbar(text, trashId = null) {
   const bar = $("snackbar-bar");
   $("snackbar-text").textContent = text;
   $("snackbar").classList.add("show");
-  snackbarTrash = trashId;
+  if (Array.isArray(trashId)) {
+    const ids = trashId.map((id) => Number(id)).filter((id) => id > 0);
+    snackbarTrash = ids.length ? ids : null;
+  } else {
+    snackbarTrash = trashId;
+  }
   if (bar) {
     bar.classList.remove("countdown");
     bar.style.width = "";
@@ -1996,16 +3658,25 @@ async function undoDelete() {
     hideSnackbar();
     return;
   }
-  const trashId = snackbarTrash;
+  const trashIds = Array.isArray(snackbarTrash)
+    ? snackbarTrash
+    : [snackbarTrash];
   hideSnackbar();
-  try {
-    await callApi("POST", "rag/restore", { trash_id: trashId });
-    toast("已撤销删除");
-    await loadRagStats(false);
-    await loadRagList();
-  } catch (error) {
-    toast(error.message || "撤销失败", true);
+  let ok = 0;
+  let failed = 0;
+  for (const trashId of trashIds) {
+    try {
+      await callApi("POST", "rag/restore", { trash_id: trashId });
+      ok += 1;
+    } catch {
+      failed += 1;
+    }
   }
+  toast(
+    failed ? `已撤销 ${ok} 条，失败 ${failed} 条` : `已撤销删除 ${ok} 条`
+  );
+  await loadRagStats(false);
+  await loadRagList();
 }
 
 /** 确认删除指定记忆，成功后显示可撤销 Snackbar。 */
@@ -2028,11 +3699,59 @@ async function deleteMemory(memoryId) {
   }
 }
 
+/** 归档指定记忆（r3.3）：归档后不再参与召回，可在「已归档」中恢复或彻底删除。 */
+async function archiveMemory(memoryId) {
+  const confirmed = await askConfirm(
+    `归档记忆 ${memoryId}？归档后不再参与召回，可在「已归档」中取消归档恢复。`
+  );
+  if (!confirmed) return;
+  try {
+    await callApi("POST", `rag/${encodeURIComponent(memoryId)}/archive`, {});
+    toast("已归档");
+    await loadRagStats(false);
+    await loadRagList();
+  } catch (error) {
+    toast(error.message || "归档失败", true);
+  }
+}
+
+/** 取消归档并恢复指定记忆（r3.3）：后端会按 TTL 自适应重算有效期。 */
+async function unarchiveMemory(memoryId) {
+  try {
+    await callApi("POST", `rag/${encodeURIComponent(memoryId)}/unarchive`, {});
+    toast("已取消归档");
+    await loadRagStats(false);
+    await loadRagList();
+  } catch (error) {
+    toast(error.message || "取消归档失败", true);
+  }
+}
+
+/** 彻底删除已归档记忆（r3.3）：物理删除、不进回收站，需二次确认。 */
+async function purgeMemory(memoryId) {
+  const confirmed = await askConfirm(
+    `彻底删除记忆 ${memoryId}？将直接从数据库移除，不进入回收站，之后只能靠备份恢复。`,
+    { danger: true }
+  );
+  if (!confirmed) return;
+  try {
+    await callApi("POST", `rag/${encodeURIComponent(memoryId)}/purge`, {
+      confirm: 1,
+    });
+    toast("已彻底删除");
+    await loadRagStats(false);
+    await loadRagList();
+  } catch (error) {
+    toast(error.message || "彻底删除失败", true);
+  }
+}
+
 /** 打开筛选弹窗，回填当前筛选条件。 */
 function openFilterModal() {
   $("filter-type").value = state.rag.memoryType;
   $("filter-scope").value = state.rag.scope;
   $("filter-identity").value = state.rag.identity;
+  if ($("filter-lifecycle")) $("filter-lifecycle").value = state.rag.lifecycle;
   const modal = $("filter-modal");
   modal.classList.add("open");
   modal.setAttribute("aria-hidden", "false");
@@ -2044,142 +3763,447 @@ function closeFilterModal() {
   modal.setAttribute("aria-hidden", "true");
 }
 
-/** 执行记忆自检：存储读写 + 提示词抽取，结果合并展示。 */
-async function ragSelftest() {
-  const button = $("rag-selftest");
-  button.disabled = true;
+/* ------------------------------------------------------------------ */
+/* 开发者模式（r3.3）                                                  */
+/* ------------------------------------------------------------------ */
+/** 切换开发者页「密钥门槛」与「工具面板」的显隐。 */
+function setDevAuthed(authed) {
+  const gate = $("dev-gate");
+  const tools = $("dev-tools");
+  if (gate) gate.hidden = Boolean(authed);
+  if (tools) tools.hidden = !authed;
+}
+
+/** 清空开发者令牌与密钥输入，回到「等待输入密钥」的门槛状态。 */
+function resetDevGate() {
+  state.dev.token = "";
+  state.dev.authed = false;
+  const input = $("dev-key");
+  if (input) input.value = "";
+  ["dev-prompt-group", "dev-prompt-private"].forEach((id) => {
+    const area = $(id);
+    if (area) area.value = "";
+  });
+  setDevAuthed(false);
+}
+
+/** 开发者接口报「密钥无效/过期」时清令牌并回到门槛；返回是否已处理。 */
+function handleDevAuthError(error) {
+  const message = String((error && error.message) || "");
+  if (!message.includes("开发者密钥")) return false;
+  resetDevGate();
+  toast("开发者密钥无效或已过期，请重新输入", true);
+  const input = $("dev-key");
+  if (input) input.focus();
+  return true;
+}
+
+/** 开发者登录：用密钥换取限时令牌，成功后展示提示词/自检工具。 */
+async function devLogin() {
+  const input = $("dev-key");
+  const button = $("dev-login");
+  // 回车与点击可能连续触发，上一次登录未结束时忽略重复提交。
+  if (button && button.disabled) return;
+  const key = input ? input.value.trim() : "";
+  if (!key) {
+    toast("请输入开发者密钥", true);
+    if (input) input.focus();
+    return;
+  }
+  if (button) button.disabled = true;
   try {
-    const data = await callApi("POST", "rag/selftest", {});
+    const data = await callApi("POST", "dev/login", { key });
+    const token = String(data.token || "");
+    if (!token) throw new Error("登录失败：未返回开发者令牌");
+    state.dev.token = token;
+    state.dev.authed = true;
+    // 登录成功后立即清空密钥输入框，避免明文停留在 DOM 中。
+    if (input) input.value = "";
+    setDevAuthed(true);
+    toast("已进入开发者模式");
+    void loadDevPrompts();
+  } catch (error) {
+    // 失败时清空输入，避免密钥明文停留在页面上。
+    resetDevGate();
+    toast(error.message || "开发者密钥错误", true);
+    if (input) input.focus();
+  } finally {
+    if (button) button.disabled = false;
+  }
+}
+
+/** 退出开发者模式：注销服务端令牌并回到密钥门槛。 */
+async function devLogout() {
+  const token = state.dev.token;
+  resetDevGate();
+  try {
+    await callApi("POST", "dev/logout", { dev_token: token });
+  } catch (error) {
+    // 令牌已失效时本地照常退出，不打扰用户。
+    console.warn("[ActiveReply] 注销开发者令牌失败", error);
+  }
+  toast("已退出开发者模式");
+}
+
+/** 读取开发者模式里的抽取提示词补充层（r3.3n）。 */
+async function loadDevPrompts() {
+  if (!state.dev.token) return;
+  try {
+    // POST 走请求体带令牌，令牌不再出现在 URL/query 中。
+    const data = await callApi("POST", "dev/prompts", {
+      dev_token: state.dev.token,
+    });
+    const group = $("dev-prompt-group");
+    const priv = $("dev-prompt-private");
+    if (group) group.value = String(data.group_prompt || "");
+    if (priv) priv.value = String(data.private_prompt || "");
+  } catch (error) {
+    if (!handleDevAuthError(error)) {
+      toast(error.message || "读取提示词失败", true);
+    }
+  }
+}
+
+/** 保存开发者模式里的抽取提示词补充层（r3.3n）。 */
+async function saveDevPrompts() {
+  if (!state.dev.token) {
+    resetDevGate();
+    toast("请先输入开发者密钥", true);
+    return;
+  }
+  const button = $("dev-prompt-save");
+  if (button) button.disabled = true;
+  try {
+    await callApi("POST", "dev/prompts/save", {
+      dev_token: state.dev.token,
+      group_prompt: $("dev-prompt-group")?.value || "",
+      private_prompt: $("dev-prompt-private")?.value || "",
+    });
+    toast("提示词已保存");
+  } catch (error) {
+    if (!handleDevAuthError(error)) {
+      toast(error.message || "保存提示词失败", true);
+    }
+  } finally {
+    if (button) button.disabled = false;
+  }
+}
+
+/**
+ * 执行记忆自检（仅开发者可见）。
+ *
+ * 默认只读：不向生产库写临时记忆、不调用抽取模型；按住 Shift 点击才运行
+ * 深度自检（写删临时记忆 + 调用一次抽取模型），避免日常排障消耗 token（F23）。
+ */
+async function devSelftest(deep = false) {
+  const button = $("dev-selftest");
+  if (!state.dev.token) {
+    resetDevGate();
+    toast("请先输入开发者密钥", true);
+    return;
+  }
+  if (button) button.disabled = true;
+  try {
+    const data = await callApi("POST", "rag/selftest", {
+      deep: deep ? 1 : 0,
+      dev_token: state.dev.token,
+    });
     const steps = data.steps || [];
-    const prompt = data.prompt || {};
-    const promptItems = prompt.items || [];
+    const prompt = data.prompt || null;
+    const isDeep = data.mode === "deep";
     const lines = [
       data.passed ? "✅ 存储自检通过" : "❌ 存储自检未通过",
+      `模式：${isDeep ? "深度（写临时记忆 + 调用抽取模型）" : "只读（不写库、不调模型）"}`,
       "",
       ...steps.map(
         (step) =>
           `${step.ok ? "✅" : "❌"} ${step.name}${step.detail ? `：${step.detail}` : ""}`
       ),
-      "",
-      "── 提示词自检 ──",
-      prompt.ok
-        ? `✅ 解析 ${promptItems.length} 条，证据通过 ${prompt.evidence_ok} 条，${prompt.elapsed_ms}ms`
-        : `❌ ${prompt.error || "未解析出记忆"}`,
-      `模型：${prompt.model || "-"}｜契约版本 v${prompt.version ?? "-"}`,
-      ...promptItems.map(
-        (item, index) =>
-          `${index + 1}. [${item.kind}] ${item.content}（置信 ${Number(
-            item.confidence
-          ).toFixed(2)}）`
-      ),
     ];
-    if (prompt.raw) lines.push("", "原始输出：", prompt.raw);
+    if (prompt) {
+      const promptItems = prompt.items || [];
+      lines.push(
+        "",
+        "── 提示词自检 ──",
+        prompt.ok
+          ? `✅ 解析 ${promptItems.length} 条，证据通过 ${prompt.evidence_ok} 条，${prompt.elapsed_ms}ms`
+          : `❌ ${prompt.error || "未解析出记忆"}`,
+        `模型：${prompt.model || "-"}｜契约版本 v${prompt.version ?? "-"}`,
+        ...promptItems.map(
+          (item, index) =>
+            `${index + 1}. [${item.kind}] ${item.content}（置信 ${Number(
+              item.confidence
+            ).toFixed(2)}）`
+        )
+      );
+      if (prompt.raw) lines.push("", "原始输出：", prompt.raw);
+    } else {
+      lines.push(
+        "",
+        "── 提示词自检 ──",
+        "本次为只读自检，未调用抽取模型；按住 Shift 点击「自检」可运行深度自检。"
+      );
+    }
     $("detail-title").textContent = "记忆自检";
+    $("detail-body").classList.remove("detail-rich");
     $("detail-body").textContent = lines.join("\n");
-    $("detail").classList.add("open");
-    $("detail").setAttribute("aria-hidden", "false");
-    toast(
-      data.passed && prompt.ok ? "记忆自检通过" : "记忆自检未全部通过",
-      !(data.passed && prompt.ok)
-    );
+    openDetailPanel();
+    const allOk = Boolean(data.passed) && (!prompt || Boolean(prompt.ok));
+    toast(allOk ? "记忆自检通过" : "记忆自检未全部通过", !allOk);
   } catch (error) {
-    toast(error.message || "自检失败", true);
+    if (!handleDevAuthError(error)) {
+      toast(error.message || "自检失败", true);
+    }
   } finally {
-    button.disabled = false;
+    if (button) button.disabled = false;
   }
 }
 
-/** 对照展示「设置里的提示词」与「实际发送的提示词」。 */
-async function promptPreview() {
-  const button = $("prompt-preview");
-  button.disabled = true;
+/** 提示词对照（仅开发者可见）：展示设置里的补充要求与实际发送的提示词。 */
+async function devPromptPreview() {
+  const button = $("dev-prompt");
+  if (!state.dev.token) {
+    resetDevGate();
+    toast("请先输入开发者密钥", true);
+    return;
+  }
+  if (button) button.disabled = true;
   try {
-    const data = await callApi("GET", "config/prompt-preview", { kind: "group" });
+    const data = await callApi("POST", "config/prompt-preview", {
+      kind: "group",
+      dev_token: state.dev.token,
+    });
     const lines = [
       `版本 v${data.version}｜设置 ${data.configured_chars} 字｜实际发送 ${data.chars} 字`,
-      `${data.is_default ? "默认提示词" : "自定义提示词"}｜多原子：${
+      `${data.is_default ? "默认补充" : "自定义补充"}｜多原子：${
         data.multi_atom ? "开" : "关"
-      }｜输出契约：${data.contract ? "已追加" : "未追加"}`,
+      }｜输出契约：${data.contract ? "多条原子" : "单条摘要"}`,
       "",
-      "── 设置里的提示词 ──",
-      data.configured || "(空)",
+      "── 你的补充要求（可编辑）──",
+      data.supplement || "(空)",
       "",
-      "── 实际发送（系统追加后，与试跑/抽取一致）──",
+      "── 系统固定规则（身份/格式/时间/评分/输出契约，不可编辑）──",
+      data.system_rules || "(空)",
+      "",
+      "── 实际发送（补充 + 固定规则，与试跑/抽取一致）──",
       data.prompt || "(空)",
     ];
     $("detail-title").textContent = "提示词对照";
+    $("detail-body").classList.remove("detail-rich");
     $("detail-body").textContent = lines.join("\n");
-    $("detail").classList.add("open");
-    $("detail").setAttribute("aria-hidden", "false");
+    openDetailPanel();
   } catch (error) {
-    toast(error.message || "获取提示词失败", true);
+    if (!handleDevAuthError(error)) {
+      toast(error.message || "获取提示词失败", true);
+    }
   } finally {
-    button.disabled = false;
-  }
-}
-
-/** 确认执行旧记录规范化，并展示检查/更新数量。 */
-async function cleanupMemories() {
-  const confirmed = await askConfirm(
-    "将把旧记录的毫秒时间戳规范化，并刷新时区元数据。继续？"
-  );
-  if (!confirmed) return;
-  try {
-    const data = await callApi("POST", "rag/cleanup", {});
-    toast(`清理完成：检查 ${data.scanned ?? 0} 条，更新 ${data.updated ?? 0} 条`);
-    await loadRagStats(false);
-    await loadRagList();
-  } catch (error) {
-    toast(error.message || "清理失败", true);
+    if (button) button.disabled = false;
   }
 }
 
 /* ------------------------------------------------------------------ */
 /* 事件绑定                                                            */
 /* ------------------------------------------------------------------ */
-/** 一次性绑定页面导航、群配置、全局表单和记忆操作的事件处理器。 */
-function lockButton(button) {
-  if (button.dataset.locking === "1") return;
-  button.dataset.locking = "1";
-  button.classList.add("btn-loading");
-  button.setAttribute("aria-busy", "true");
+/** 按钮加载锁最短展示时长；实际解锁还要等接口请求结束（F42）。 */
+const BUTTON_LOCK_MIN_MS = 1000;
+/** 兜底上限：极端情况下请求迟迟不结算，也不能让按钮永久卡住。 */
+const BUTTON_LOCK_MAX_MS = 6000;
+/** 当前处于加载锁状态的按钮：button -> { startedAt, startedAtCount, spinner }。 */
+const lockedButtons = new Map();
+let lockMonitorTimer = 0;
 
-  const spinner = document.createElement("span");
-  spinner.className = "btn-spinner";
-  spinner.setAttribute("aria-hidden", "true");
-  const icon = button.querySelector("svg.icon");
-  const rect = button.getBoundingClientRect();
-  let left = rect.width / 2;
-  let top = rect.height / 2;
-  if (icon) {
-    const iconRect = icon.getBoundingClientRect();
-    left = iconRect.left - rect.left + iconRect.width / 2;
-    top = iconRect.top - rect.top + iconRect.height / 2;
+/** 解锁单个按钮并清理加载态标记。 */
+function unlockButton(button) {
+  const entry = lockedButtons.get(button);
+  if (entry) {
+    if (entry.spinner && entry.spinner.isConnected) entry.spinner.remove();
+    lockedButtons.delete(button);
   }
-  spinner.style.left = `${left}px`;
-  spinner.style.top = `${top}px`;
-  button.appendChild(spinner);
-
-  window.setTimeout(() => {
-    button.classList.remove("btn-loading");
-    button.removeAttribute("aria-busy");
-    delete button.dataset.locking;
-    spinner.remove();
-  }, 1000);
+  button.classList.remove("btn-loading");
+  button.removeAttribute("aria-busy");
+  delete button.dataset.locking;
 }
 
+/**
+ * 释放满足条件的按钮锁：至少展示 1 秒，且本按钮触发的接口请求已经结束。
+ * 若点击没有发出请求（如前端校验失败），只受最短时长约束。
+ */
+function releaseFinishedButtonLocks() {
+  const now =
+    typeof performance !== "undefined" && performance.now
+      ? performance.now()
+      : Date.now();
+  lockedButtons.forEach((entry, button) => {
+    const elapsed = now - entry.startedAt;
+    if (elapsed < BUTTON_LOCK_MIN_MS) return;
+    const requestStarted = apiStartedCount > entry.startedAtCount;
+    if (requestStarted && apiInFlight > 0 && elapsed < BUTTON_LOCK_MAX_MS) {
+      return;
+    }
+    unlockButton(button);
+  });
+  if (!lockedButtons.size && lockMonitorTimer) {
+    window.clearInterval(lockMonitorTimer);
+    lockMonitorTimer = 0;
+  }
+}
+
+/** 有按钮处于加载锁时启动轮询，避免每个按钮各自挂一个计时器。 */
+function ensureLockMonitor() {
+  if (lockMonitorTimer) return;
+  lockMonitorTimer = window.setInterval(releaseFinishedButtonLocks, 120);
+}
+
+/**
+ * 键盘视口恢复（r3.3v）：Android WebView 在收起软键盘后偶尔不重算可视视口，
+ * 表现为点击偏移或下半屏点不动。任何 input/textarea 失焦后，若焦点已回落到
+ * body，则分两次（键盘动画中/结束后）触发 resize 并原地重设滚动位置，强制重算。
+ */
+/** 键盘视口恢复：键盘收起后恢复滚动位置并强制重算命中区。 */
+/** 键盘视口恢复：键盘收起后恢复滚动位置并强制重算命中区。 */
+function installViewportRecovery() {
+  const viewport = window.visualViewport;
+  let keyboardOpen = false;
+  let stabilizeTimer = 0;
+
+  if (viewport) {
+    const onViewportChange = () => {
+      if (isKeyboardViewportOpen()) {
+        keyboardOpen = true;
+        clearTimeout(stabilizeTimer);
+        return;
+      }
+      if (!keyboardOpen) {
+        scheduleBaselineRefresh();
+        return;
+      }
+      clearTimeout(stabilizeTimer);
+      stabilizeTimer = window.setTimeout(() => {
+        keyboardOpen = false;
+        scheduleBaselineRefresh();
+      }, 160);
+    };
+    viewport.addEventListener("resize", onViewportChange, { passive: true });
+  }
+
+  // r3.4s：所有输入框只唤起键盘、不滚动页面。
+  // 1) 记录按下时的滚动位置；2) 拦截默认聚焦并手动 focus({preventScroll:true})；
+  // 3) 若浏览器仍因聚焦/键盘调整了滚动，随后恢复回按下前位置。
+  let lastPointerScrollY = null;
+  let suppressFocusRestore = false;
+  const focusableSelector = 'input, textarea, [contenteditable="true"]';
+
+  const restoreFocusScroll = (targetScrollY) => {
+    if (targetScrollY === null) return;
+    requestAnimationFrame(() => {
+      if (Math.abs(window.scrollY - targetScrollY) > 1) {
+        window.scrollTo(0, targetScrollY);
+      }
+    });
+  };
+
+  document.addEventListener(
+    "pointerdown",
+    (event) => {
+      lastPointerScrollY = Math.max(0, Number(window.scrollY) || 0);
+      if (event.pointerType === "mouse") return;
+      const target =
+        event.target instanceof Element
+          ? event.target.closest(focusableSelector)
+          : null;
+      if (!target || target.disabled) return;
+      if (target.tagName !== "INPUT" && target.tagName !== "TEXTAREA") return;
+      if (target.readOnly) return;
+      if (document.activeElement === target) return; // 已聚焦：保留默认光标定位
+      event.preventDefault();
+      suppressFocusRestore = true;
+      try {
+        target.focus({ preventScroll: true });
+      } catch (error) {
+        target.focus();
+      }
+      suppressFocusRestore = false;
+      if (typeof target.setSelectionRange === "function") {
+        const length = String(target.value || "").length;
+        try {
+          target.setSelectionRange(length, length);
+        } catch (error) {
+          /* 某些 input 类型不支持选区，忽略 */
+        }
+      }
+      restoreFocusScroll(lastPointerScrollY);
+    },
+    { capture: true, passive: false }
+  );
+
+  // 记录键盘状态与诊断历史（不做滚动位置恢复/视图纠正）。
+  document.addEventListener(
+    "focusin",
+    (event) => {
+      const target = event.target;
+      if (!target) return;
+      const tag = String(target.tagName || "").toUpperCase();
+      if (tag === "INPUT" || tag === "TEXTAREA" || target.isContentEditable) {
+        keyboardOpen = true;
+        recordUiSample("focusin");
+        // 兜底：用键盘/无障碍等方式聚焦时，若页面被浏览器滚动了，恢复按下前位置。
+        if (!suppressFocusRestore && lastPointerScrollY !== null) {
+          restoreFocusScroll(lastPointerScrollY);
+          lastPointerScrollY = null;
+        }
+      }
+    },
+    true
+  );
+  document.addEventListener(
+    "focusout",
+    (event) => {
+      const target = event.target;
+      if (!target) return;
+      const tag = String(target.tagName || "").toUpperCase();
+      if (tag !== "INPUT" && tag !== "TEXTAREA") return;
+      keyboardOpen = false;
+      recordUiSample("focusout");
+    },
+    true
+  );
+
+  // 诊断历史：定期采样 + 关键事件采样（聚焦/失焦/滚动/resize）。
+  startUiHistorySampler();
+  window.addEventListener("scroll", () => recordUiSample("scroll"), {
+    passive: true,
+  });
+  window.addEventListener("resize", () => recordUiSample("resize"), {
+    passive: true,
+  });
+
+  // 键盘基线：初始、真实 resize（含旋转/地址栏变化）后重算。
+  scheduleBaselineRefresh();
+  window.addEventListener(
+    "resize",
+    () => {
+      scheduleScrolledClass();
+      scheduleBaselineRefresh();
+    },
+    { passive: true }
+  );
+
+  window.addEventListener("orientationchange", () => {
+    keyboardBaselineHeight = 0;
+    window.setTimeout(() => {
+      scheduleBaselineRefresh();
+      refreshTopbarHeight();
+    }, 300);
+  });
+}
 const FEEDBACK_SELECTOR = [
   "#save-group",
   "#save-global",
   "#reset-group",
   "#reset-global",
-  "#rag-reset",
   "#overview-refresh",
   "#groups-refresh",
   "#rag-search",
-  "#rag-cleanup",
-  "#rag-selftest",
-  "#prompt-preview",
   "#rag-prev",
   "#rag-next",
   "#auto-memory-toggle",
@@ -2187,9 +4211,262 @@ const FEEDBACK_SELECTOR = [
   "#group-block-add",
   "#modal-ok",
   "[data-delete]",
+  "[data-archive]",
+  "[data-unarchive]",
+  "[data-purge]",
   "[data-block-remove]",
   "[data-feedback]",
 ].join(",");
+
+let uiDiagTimer = 0;
+const uiHistory = [];
+let uiHistoryTimer = 0;
+
+/** 记录一条视口历史（诊断用，保留最近 20 秒）。 */
+function recordUiSample(reason = "") {
+  if (document.hidden) return;
+  const vv = window.visualViewport;
+  const active = document.activeElement;
+  uiHistory.push({
+    t: Date.now(),
+    y: Math.round(window.scrollY || 0),
+    inner: Math.round(window.innerHeight || 0),
+    vh: vv ? Math.round(vv.height) : 0,
+    top: vv ? Math.round(vv.offsetTop) : 0,
+    pageTop: vv ? Math.round(vv.pageTop) : 0,
+    active: active
+      ? `${active.tagName}${active.id ? `#${active.id}` : ""}`
+      : "body",
+    reason,
+  });
+  if (uiHistory.length > 80) uiHistory.shift();
+}
+
+function startUiHistorySampler() {
+  if (uiHistoryTimer) return;
+  uiHistoryTimer = window.setInterval(() => recordUiSample("tick"), 400);
+}
+
+function formatUiHistory() {
+  const now = Date.now();
+  const rows = uiHistory.slice(-10).map((item) => {
+    const dt = ((item.t - now) / 1000).toFixed(1);
+    const reason = item.reason && item.reason !== "tick" ? ` ${item.reason}` : "";
+    return `t${dt}s y=${item.y} vh=${item.vh}/${item.inner} top=${item.top} pt=${item.pageTop} ${item.active}${reason}`;
+  });
+  return rows.length ? rows.join("\n") : "（无历史）";
+}
+
+/** 采集当前视口/滚动/iframe/键盘状态，用于定位点击偏移根因（r3.3x）。 */
+function collectUiDiagnostics() {
+  const lines = [];
+  const vv = window.visualViewport;
+  const focused = document.activeElement;
+  const frame = (() => {
+    try {
+      return window.frameElement;
+    } catch (error) {
+      return null;
+    }
+  })();
+  const parentInfo = (() => {
+    try {
+      if (!window.parent || window.parent === window) return "无（顶层页面）";
+      const ph = window.parent.innerHeight;
+      const pv = window.parent.visualViewport;
+      return `parent.innerHeight=${ph} parent.vv=${pv ? Math.round(pv.height) : "-"}`;
+    } catch (error) {
+      return "跨域不可读";
+    }
+  })();
+  lines.push(`viewport = ${window.innerWidth} × ${window.innerHeight} @${window.devicePixelRatio}x`);
+  lines.push(
+    `visualViewport = ${vv ? `${Math.round(vv.width)} × ${Math.round(vv.height)}` : "不支持"}`
+  );
+  if (vv) {
+    lines.push(
+      `  offsetTop=${Math.round(vv.offsetTop)} pageTop=${Math.round(vv.pageTop)} scale=${vv.scale.toFixed(3)}`
+    );
+  }
+  lines.push(`scrollY=${Math.round(window.scrollY)} scrollX=${Math.round(window.scrollX)}`);
+  lines.push(
+    `docEl.clientHeight=${document.documentElement.clientHeight} body.scrollHeight=${document.body.scrollHeight}`
+  );
+  lines.push(`iframe = ${parentInfo}`);
+  if (frame) {
+    try {
+      const rect = frame.getBoundingClientRect();
+      lines.push(
+        `frameRect = x${Math.round(rect.left)} y${Math.round(rect.top)} ${Math.round(rect.width)} × ${Math.round(rect.height)}`
+      );
+    } catch (error) {
+      lines.push("frameRect = 不可读");
+    }
+  }
+  lines.push(
+    `activeElement = ${focused ? `${focused.tagName}${focused.id ? `#${focused.id}` : ""}` : "body"}`
+  );
+  lines.push(`isKeyboardViewportOpen = ${isKeyboardViewportOpen()}`);
+  lines.push(`keyboardBaseline = ${keyboardBaselineHeight}`);
+  lines.push(`body.class = ${Array.from(document.body.classList).join(" ") || "-"}`);
+  const drawer = $("drawer");
+  const detail = $("detail");
+  const scrim = $("scrim");
+  lines.push(
+    `drawer=${drawer?.classList.contains("open")} detail=${detail?.classList.contains("open")} scrim=${scrim?.classList.contains("show")}`
+  );
+  lines.push(
+    `pane.is-pushed=${$("main-pane")?.classList.contains("is-pushed")} panel-closing=${document.body.classList.contains("panel-closing")}`
+  );
+  const topbar = getComputedStyle(document.documentElement).getPropertyValue("--topbar-h");
+  const tabsFade = getComputedStyle(document.documentElement).getPropertyValue("--tabs-fade-h");
+  lines.push(`--topbar-h=${topbar || "-"} --tabs-fade-h=${tabsFade || "-"}`);
+  lines.push("");
+  lines.push("最近视口历史（y=scrollY vh/inner=视口高 top/pageTop=visualViewport偏移）:");
+  lines.push(formatUiHistory());
+  return lines.join("\n");
+}
+
+function renderUiDiagnostics() {
+  const pre = $("ui-diag-text");
+  if (pre) pre.textContent = collectUiDiagnostics();
+}
+
+function showUiDiagnostics() {
+  const modal = $("ui-diag");
+  if (!modal) return;
+  modal.classList.add("open");
+  modal.setAttribute("aria-hidden", "false");
+  renderUiDiagnostics();
+  clearInterval(uiDiagTimer);
+  uiDiagTimer = window.setInterval(renderUiDiagnostics, 500);
+}
+
+function hideUiDiagnostics() {
+  clearInterval(uiDiagTimer);
+  uiDiagTimer = 0;
+  const modal = $("ui-diag");
+  if (!modal) return;
+  modal.classList.remove("open");
+  modal.setAttribute("aria-hidden", "true");
+}
+
+let menuRecoverTriggered = false;
+let menuLongPressTimer = 0;
+let menuLongPressStart = null;
+let uiWatchdogTimer = 0;
+
+/** 长按菜单胶囊触发界面自愈；点击事件会被吞掉，避免同时开关抽屉。 */
+function bindMenuLongPressRecovery() {
+  const button = $("menu-btn");
+  if (!button) return;
+  const cancel = () => {
+    clearTimeout(menuLongPressTimer);
+    menuLongPressTimer = 0;
+    menuLongPressStart = null;
+  };
+  button.addEventListener("pointerdown", (event) => {
+    if (event.pointerType === "mouse" && event.button !== 0) return;
+    menuLongPressStart = { x: event.clientX, y: event.clientY };
+    clearTimeout(menuLongPressTimer);
+    menuLongPressTimer = window.setTimeout(() => {
+      if (!menuLongPressStart) return;
+      menuRecoverTriggered = true;
+      recoverUiState("long-press");
+      toast("界面已恢复");
+    }, 800);
+  });
+  button.addEventListener("pointermove", (event) => {
+    if (!menuLongPressStart) return;
+    if (
+      Math.abs(event.clientX - menuLongPressStart.x) > 12 ||
+      Math.abs(event.clientY - menuLongPressStart.y) > 12
+    ) {
+      cancel();
+    }
+  });
+  button.addEventListener("pointerup", cancel);
+  button.addEventListener("pointercancel", cancel);
+  button.addEventListener("pointerleave", cancel);
+  // 阻止 Android 长按弹出的文本选择菜单，确保长按手势归我们处理。
+  button.addEventListener("contextmenu", (event) => event.preventDefault());
+  button.addEventListener("selectstart", (event) => event.preventDefault());
+}
+
+/**
+ * 界面自愈（r3.3r）：清理卡死时残留的遮罩 / body 状态 / 面板变换，
+ * 以及按住不放的按钮锁。每 3 秒巡检一次，页面重新可见时也执行。
+ */
+function recoverUiState(reason = "") {
+  // 手势拖动中（边缘推开）不要清理内联变换，避免下一次 pointermove 前跳变。
+  if (typeof dragState !== "undefined" && dragState) return;
+  // 卡死的按钮锁：没有请求在途时全部释放（输入聚焦时也允许释放按钮）。
+  if (apiInFlight === 0 && lockedButtons.size) {
+    Array.from(lockedButtons.keys()).forEach((button) => unlockButton(button));
+  }
+  // r3.3w：输入框聚焦（软键盘可能展开）或数字键盘弹窗打开时不要改布局，
+  // 否则会和 WebView 的视口重算互相打架，造成点击偏移。
+  if (editingRangeValue) return;
+  const focused = document.activeElement;
+  if (focused && focused !== document.body) {
+    const focusedTag = String(focused.tagName || "").toUpperCase();
+    if (focusedTag === "INPUT" || focusedTag === "TEXTAREA") return;
+  }
+  const drawer = $("drawer");
+  const detail = $("detail");
+  const scrim = $("scrim");
+  const pane = $("main-pane");
+  if (!drawer || !detail || !scrim || !pane) return;
+  const drawerOpen = drawer.classList.contains("open");
+  const detailOpen = detail.classList.contains("open");
+  if (drawerOpen && detailOpen) {
+    // 两个面板同时打开是非法状态：保留详情，关闭抽屉。
+    closeDrawer();
+    return;
+  }
+  if (!drawerOpen) {
+    document.body.classList.remove("drawer-open");
+    drawer.setAttribute("aria-hidden", "true");
+  }
+  if (!detailOpen) {
+    document.body.classList.remove("detail-open");
+    detail.setAttribute("aria-hidden", "true");
+  }
+  if (!drawerOpen && !detailOpen) {
+    scrim.classList.remove("show");
+    pane.classList.remove("is-pushed");
+    pane.style.transition = "";
+    pane.style.transform = "";
+    pane.style.borderRadius = "";
+    pane.style.boxShadow = "";
+    const veil = document.querySelector(".pane-veil");
+    if (veil) {
+      veil.style.transition = "";
+      veil.style.opacity = "";
+    }
+    clearFloatingControlsInline();
+    setContentScrollOffset(0);
+    document.body.classList.remove("panel-closing");
+    if (!$("modal").classList.contains("open")) {
+      $("menu-btn").setAttribute("aria-expanded", "false");
+    }
+  }
+  if (reason) {
+    console.debug("[ActiveReply] 界面自愈", reason);
+  }
+}
+
+/** 启动界面巡检：正常时几乎零开销（只读 class 状态）。 */
+function startUiWatchdog() {
+  if (uiWatchdogTimer) return;
+  uiWatchdogTimer = window.setInterval(() => {
+    try {
+      recoverUiState("watchdog");
+    } catch (error) {
+      console.warn("[ActiveReply] 界面自愈失败", error);
+    }
+  }, 3000);
+}
 
 function installButtonFeedback() {
   document.addEventListener(
@@ -2199,7 +4476,12 @@ function installButtonFeedback() {
       if (!button) return;
       if (button.classList.contains("no-lock")) return;
       if (!button.matches(FEEDBACK_SELECTOR)) return;
-      if (button.classList.contains("btn-loading")) return;
+      if (button.classList.contains("btn-loading") || button.dataset.locking === "1") {
+        // 上一次请求尚未结束：在捕获阶段拦下重复提交，避免重复写配置/删记忆。
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        return;
+      }
       if (button.disabled) return;
       lockButton(button);
     },
@@ -2209,11 +4491,24 @@ function installButtonFeedback() {
 
 function bindEvents() {
   $("menu-btn").addEventListener("click", () => {
+    if (menuRecoverTriggered) {
+      menuRecoverTriggered = false;
+      return;
+    }
+    if ($("detail").classList.contains("open")) {
+      closeDetail();
+      return;
+    }
     const opened = $("drawer").classList.contains("open");
     opened ? closeDrawer() : openDrawer();
   });
-  $("drawer-close").addEventListener("click", closeDrawer);
-  $("scrim").addEventListener("click", closeDrawer);
+  // r3.3r：长按左上角胶囊 800ms = 强制恢复界面（遮罩/面板/按钮锁卡死时的逃生口）。
+  bindMenuLongPressRecovery();
+  bindPushGesture();
+  bindCloseGesture();
+  window.addEventListener("scroll", scheduleScrolledClass, { passive: true });
+  // resize 处理统一放在 installViewportRecovery（含键盘基线重算）。
+  updateScrolledClass();
   document.addEventListener("keydown", (event) => {
     if (event.key === "Escape") {
       closeDrawer();
@@ -2347,6 +4642,7 @@ function bindEvents() {
     state.rag.memoryType = $("filter-type").value;
     state.rag.scope = $("filter-scope").value;
     state.rag.identity = $("filter-identity").value;
+    state.rag.lifecycle = $("filter-lifecycle")?.value || "";
     state.rag.keyword = $("rag-keyword").value.trim();
     state.rag.role = $("rag-role").value.trim();
     state.rag.page = 1;
@@ -2354,18 +4650,44 @@ function bindEvents() {
     void loadRagList();
   });
   $("filter-cancel").addEventListener("click", closeFilterModal);
-  $("snackbar-undo").addEventListener("click", () => void undoDelete());
-  $("rag-reset").addEventListener("click", () => {
+  // r3.3g：筛选弹窗新增「清空」；清空筛选条件但保留「已归档」开关状态。
+  $("filter-clear").addEventListener("click", () => {
+    $("filter-type").value = "";
+    $("filter-scope").value = "";
+    $("filter-identity").value = "";
+    if ($("filter-lifecycle")) $("filter-lifecycle").value = "";
     $("rag-keyword").value = "";
     $("rag-role").value = "";
-    state.rag.keyword = "";
-    state.rag.scope = "";
-    state.rag.role = "";
     state.rag.memoryType = "";
+    state.rag.scope = "";
     state.rag.identity = "";
+    state.rag.lifecycle = "";
+    state.rag.keyword = "";
+    state.rag.role = "";
     state.rag.page = 1;
+    closeFilterModal();
+    syncRagFilterButton();
     void loadRagList();
   });
+  $("snackbar-undo").addEventListener("click", () => void undoDelete());
+  // r3.3：关键词/角色输入框右侧的快捷搜索按钮与两输入框回车，
+  // 都按当前输入重查第一页；筛选弹窗仍由「筛选」按钮打开。
+  $("rag-quick-search")?.addEventListener("click", quickSearchRag);
+  ["rag-keyword", "rag-role"].forEach((id) => {
+    const input = $(id);
+    if (!input) return;
+    input.addEventListener("keydown", (event) => {
+      if (event.key !== "Enter") return;
+      event.preventDefault();
+      quickSearchRag();
+    });
+  });
+  // r3.3：「已归档」开关切换为只显示归档记录（请求参数 archived_only=1）。
+  $("rag-archived-btn")?.addEventListener("click", toggleRagArchived);
+  $("rag-select-btn")?.addEventListener("click", () => toggleRagSelectMode());
+  $("rag-bulk-cancel")?.addEventListener("click", () => toggleRagSelectMode(false));
+  $("rag-bulk-archive")?.addEventListener("click", () => void bulkArchiveSelected());
+  $("rag-bulk-delete")?.addEventListener("click", () => void bulkDeleteSelected());
   $("theme-btn").addEventListener("click", () => cycleTheme());
   $("drawer-blocks").addEventListener("click", () => switchView("blocks"));
   $("block-add").addEventListener("click", () => void onBlockAddGlobal());
@@ -2379,6 +4701,11 @@ function bindEvents() {
     renderGlobalBlocks();
   });
   document.addEventListener("click", (event) => {
+    const rangeValue = event.target.closest(".range-value");
+    if (rangeValue) {
+      startRangeValueEdit(rangeValue);
+      return;
+    }
     const button = event.target.closest("[data-block-remove]");
     if (button) void removeBlockEntry(button);
   });
@@ -2387,9 +4714,6 @@ function bindEvents() {
     state.globalTab = "memory_rag";
     switchView("settings");
   });
-  $("rag-cleanup").addEventListener("click", () => void cleanupMemories());
-  $("rag-selftest").addEventListener("click", () => void ragSelftest());
-  $("prompt-preview").addEventListener("click", () => void promptPreview());
   $("rag-prev").addEventListener("click", () => {
     if (state.rag.page <= 1) return;
     state.rag.page -= 1;
@@ -2405,13 +4729,22 @@ function bindEvents() {
     state.rag.page = 1;
     void loadRagList();
   });
-  $("rag-keyword").addEventListener("keydown", (event) => {
-    if (event.key === "Enter") {
-      event.preventDefault();
-      $("rag-search").click();
-    }
+  // 开发者模式（r3.3）：侧栏扳手按钮进入，密钥校验通过后才展示提示词/自检。
+  $("drawer-dev")?.addEventListener("click", () => switchView("dev"));
+  $("dev-login")?.addEventListener("click", () => void devLogin());
+  $("dev-key")?.addEventListener("keydown", (event) => {
+    if (event.key !== "Enter") return;
+    event.preventDefault();
+    void devLogin();
   });
-  $("detail-close").addEventListener("click", closeDetail);
+  $("dev-prompt")?.addEventListener("click", () => void devPromptPreview());
+  $("dev-selftest")?.addEventListener("click", (event) =>
+    void devSelftest(Boolean(event.shiftKey))
+  );
+  $("dev-logout")?.addEventListener("click", () => void devLogout());
+  $("dev-prompt-save")?.addEventListener("click", () => void saveDevPrompts());
+  // 开发者模式保留「界面诊断」入口；注意它会切页，抓现场请用 Tab 连点 5 次。
+  $("dev-diag")?.addEventListener("click", () => showUiDiagnostics());
   installButtonFeedback();
 }
 
@@ -2420,14 +4753,29 @@ function bindEvents() {
 /* ------------------------------------------------------------------ */
 /** 等待 AstrBot bridge、注册主题变化监听，再进入状态概览页。 */
 async function init() {
-  const topbar = document.querySelector(".topbar");
-  if (topbar) {
-    document.documentElement.style.setProperty(
-      "--topbar-h",
-      `${topbar.offsetHeight}px`
-    );
+  refreshTopbarHeight();
+  try {
+    bindEvents();
+  } catch (error) {
+    // r3.3r：单个绑定失败不能让整页事件全部失效。
+    console.error("[ActiveReply] 事件绑定失败，保留已绑定部分", error);
+    bindMenuLongPressRecovery();
+    $("menu-btn")?.addEventListener("click", () => {
+      const opened = $("drawer")?.classList.contains("open");
+      opened ? closeDrawer() : openDrawer();
+    });
+    $("scrim")?.addEventListener("click", () => {
+      if ($("detail")?.classList.contains("open")) closeDetail();
+      else closeDrawer();
+    });
+    $("theme-btn")?.addEventListener("click", () => cycleTheme());
   }
-  bindEvents();
+  installViewportRecovery();
+  startUiWatchdog();
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) recoverUiState("visible");
+  });
+  window.addEventListener("pageshow", () => recoverUiState("pageshow"));
   state.themeMode = loadThemeMode();
   state.systemDark =
     typeof window.matchMedia === "function" &&

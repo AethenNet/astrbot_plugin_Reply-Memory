@@ -127,7 +127,7 @@
           "max": 1000,
           "step": 10
         },
-        "default": 40
+        "default": 200
       },
       "history_max_chars": {
         "description": "历史字数上限",
@@ -138,7 +138,7 @@
           "max": 20000,
           "step": 500
         },
-        "default": 3000
+        "default": 5000
       },
       "include_sender_id": {
         "description": "包含用户信息",
@@ -206,6 +206,17 @@
             "hint": "关闭后整个用户屏蔽区块不生效（页面与指令添加的记录仍会保留）",
             "type": "bool",
             "default": true
+          },
+          "blacklist": {
+            "description": "用户黑名单",
+            "hint": "填写 QQ 号，列表内用户的消息会被直接忽略；默认屏蔽 AstrBot 内置的 4 个官方/管家账号（2854196310、2854197266、3889239358、3889001246），留空表示不额外屏蔽",
+            "type": "list",
+            "default": [
+              "2854196310",
+              "2854197266",
+              "3889239358",
+              "3889001246"
+            ]
           },
           "block_hint": {
             "description": "屏蔽提示",
@@ -350,7 +361,7 @@
           },
           "memory_batch_messages": {
             "description": "累计消息记忆",
-            "hint": "抽取间隔冷却结束后，总结最近多少条消息",
+            "hint": "未总结消息达到该条数、且抽取间隔冷却结束后，把积压的消息一次性总结；空档期由“对话间隔切窗”兜底",
             "type": "int",
             "slider": {
               "min": 10,
@@ -381,31 +392,9 @@
             },
             "default": 10
           },
-          "memory_dedup_threshold": {
-            "description": "去重阈值",
-            "hint": "相似度达到该值视为重复记忆，直接跳过",
-            "type": "float",
-            "slider": {
-              "min": 0.8,
-              "max": 0.99,
-              "step": 0.01
-            },
-            "default": 0.9
-          },
-          "memory_conflict_threshold": {
-            "description": "冲突阈值",
-            "hint": "相似度处于冲突与去重阈值之间时，旧记忆标记为已失效",
-            "type": "float",
-            "slider": {
-              "min": 0.5,
-              "max": 0.89,
-              "step": 0.01
-            },
-            "default": 0.75
-          },
           "auto_extract_min_confidence": {
             "description": "最低置信度",
-            "hint": "低于该值的候选记忆会被丢弃；按五档标准，日常讨论通常为 0.50-0.60，简单闲聊为 0.30-0.40。默认 0.50 可保留日常讨论，只过滤闲聊以下",
+            "hint": "低于该值的候选记忆会被丢弃；按五档标准，日常讨论通常为 0.50-0.60，简单闲聊为 0.30-0.40。默认 0.50 可保留日常讨论，只过滤闲聊以下；注意：chatter/spam 档另受下方「丢弃闲聊/灌水档」开关控制，把本项设为 0 不会绕过该开关",
             "type": "float",
             "slider": {
               "min": 0,
@@ -432,14 +421,42 @@
           },
           "memory_extract_max_chars": {
             "description": "抽取输入字数上限",
-            "hint": "每次抽取最多发送多少字的聊天内容，超出时丢弃最早的消息",
+            "hint": "单次送入模型的最大字数；5000 字约等于 50 条短消息，积压超过上限时会从最早开始连续分几次总结，不丢消息",
             "type": "int",
             "slider": {
-              "min": 300,
-              "max": 6000,
-              "step": 100
+              "min": 500,
+              "max": 10000,
+              "step": 250
             },
-            "default": 1500
+            "default": 6000
+          },
+          "memory_extract_min_substance_chars": {
+            "description": "无实质内容过滤字数",
+            "hint": "整窗去掉图片/表情/引用/链接后，实质文字（中日韩文字、字母、数字）少于该值时跳过抽取，避免只有图片和表情的窗口生成记忆；0 表示关闭",
+            "type": "int",
+            "slider": {
+              "min": 0,
+              "max": 100,
+              "step": 1
+            },
+            "default": 8
+          },
+          "memory_extract_skip_chatter": {
+            "description": "丢弃闲聊/灌水档",
+            "hint": "开启后，模型评为简单闲聊（chatter，约 0.30-0.40）或灌水（spam，≤0.20）的候选一律丢弃，自动抽取与手动 /总结记忆 都生效；即使「最低置信度」设为 0 也仍然丢弃，关闭本开关后按数值门槛判断。",
+            "type": "bool",
+            "default": true
+          },
+          "memory_max_participants": {
+            "description": "单条记忆参与者上限",
+            "hint": "一条记忆最多关联多少名窗口内的真实发言者；多人窗口会依次按模型结论、昵称、证据与发言顺序补齐参与者",
+            "type": "int",
+            "slider": {
+              "min": 1,
+              "max": 20,
+              "step": 1
+            },
+            "default": 8
           },
           "memory_multi_atom": {
             "description": "多条原子记忆",
@@ -459,33 +476,10 @@
             "default": 3
           },
           "memory_prompt_contract": {
-            "description": "自动追加输出契约",
-            "hint": "自定义提示词缺少 JSON 输出格式时自动追加契约；关闭后沿用单条摘要格式",
+            "description": "多条原子记忆",
+            "hint": "开启时要求模型输出 {\"memories\":[...]} 多条原子记忆；关闭时退回单条摘要格式",
             "type": "bool",
             "default": true
-          },
-          "memory_window_gap_minutes": {
-            "description": "对话间隔切窗（分钟）",
-            "hint": "对话停顿超过该时长后，自动把当前片段总结成一条记忆",
-            "type": "int",
-            "slider": {
-              "min": 10,
-              "max": 180,
-              "step": 10
-            },
-            "default": 60
-          },
-          "memory_group_prompt": {
-            "description": "群聊总结提示词",
-            "hint": "群聊记忆总结使用的提示词，必须保留 {messages} 占位符；系统会自动追加强制校准规则（发言归属、时间、置信度档位）",
-            "type": "text",
-            "default": "## 总结要求\n1. **第一人称视角**：以\"我\"的视角描述对话，不要使用\"bot\"、\"助手\"等第三人称词汇。\n2. **讨论内容**：群里讨论了什么。\n3. **参与者**：谁参与了对话（包括你自己），**必须使用具体昵称**，明确区分**谁说的**和**说了什么**，不要把别人的发言混为自己的。判断发言者时只看每条消息开头 **[昵称 | ID: 账号 | 时间]** 里的昵称；正文中出现的昵称（引用、@、转述）都不是发言者。正文末尾的（引用 X 的旧消息：「…」）只是当前发言人引用的旧内容，（@ X）只表示提及，都不是当前发言者说的话。查找所有以 \"[Bot:\" 开头的消息，这些消息是**你自己说的话**。\n4. **总结结果**：把整段消息进行总结，每条记忆 1~5 句话、不超过 200 字，**相对时间（今天/昨天/下周）**按消息时间换算成具体日期。\n\n## 时间规则\n- 每条消息行头的时间是真实发送时间；总结里的日期和时间必须据此换算。\n- 示例中的 2026-10-28 只是格式示意，**不要照抄示例日期**；相对时间必须换算成具体日期。\n\n## 置信度评分标准（0.0-1.0）\n\"置信度\"表示这段对话作为长期记忆的价值，不是事实可信度，也不是对某一条消息打分。\n**先判断档位，再在档位区间内取值；默认从低档起评，只有同时满足全部条件才进入高档。**\n- 0.90-1.00：重要群体决策。只有群规制定、全员投票结果、正式承诺、涉及金钱/安全/重大日程的决定，或对群体有长期约束的计划，才可以进入本档；并且至少 3 名成员实质参与、有具体可执行的安排。普通约饭、约玩、临时改时间最高 0.60。\n- 0.70-0.80：有价值的讨论。多人参与且有明确结论，但影响限于短期或个别成员。\n- 0.50-0.60：日常讨论。普通约饭、约玩、临时安排、一般信息交流；即使形成了约定，只要是一次性、临时性的日常安排，就落在本档，**最高 0.60**。有明确时间、地点或参与者的安排取 0.60；其他日常交流取 0.50-0.55。\n- 0.30-0.40：简单闲聊。少数人参与、临时状态、当下情绪、玩笑、反讽、推测、传闻。\n- 0.00-0.20：没有信息量的灌水。单人刷屏、一次性问答、寒暄、表情、复读。\n\n### 防虚高约束\n- 大多数群聊片段应落在 0.30-0.60；0.70 以上只给少数真正有结论、有长期价值的讨论。\n- 不要因为\"总结写得完整\"\"消息条数多\"\"有人 @ 或引用\"而提高评分。\n- 无法确认多人达成共识，或只是临时起意的吃饭、看电影、打游戏、生日祝福、日常吐槽时，一律不得高于 0.60。\n- 反例：三人临时约好今晚七点吃火锅 → 0.60（daily），不是 0.90。\n\n## 字段规则\n- confidence 必须落在上面某个档位区间内，保留两位小数；\n- confidence_tier 必须从 major / discussion / daily / chatter / spam 中选择，并与 confidence 所在档位一致；\n- importance 是同一口径的长期价值评分，通常等于 confidence；\n- topics 最多 5 个，participants 最多 10 个；\n- participants 和 role_ids 只填片段中出现过的用户；不确定就留空；\n- scope：个人偏好/身份/习惯用 global；只和这个群有关的事用 group；\n- quotes 至少 1 条，必须来自当前消息正文并能逐字找到；不要摘录“引用旧消息”里的内容，否则整条记忆会被丢弃。\n\n## 输出格式\n只输出一个 JSON 对象，不要数组、解释或代码块：\n{\n  \"summary\": \"整段对话的总结\",\n  \"topics\": [\"主题1\", \"主题2\"],\n  \"participants\": [\"昵称1\", \"昵称2\"],\n  \"role_ids\": [\"相关用户QQ号\"],\n  \"scope\": \"global | group\",\n  \"confidence_tier\": \"major | discussion | daily | chatter | spam\",\n  \"confidence\": 0.0,\n  \"importance\": 0.0,\n  \"quotes\": [\"逐字来自聊天片段的证据1\", \"证据2\"]\n}\n\n## 消息格式\n- **[昵称 | ID: 账号 | 时间]**：群成员发送的消息，只有方括号开头的昵称是发送者；\n- **[Bot: 昵称 | ID: 账号 | 时间]**：你自己（机器人）发送的消息，以 \"Bot:\" 开头；\n- **[图片]**、**[文件: 文件名]**、**[语音]**、**[视频]**、**[表情]**：媒体占位；\n- 正文末尾的（引用 X 的旧消息：「…」）不是当前发言人说的话；（@ X）只表示提及。\n\n## 示例输入\n- **[事佳 | ID: 1000123 | 2026-10-28 15:01:10]**: 今天谁在摸鱼？\n- **[苏琪 | ID: 1000456 | 2026-10-28 15:01:23]**: 刚开完会，脑子还在加载\n- **[Bot: AstrBot | ID: 123456789 | 2026-10-28 15:01:26]**: +1\n- **[事佳 | ID: 1000123 | 2026-10-28 15:01:52]**: 那就老地方吃火锅，七点？\n- **[苏琪 | ID: 1000456 | 2026-10-28 15:02:02]**: 七点可以，我六点半下班\n- **[Dew | ID: 1000789 | 2026-10-28 15:02:12]**: 最后一个来的，请大家喝奶茶\n\n## 示例输出\n{\"summary\": \"群里约定 2026-10-28 晚上七点在老地方吃火锅；苏琪六点半下班，Dew 说最后一个到场的人请大家喝奶茶。\", \"topics\": [\"晚餐约定\", \"火锅\", \"下班时间\"], \"participants\": [\"事佳\", \"苏琪\", \"Dew\"], \"role_ids\": [\"1000123\", \"1000456\", \"1000789\"], \"scope\": \"group\", \"confidence_tier\": \"daily\", \"confidence\": 0.60, \"importance\": 0.60, \"quotes\": [\"那就老地方吃火锅，七点？\", \"七点可以，我六点半下班\", \"最后一个来的，请大家喝奶茶\"]}\n\n聊天片段：\n{messages}"
-          },
-          "memory_private_prompt": {
-            "description": "私聊总结提示词",
-            "hint": "私聊记忆总结使用的提示词，必须保留 {messages} 占位符；系统会自动追加强制校准规则（发言归属、时间、置信度档位）",
-            "type": "text",
-            "default": "## 总结要求\n1. **第一人称视角**：以\"我\"的视角描述私聊对话，不要使用\"bot\"、\"助手\"等第三人称词汇。\n2. **聊天内容**：你们聊了什么。\n3. **参与者**：只涉及你和对方，**必须使用具体昵称**，明确区分**谁说的**和**说了什么**。判断发言者时只看每条消息开头 **[昵称 | ID: 账号 | 时间]** 里的昵称；正文中出现的昵称（引用、@、转述）都不是发言者。正文末尾的（引用 X 的旧消息：「…」）只是当前发言人引用的旧内容，（@ X）只表示提及，都不是当前发言者说的话。查找所有以 \"[Bot:\" 开头的消息，这些消息是**你自己说的话**。\n4. **总结结果**：把整段消息进行总结，每条记忆 1~5 句话、不超过 200 字，**相对时间（今天/昨天/下周）**按消息时间换算成具体日期。\n\n## 时间规则\n- 每条消息行头的时间是真实发送时间；总结里的日期和时间必须据此换算。\n- 示例中的 2026-10-28 只是格式示意，**不要照抄示例日期**；相对时间必须换算成具体日期。\n\n## 置信度评分标准（0.0-1.0）\n\"置信度\"表示这段对话作为长期记忆的价值，不是事实可信度，也不是对某一条消息打分。\n**先判断档位，再在档位区间内取值；默认从低档起评。**\n- 0.90-1.00：正式约定、明确的长期计划或关键个人信息，并且已经确认；普通约饭、约玩、临时看电影最高 0.60。\n- 0.70-0.80：有价值的交流，有明确结论，但影响限于短期。\n- 0.50-0.60：日常聊天、一般信息、临时安排；普通约饭、约玩、一次性计划最高 0.60。有明确时间、地点的安排取 0.60；其他日常聊天取 0.50-0.55。\n- 0.30-0.40：闲聊、临时状态、当下情绪、玩笑、反讽、推测。\n- 0.00-0.20：寒暄、表情、复读、没有信息量。\n\n### 防虚高约束\n- 大多数私聊片段应落在 0.30-0.60；0.70 以上只给真正有长期价值的交流。\n- 不要因为\"总结写得完整\"\"消息条数多\"而提高评分。\n- 临时起意的吃饭、看电影、打游戏、普通祝福、日常吐槽不得高于 0.60。\n- 反例：对方临时约我今晚看电影 → 0.60（daily），不是 0.90。\n\n## 字段规则\n- confidence 必须落在上面某个档位区间内，保留两位小数；\n- confidence_tier 必须从 major / discussion / daily / chatter / spam 中选择，并与 confidence 所在档位一致；\n- importance 是同一口径的长期价值评分，通常等于 confidence；\n- topics 最多 5 个，participants 最多 10 个；\n- participants 和 role_ids 只填片段中出现过的用户；不确定就留空；\n- scope：个人偏好/身份/习惯用 global；只和这次私聊有关的事用 group；\n- quotes 至少 1 条，必须来自当前消息正文并能逐字找到；不要摘录“引用旧消息”里的内容，否则整条记忆会被丢弃。\n\n## 输出格式\n只输出一个 JSON 对象，不要数组、解释或代码块：\n{\n  \"summary\": \"整段对话的总结\",\n  \"topics\": [\"主题1\", \"主题2\"],\n  \"participants\": [\"昵称1\", \"昵称2\"],\n  \"role_ids\": [\"相关用户QQ号\"],\n  \"scope\": \"global | group\",\n  \"confidence_tier\": \"major | discussion | daily | chatter | spam\",\n  \"confidence\": 0.0,\n  \"importance\": 0.0,\n  \"quotes\": [\"逐字来自聊天片段的证据1\", \"证据2\"]\n}\n\n## 消息格式\n- **[昵称 | ID: 账号 | 时间]**：对方发送的消息，只有方括号开头的昵称是发送者；\n- **[Bot: 昵称 | ID: 账号 | 时间]**：你自己（机器人）发送的消息；\n- **[图片]**、**[文件: 文件名]**、**[语音]**、**[视频]**、**[表情]**：媒体占位；\n- 正文末尾的（引用 X 的旧消息：「…」）不是当前发言人说的话；（@ X）只表示提及。\n\n## 示例输入\n- **[苏琪 | ID: 1000456 | 2026-10-28 20:01:10]**: 明天有空吗？\n- **[Bot: AstrBot | ID: 123456789 | 2026-10-28 20:01:20]**: 有呀，怎么了？\n- **[苏琪 | ID: 1000456 | 2026-10-28 20:01:35]**: 想约你晚上七点看电影\n\n## 示例输出\n{\"summary\": \"苏琪在 2026-10-28 私聊约我 2026-10-29 晚上七点看电影，我已经答应了。\", \"topics\": [\"看电影\", \"邀约\"], \"participants\": [\"苏琪\", \"AstrBot\"], \"role_ids\": [\"1000456\"], \"scope\": \"group\", \"confidence_tier\": \"daily\", \"confidence\": 0.60, \"importance\": 0.60, \"quotes\": [\"想约你晚上七点看电影\"]}\n\n聊天片段：\n{messages}"
           }
         }
       },
@@ -515,101 +509,6 @@
               "step": 1
             },
             "default": 5
-          },
-          "memory_mmr_enabled": {
-            "description": "卡片去重",
-            "hint": "多张卡片内容重复时做多样性惩罚，避免同一件事占满注入额度",
-            "type": "bool",
-            "default": true
-          },
-          "memory_kind_badge": {
-            "description": "卡片显示类型",
-            "hint": "在注入卡片里显示记忆类型（plan/preference 等），便于模型区分计划与偏好",
-            "type": "bool",
-            "default": true
-          },
-          "memory_entity_boost": {
-            "description": "实体命中加分",
-            "hint": "记忆中的实体出现在当前消息时，提高该条记忆的排序权重",
-            "type": "float",
-            "slider": {
-              "min": 0.0,
-              "max": 0.5,
-              "step": 0.02
-            },
-            "default": 0.1
-          },
-          "memory_online_scan_limit": {
-            "description": "在线扫描上限",
-            "hint": "自动回忆单次最多扫描多少条最新记忆；调小可降低延迟，但可能漏掉更早的记忆（工具与控制台不受影响）",
-            "type": "int",
-            "slider": {
-              "min": 100,
-              "max": 5000,
-              "step": 100
-            },
-            "default": 900
-          },
-          "memory_min_similarity": {
-            "description": "最低相似度",
-            "hint": "召回结果与问题的相似度低于该值时丢弃，避免注入不相关的记忆",
-            "type": "float",
-            "slider": {
-              "min": 0,
-              "max": 1,
-              "step": 0.05
-            },
-            "default": 0.55
-          },
-          "memory_lexical_recall": {
-            "description": "关键词召回",
-            "hint": "启用本地关键词（bigram）召回通道，精确词命中时无需调用 embedding，可降低延迟",
-            "type": "bool",
-            "default": true
-          },
-          "memory_embedding_cache_ttl": {
-            "description": "向量缓存时长（秒）",
-            "hint": "相同问题在此时长内复用查询向量，0 表示关闭缓存",
-            "type": "int",
-            "slider": {
-              "min": 0,
-              "max": 3600,
-              "step": 30
-            },
-            "default": 300
-          },
-          "memory_embedding_cache_size": {
-            "description": "向量缓存条数",
-            "hint": "查询向量缓存的最大条目数，0 表示关闭缓存",
-            "type": "int",
-            "slider": {
-              "min": 0,
-              "max": 2048,
-              "step": 64
-            },
-            "default": 256
-          },
-          "recall_k": {
-            "description": "召回数量",
-            "hint": "语义召回候选条数",
-            "type": "int",
-            "slider": {
-              "min": 1,
-              "max": 50,
-              "step": 1
-            },
-            "default": 20
-          },
-          "max_return_results": {
-            "description": "最大返回条数",
-            "hint": "记忆工具单次最多返回多少条",
-            "type": "int",
-            "slider": {
-              "min": 1,
-              "max": 300,
-              "step": 1
-            },
-            "default": 100
           }
         }
       },
@@ -618,17 +517,6 @@
         "hint": "控制记忆的时间衰减、定期巩固与低价值归档",
         "type": "object",
         "items": {
-          "memory_decay_half_life_days": {
-            "description": "记忆衰减半衰期（天）",
-            "hint": "读取时按重要性 × 时间衰减排序，不写入数据库",
-            "type": "int",
-            "slider": {
-              "min": 7,
-              "max": 30,
-              "step": 1
-            },
-            "default": 10
-          },
           "memory_consolidation_enable": {
             "description": "定期巩固",
             "hint": "定期把同主题的多条旧记忆合并成一条摘要",
@@ -646,6 +534,23 @@
             },
             "default": 7
           },
+          "memory_consolidation_archive": {
+            "description": "巩固仅归档",
+            "hint": "开启后巩固只把被合并的旧记忆移入归档，不直接删除；关闭时按旧行为处理",
+            "type": "bool",
+            "default": true
+          },
+          "memory_trash_retention_days": {
+            "description": "回收站保留天数",
+            "hint": "删除的记忆在回收站中保留多少天，超期后物理清理（归档记录不在回收站）",
+            "type": "int",
+            "slider": {
+              "min": 7,
+              "max": 365,
+              "step": 1
+            },
+            "default": 30
+          },
           "memory_archive_enable": {
             "description": "归档低价值记忆",
             "hint": "低重要性且长期未访问的记忆会被归档，不再参与检索",
@@ -661,53 +566,136 @@
               "max": 120,
               "step": 1
             },
-            "default": 15
+            "default": 30
           },
           "memory_archive_importance": {
             "description": "归档重要性阈值",
-            "hint": "重要性低于该值的记忆才可能被归档",
+            "hint": "有效重要性低于该值的记忆才可能被归档（0-10；开启重要性演化时按查询时刻计算）",
             "type": "float",
             "slider": {
               "min": 0.0,
-              "max": 1.0,
-              "step": 0.05
+              "max": 10.0,
+              "step": 0.5
             },
-            "default": 0.35
+            "default": 3.0
+          },
+          "memory_ttl_adaptive": {
+            "description": "自适应有效期",
+            "hint": "写入记忆时按「类型基础天数 × 重要性系数 × 强化系数」计算有效期；关闭后不再写有效期，改用旧的按类型硬过期策略",
+            "type": "bool",
+            "default": true
+          },
+          "memory_ttl_base": {
+            "description": "按类型基础有效期（天）",
+            "hint": "每条记忆按类型的基础有效期，单位天，范围 1–365；重要性和访问次数会在此基础上延长。计划/事件可短一些，事实/关系可长一些。",
+            "type": "object",
+            "items": {
+              "plan_days": {
+                "description": "计划·基础天数",
+                "type": "int",
+                "slider": {
+                  "min": 1,
+                  "max": 365,
+                  "step": 1
+                },
+                "default": 2
+              },
+              "episode_days": {
+                "description": "事件·基础天数",
+                "type": "int",
+                "slider": {
+                  "min": 1,
+                  "max": 365,
+                  "step": 1
+                },
+                "default": 7
+              },
+              "preference_days": {
+                "description": "偏好·基础天数",
+                "type": "int",
+                "slider": {
+                  "min": 1,
+                  "max": 365,
+                  "step": 1
+                },
+                "default": 60
+              },
+              "relation_days": {
+                "description": "关系·基础天数",
+                "type": "int",
+                "slider": {
+                  "min": 1,
+                  "max": 365,
+                  "step": 1
+                },
+                "default": 90
+              },
+              "fact_days": {
+                "description": "事实·基础天数",
+                "type": "int",
+                "slider": {
+                  "min": 1,
+                  "max": 365,
+                  "step": 1
+                },
+                "default": 180
+              }
+            }
           },
           "memory_kind_decay": {
             "description": "按类型衰减",
-            "hint": "不同记忆类型的半衰期（天）：计划很快失效，事实长期有效",
+            "hint": "每种记忆的“半衰期”，单位天；数值越小衰减越快。计划 3 天、事实 120 天是常用起点，可按需要调整。",
             "type": "object",
             "items": {
               "plan_half_life_days": {
                 "description": "计划·半衰期",
                 "type": "int",
-                "slider": {"min": 1, "max": 30, "step": 1},
+                "slider": {
+                  "min": 1,
+                  "max": 30,
+                  "step": 1
+                },
                 "default": 3
               },
               "episode_half_life_days": {
                 "description": "事件·半衰期",
                 "type": "int",
-                "slider": {"min": 1, "max": 60, "step": 1},
+                "slider": {
+                  "min": 1,
+                  "max": 60,
+                  "step": 1
+                },
                 "default": 7
               },
               "preference_half_life_days": {
                 "description": "偏好·半衰期",
                 "type": "int",
-                "slider": {"min": 7, "max": 365, "step": 1},
+                "slider": {
+                  "min": 7,
+                  "max": 365,
+                  "step": 1
+                },
                 "default": 60
-              },
-              "fact_half_life_days": {
-                "description": "事实·半衰期",
-                "type": "int",
-                "slider": {"min": 30, "max": 365, "step": 1},
-                "default": 120
               },
               "relation_half_life_days": {
                 "description": "关系·半衰期",
                 "type": "int",
-                "slider": {"min": 30, "max": 365, "step": 1},
+                "slider": {
+                  "min": 30,
+                  "max": 365,
+                  "step": 1
+                },
                 "default": 90
+              },
+              "fact_half_life_days": {
+                "description": "事实·半衰期",
+                "type": "int",
+                "slider": {
+                  "min": 30,
+                  "max": 365,
+                  "step": 1
+                },
+                "default": 120
               }
             }
           }
@@ -764,6 +752,268 @@
               "step": 1
             },
             "default": 45
+          },
+          "embedding_sec": {
+            "description": "向量化超时(秒)",
+            "hint": "单条文本向量化调用的超时时间；远程 embedding 建议 5-15 秒",
+            "type": "float",
+            "slider": {
+              "min": 0.1,
+              "max": 60,
+              "step": 0.1
+            },
+            "default": 8.0
+          },
+          "embedding_write_sec": {
+            "description": "记忆写入向量化超时(秒)",
+            "hint": "后台记忆逐条写入时的向量化超时时间，通常比查询更宽松",
+            "type": "float",
+            "slider": {
+              "min": 0.1,
+              "max": 120,
+              "step": 0.1
+            },
+            "default": 12.0
+          },
+          "recall_deadline_sec": {
+            "description": "自动回忆总时限(秒)",
+            "hint": "单次自动回忆从开始到放弃的最长耗时；超时降级（用已有结果或跳过注入）",
+            "type": "float",
+            "slider": {
+              "min": 0.1,
+              "max": 15,
+              "step": 0.1
+            },
+            "default": 3.0
+          }
+        }
+      },
+      "memory_tuning": {
+        "description": "记忆检索与缓存调优",
+        "hint": "性能/成本/高级调参；一般保持默认即可，修改后保存立即生效",
+        "type": "object",
+        "items": {
+          "recall_k": {
+            "description": "召回数量",
+            "hint": "语义召回候选条数",
+            "type": "int",
+            "slider": {
+              "min": 1,
+              "max": 50,
+              "step": 1
+            },
+            "default": 20
+          },
+          "max_return_results": {
+            "description": "最大返回条数",
+            "hint": "记忆工具单次最多返回多少条",
+            "type": "int",
+            "slider": {
+              "min": 1,
+              "max": 300,
+              "step": 1
+            },
+            "default": 100
+          },
+          "memory_online_scan_limit": {
+            "description": "在线扫描上限",
+            "hint": "自动回忆单次最多扫描多少条最新记忆；调小可降低延迟，但可能漏掉更早的记忆（工具与控制台不受影响）",
+            "type": "int",
+            "slider": {
+              "min": 100,
+              "max": 5000,
+              "step": 100
+            },
+            "default": 900
+          },
+          "memory_min_similarity": {
+            "description": "最低相似度",
+            "hint": "召回结果与问题的相似度低于该值时丢弃，避免注入不相关的记忆",
+            "type": "float",
+            "slider": {
+              "min": 0,
+              "max": 1,
+              "step": 0.05
+            },
+            "default": 0.55
+          },
+          "memory_mmr_enabled": {
+            "description": "卡片去重",
+            "hint": "多张卡片内容重复时做多样性惩罚，避免同一件事占满注入额度",
+            "type": "bool",
+            "default": true
+          },
+          "memory_kind_badge": {
+            "description": "卡片显示类型",
+            "hint": "在注入卡片里显示记忆类型（plan/preference 等），便于模型区分计划与偏好",
+            "type": "bool",
+            "default": true
+          },
+          "memory_entity_boost": {
+            "description": "实体命中加分",
+            "hint": "记忆中的实体出现在当前消息时，提高该条记忆的排序权重",
+            "type": "float",
+            "slider": {
+              "min": 0.0,
+              "max": 0.5,
+              "step": 0.02
+            },
+            "default": 0.1
+          },
+          "memory_lexical_recall": {
+            "description": "关键词召回",
+            "hint": "启用本地关键词（bigram）召回通道，精确词命中时无需调用 embedding，可降低延迟",
+            "type": "bool",
+            "default": true
+          },
+          "memory_embedding_cache_ttl": {
+            "description": "向量缓存时长（秒）",
+            "hint": "相同问题在此时长内复用查询向量，0 表示关闭缓存",
+            "type": "int",
+            "slider": {
+              "min": 0,
+              "max": 3600,
+              "step": 30
+            },
+            "default": 300
+          },
+          "memory_embedding_cache_size": {
+            "description": "向量缓存条数",
+            "hint": "查询向量缓存的最大条目数，0 表示关闭缓存",
+            "type": "int",
+            "slider": {
+              "min": 0,
+              "max": 2048,
+              "step": 64
+            },
+            "default": 256
+          },
+          "memory_recall_cache_ttl_sec": {
+            "description": "回忆缓存时长（秒）",
+            "hint": "同一会话的自动回忆结果在此时长内复用，0 表示关闭缓存",
+            "type": "int",
+            "slider": {
+              "min": 0,
+              "max": 600,
+              "step": 5
+            },
+            "default": 45
+          },
+          "memory_recall_cache_entries": {
+            "description": "回忆缓存条数",
+            "hint": "自动回忆结果缓存的最大条目数，超出后淘汰最久未使用的条目",
+            "type": "int",
+            "slider": {
+              "min": 8,
+              "max": 2048,
+              "step": 8
+            },
+            "default": 256
+          },
+          "memory_dedup_threshold": {
+            "description": "去重阈值",
+            "hint": "相似度达到该值视为重复记忆，直接跳过",
+            "type": "float",
+            "slider": {
+              "min": 0.8,
+              "max": 0.99,
+              "step": 0.01
+            },
+            "default": 0.9
+          },
+          "memory_conflict_threshold": {
+            "description": "冲突阈值",
+            "hint": "相似度处于冲突与去重阈值之间时，两条记忆都保留（不再标记失效）",
+            "type": "float",
+            "slider": {
+              "min": 0.5,
+              "max": 0.89,
+              "step": 0.01
+            },
+            "default": 0.75
+          },
+          "memory_window_gap_minutes": {
+            "description": "对话间隔切窗（分钟）",
+            "hint": "会话空闲超过该时长且已攒 3 条以上未总结消息时兜底总结一次；0 表示关闭。它不依赖下一条消息，是低活跃群的保底",
+            "type": "int",
+            "slider": {
+              "min": 0,
+              "max": 240,
+              "step": 10
+            },
+            "default": 60
+          },
+          "memory_importance_decay": {
+            "description": "重要性随时间演化",
+            "hint": "召回排序与归档判定时按时间衰减重要性（仅查询侧计算，不写库）；关闭后一律使用原始重要性",
+            "type": "bool",
+            "default": true
+          },
+          "memory_importance_decay_rate": {
+            "description": "重要性日衰减率",
+            "hint": "每经过一天，有效重要性按该比例指数衰减；越大遗忘越快",
+            "type": "float",
+            "slider": {
+              "min": 0.0,
+              "max": 0.2,
+              "step": 0.005
+            },
+            "default": 0.01
+          },
+          "memory_importance_decay_floor": {
+            "description": "重要性衰减下限",
+            "hint": "有效重要性最低保留到该值，避免直接归零（0-10）",
+            "type": "float",
+            "slider": {
+              "min": 0.0,
+              "max": 5.0,
+              "step": 0.5
+            },
+            "default": 0.5
+          },
+          "memory_importance_decay_access_window_days": {
+            "description": "近期访问窗口（天）",
+            "hint": "最近多少天内有访问，才按「近期访问」获得抗衰减加成",
+            "type": "int",
+            "slider": {
+              "min": 1,
+              "max": 365,
+              "step": 1
+            },
+            "default": 30
+          },
+          "memory_importance_decay_access_max_count": {
+            "description": "访问次数饱和上限",
+            "hint": "访问次数达到该值后抗衰减收益不再增加",
+            "type": "int",
+            "slider": {
+              "min": 1,
+              "max": 100,
+              "step": 1
+            },
+            "default": 10
+          },
+          "memory_importance_protected_threshold": {
+            "description": "受保护重要性阈值",
+            "hint": "原始重要性达到该值的记忆不随时间衰减（0-10；默认 10.0 表示只保护满分记忆）",
+            "type": "float",
+            "slider": {
+              "min": 5.0,
+              "max": 10.0,
+              "step": 0.5
+            },
+            "default": 10.0
+          },
+          "memory_archive_retention_days": {
+            "description": "归档区保留天数",
+            "hint": "已归档记忆超过多少天后物理删除（不写回收站、不可恢复）；0 表示永久保留",
+            "type": "int",
+            "slider": {
+              "min": 0,
+              "max": 3650,
+              "step": 1
+            },
+            "default": 0
           }
         }
       }

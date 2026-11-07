@@ -8,6 +8,7 @@ numpy 可用时把一批候选拼成矩阵做一次矩阵乘法；不可用时�
 from __future__ import annotations
 
 import json
+import logging
 import math
 from collections.abc import Sequence
 from typing import Any
@@ -16,6 +17,40 @@ try:  # numpy 是 AstrBot/FAISS 的既有依赖，但没有它也要能跑
     import numpy as _np
 except Exception:  # pragma: no cover - 取决于运行环境
     _np = None
+
+logger = logging.getLogger(__name__)
+
+# F26：维度不一致（通常是换了 embedding 模型）以前静默过滤，语义召回声量
+# 变小却没有任何提示。这里只计数 + 同类只告警一次，返回语义仍是 -1.0。
+_dimension_mismatch_count = 0
+_dimension_mismatch_warned = False
+
+
+def dimension_mismatch_count() -> int:
+    """返回本次进程内检测到的维度不一致次数（供测试/诊断使用）。"""
+    return _dimension_mismatch_count
+
+
+def reset_dimension_mismatch_stats() -> None:
+    """重置维度不一致计数与告警状态（测试用）。"""
+    global _dimension_mismatch_count, _dimension_mismatch_warned
+    _dimension_mismatch_count = 0
+    _dimension_mismatch_warned = False
+
+
+def _note_dimension_mismatch(expected: int, actual: int) -> None:
+    """记录一次维度不一致；同一进程内只告警一次，避免刷屏。"""
+    global _dimension_mismatch_count, _dimension_mismatch_warned
+    _dimension_mismatch_count += 1
+    if _dimension_mismatch_warned:
+        return
+    _dimension_mismatch_warned = True
+    logger.warning(
+        "[ActiveReply] 记忆向量维度不一致（查询 %s 维 / 候选 %s 维），"
+        "已跳过比较；更换 embedding 模型后建议重建记忆向量",
+        expected,
+        actual,
+    )
 
 
 def numpy_available() -> bool:
@@ -72,6 +107,9 @@ def cosine_scores(query: Sequence[float], vectors: Sequence[Any]) -> list[float]
         return [-1.0] * len(vectors)
     prepared = [_to_array(item) for item in vectors]
     dim = int(query_array.size)
+    for item in prepared:
+        if item is not None and item.size != dim:
+            _note_dimension_mismatch(dim, int(item.size))
     usable = [
         i for i, item in enumerate(prepared) if item is not None and item.size == dim
     ]
@@ -111,7 +149,10 @@ def _python_cosine(query: Sequence[float], value: Any) -> float:
         right = [float(item) for item in (vector or [])]
     except (TypeError, ValueError):
         return -1.0
-    if not left or len(left) != len(right):
+    if not left or not right:
+        return -1.0
+    if len(left) != len(right):
+        _note_dimension_mismatch(len(left), len(right))
         return -1.0
     dot = norm_left = norm_right = 0.0
     for a, b in zip(left, right, strict=False):
@@ -123,4 +164,9 @@ def _python_cosine(query: Sequence[float], value: Any) -> float:
     return dot / (math.sqrt(norm_left) * math.sqrt(norm_right))
 
 
-__all__ = ["cosine_scores", "numpy_available"]
+__all__ = [
+    "cosine_scores",
+    "dimension_mismatch_count",
+    "numpy_available",
+    "reset_dimension_mismatch_stats",
+]

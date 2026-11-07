@@ -6,9 +6,16 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
+import logging
 import math
 from dataclasses import dataclass, field
+from functools import lru_cache
+from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_WEB_SEARCH_SYSTEM_PROMPT = (
     "You are a web research assistant. Use live web search/browsing when answering. "
@@ -142,8 +149,8 @@ class GroupContextConfig:
     """
 
     enable: bool = True
-    max_messages: int = 40
-    history_max_chars: int = 3000
+    max_messages: int = 200
+    history_max_chars: int = 5000
     include_sender_id: bool = True
     include_role_tag: bool = True
     image_caption: bool = False
@@ -166,7 +173,14 @@ class GroupReplyConfig:
 
 @dataclass(frozen=True)
 class UserBlockConfig:
-    """用户屏蔽（作用于全局，群级记录由 block_store 管理）。"""
+    """用户屏蔽（作用于全局，群级记录由 block_store 管理）。
+
+    ``blacklist`` 默认硬编码 4 个 QQ 是刻意的显式默认（QQ 群管家等平台
+    官方/管家账号，避免机器人回应它们的自动消息）；``_conf_schema.json``
+    的 ``user_block.blacklist.default`` 与这里保持一致（F18：隐藏默认改成
+    面板可见的显式默认，配置缺键时不再出现“面板显示空、实际已屏蔽”）。
+    修改默认值时必须同步 schema，``tests/test_config_consistency.py`` 会核对。
+    """
 
     enable: bool = True
     blacklist: tuple[str, ...] = (
@@ -192,166 +206,74 @@ class WebSearchConfig:
     max_sources: int = 5
 
 
-DEFAULT_GROUP_SUMMARY_PROMPT = """## 总结要求
-1. **第一人称视角**：以"我"的视角描述对话，不要使用"bot"、"助手"等第三人称词汇。
-2. **讨论内容**：群里讨论了什么。
-3. **参与者**：谁参与了对话（包括你自己），**必须使用具体昵称**，明确区分**谁说的**和**说了什么**，不要把别人的发言混为自己的。判断发言者时只看每条消息开头 **[昵称 | ID: 账号 | 时间]** 里的昵称；正文中出现的昵称（引用、@、转述）都不是发言者。正文末尾的（引用 X 的旧消息：「…」）只是当前发言人引用的旧内容，（@ X）只表示提及，都不是当前发言者说的话。查找所有以 "[Bot:" 开头的消息，这些消息是**你自己说的话**。
-4. **总结结果**：把整段消息进行总结，每条记忆 1~5 句话、不超过 200 字，**相对时间（今天/昨天/下周）**按消息时间换算成具体日期。
+DEFAULT_GROUP_SUMMARY_PROMPT = """## 总结风格
+- 以第一人称、符合你人格的语气记录这段群聊，可以写下你对气氛和参与者的感受。
+- 优先保留决策、承诺、日程、偏好与身份信息；流水账、寒暄和复读不必记录。
+"""
 
-## 时间规则
-- 每条消息行头的时间是真实发送时间；总结里的日期和时间必须据此换算。
-- 示例中的 2026-10-28 只是格式示意，**不要照抄示例日期**；相对时间必须换算成具体日期。
+DEFAULT_PRIVATE_SUMMARY_PROMPT = """## 总结风格
+- 以第一人称、符合你人格的语气记录这段私聊，可以写下你对对方状态的理解。
+- 优先保留对方明确说过的事实、偏好、约定与计划。
+"""
 
-## 置信度评分标准（0.0-1.0）
-"置信度"表示这段对话作为长期记忆的价值，不是事实可信度，也不是对某一条消息打分。
-**先判断档位，再在档位区间内取值；默认从低档起评，只有同时满足全部条件才进入高档。**
-- 0.90-1.00：重要群体决策。只有群规制定、全员投票结果、正式承诺、涉及金钱/安全/重大日程的决定，或对群体有长期约束的计划，才可以进入本档；并且至少 3 名成员实质参与、有具体可执行的安排。普通约饭、约玩、临时改时间最高 0.60。
-- 0.70-0.80：有价值的讨论。多人参与且有明确结论，但影响限于短期或个别成员。
-- 0.50-0.60：日常讨论。普通约饭、约玩、临时安排、一般信息交流；即使形成了约定，只要是一次性、临时性的日常安排，就落在本档，**最高 0.60**。有明确时间、地点或参与者的安排取 0.60；其他日常交流取 0.50-0.55。
-- 0.30-0.40：简单闲聊。少数人参与、临时状态、当下情绪、玩笑、反讽、推测、传闻。
-- 0.00-0.20：没有信息量的灌水。单人刷屏、一次性问答、寒暄、表情、复读。
-
-### 防虚高约束
-- 大多数群聊片段应落在 0.30-0.60；0.70 以上只给少数真正有结论、有长期价值的讨论。
-- 不要因为"总结写得完整""消息条数多""有人 @ 或引用"而提高评分。
-- 无法确认多人达成共识，或只是临时起意的吃饭、看电影、打游戏、生日祝福、日常吐槽时，一律不得高于 0.60。
-- 反例：三人临时约好今晚七点吃火锅 → 0.60（daily），不是 0.90。
-
-## 字段规则
-- confidence 必须落在上面某个档位区间内，保留两位小数；
-- confidence_tier 必须从 major / discussion / daily / chatter / spam 中选择，并与 confidence 所在档位一致；
-- importance 是同一口径的长期价值评分，通常等于 confidence；
-- topics 最多 5 个，participants 最多 10 个；
-- participants 和 role_ids 只填片段中出现过的用户；不确定就留空；
-- scope：个人偏好/身份/习惯用 global；只和这个群有关的事用 group；
-- quotes 至少 1 条，必须来自当前消息正文并能逐字找到；不要摘录“引用旧消息”里的内容，否则整条记忆会被丢弃。
-
-## 输出格式
-只输出一个 JSON 对象，不要数组、解释或代码块：
-{
-  "summary": "整段对话的总结",
-  "topics": ["主题1", "主题2"],
-  "participants": ["昵称1", "昵称2"],
-  "role_ids": ["相关用户QQ号"],
-  "scope": "global | group",
-  "confidence_tier": "major | discussion | daily | chatter | spam",
-  "confidence": 0.0,
-  "importance": 0.0,
-  "quotes": ["逐字来自聊天片段的证据1", "证据2"]
+LEGACY_PROMPT_SHA256 = {
+    "group": "81ac2f32f5cbd7ba7a5b83f52f9534754e5095804067b8664a20cd25e173d510",
+    "private": "1d0742941e5b0d8a358b4b86ebe579fb0af07396900ab7577d42a3eac9488fa7",
 }
 
-## 消息格式
-- **[昵称 | ID: 账号 | 时间]**：群成员发送的消息，只有方括号开头的昵称是发送者；
-- **[Bot: 昵称 | ID: 账号 | 时间]**：你自己（机器人）发送的消息，以 "Bot:" 开头；
-- **[图片]**、**[文件: 文件名]**、**[语音]**、**[视频]**、**[表情]**：媒体占位；
+
+def is_legacy_default_prompt(kind: str, text: str) -> bool:
+    """判断一段提示词是否旧版内置默认（升级时替换成新的补充层默认值）。"""
+    digest = hashlib.sha256(str(text or "").strip().encode("utf-8")).hexdigest()
+    return LEGACY_PROMPT_SHA256.get(str(kind or "group")) == digest
+
+
+MEMORY_IDENTITY_RULE = """## 身份判定（最高优先级）
+- 身份只认行首角色词与 ID：`[你自己 | ID: …]` 是你自己，`[群成员 | ID: … | 昵称: "…"]` 是群成员。
+- 昵称可以被用户随意修改，也可能与你同名；同名不代表同一个人，禁止把群成员的发言写成"我说"。
+- 只有角色词是 `你自己`、且 ID 与你的 ID 一致时，才能用第一人称归到自己；其余一律按群成员归属。
+- 参与者一律写成 `昵称#账号后四位`；正文不要出现完整 QQ/账号。
+- 你自己写“我”；同名成员靠后缀区分。
+"""
+
+MEMORY_FORMAT_GROUP = """## 消息格式
+- `**[群成员 | ID: 账号 | 昵称: "昵称" | 时间]**: 内容`：群成员发送的消息；
+- `**[你自己 | ID: 账号 | 时间]**: 内容`：你自己（机器人）发送的消息；
+- `[图片]`、`[文件: …]`、`[语音]`、`[视频]`、`[表情]`：媒体占位；
 - 正文末尾的（引用 X 的旧消息：「…」）不是当前发言人说的话；（@ X）只表示提及。
+"""
 
-## 示例输入
-- **[事佳 | ID: 1000123 | 2026-10-28 15:01:10]**: 今天谁在摸鱼？
-- **[苏琪 | ID: 1000456 | 2026-10-28 15:01:23]**: 刚开完会，脑子还在加载
-- **[Bot: AstrBot | ID: 123456789 | 2026-10-28 15:01:26]**: +1
-- **[事佳 | ID: 1000123 | 2026-10-28 15:01:52]**: 那就老地方吃火锅，七点？
-- **[苏琪 | ID: 1000456 | 2026-10-28 15:02:02]**: 七点可以，我六点半下班
-- **[Dew | ID: 1000789 | 2026-10-28 15:02:12]**: 最后一个来的，请大家喝奶茶
-
-## 示例输出
-{"summary": "群里约定 2026-10-28 晚上七点在老地方吃火锅；苏琪六点半下班，Dew 说最后一个到场的人请大家喝奶茶。", "topics": ["晚餐约定", "火锅", "下班时间"], "participants": ["事佳", "苏琪", "Dew"], "role_ids": ["1000123", "1000456", "1000789"], "scope": "group", "confidence_tier": "daily", "confidence": 0.60, "importance": 0.60, "quotes": ["那就老地方吃火锅，七点？", "七点可以，我六点半下班", "最后一个来的，请大家喝奶茶"]}
-
-聊天片段：
-{messages}"""
-
-DEFAULT_PRIVATE_SUMMARY_PROMPT = """## 总结要求
-1. **第一人称视角**：以"我"的视角描述私聊对话，不要使用"bot"、"助手"等第三人称词汇。
-2. **聊天内容**：你们聊了什么。
-3. **参与者**：只涉及你和对方，**必须使用具体昵称**，明确区分**谁说的**和**说了什么**。判断发言者时只看每条消息开头 **[昵称 | ID: 账号 | 时间]** 里的昵称；正文中出现的昵称（引用、@、转述）都不是发言者。正文末尾的（引用 X 的旧消息：「…」）只是当前发言人引用的旧内容，（@ X）只表示提及，都不是当前发言者说的话。查找所有以 "[Bot:" 开头的消息，这些消息是**你自己说的话**。
-4. **总结结果**：把整段消息进行总结，每条记忆 1~5 句话、不超过 200 字，**相对时间（今天/昨天/下周）**按消息时间换算成具体日期。
-
-## 时间规则
-- 每条消息行头的时间是真实发送时间；总结里的日期和时间必须据此换算。
-- 示例中的 2026-10-28 只是格式示意，**不要照抄示例日期**；相对时间必须换算成具体日期。
-
-## 置信度评分标准（0.0-1.0）
-"置信度"表示这段对话作为长期记忆的价值，不是事实可信度，也不是对某一条消息打分。
-**先判断档位，再在档位区间内取值；默认从低档起评。**
-- 0.90-1.00：正式约定、明确的长期计划或关键个人信息，并且已经确认；普通约饭、约玩、临时看电影最高 0.60。
-- 0.70-0.80：有价值的交流，有明确结论，但影响限于短期。
-- 0.50-0.60：日常聊天、一般信息、临时安排；普通约饭、约玩、一次性计划最高 0.60。有明确时间、地点的安排取 0.60；其他日常聊天取 0.50-0.55。
-- 0.30-0.40：闲聊、临时状态、当下情绪、玩笑、反讽、推测。
-- 0.00-0.20：寒暄、表情、复读、没有信息量。
-
-### 防虚高约束
-- 大多数私聊片段应落在 0.30-0.60；0.70 以上只给真正有长期价值的交流。
-- 不要因为"总结写得完整""消息条数多"而提高评分。
-- 临时起意的吃饭、看电影、打游戏、普通祝福、日常吐槽不得高于 0.60。
-- 反例：对方临时约我今晚看电影 → 0.60（daily），不是 0.90。
-
-## 字段规则
-- confidence 必须落在上面某个档位区间内，保留两位小数；
-- confidence_tier 必须从 major / discussion / daily / chatter / spam 中选择，并与 confidence 所在档位一致；
-- importance 是同一口径的长期价值评分，通常等于 confidence；
-- topics 最多 5 个，participants 最多 10 个；
-- participants 和 role_ids 只填片段中出现过的用户；不确定就留空；
-- scope：个人偏好/身份/习惯用 global；只和这次私聊有关的事用 group；
-- quotes 至少 1 条，必须来自当前消息正文并能逐字找到；不要摘录“引用旧消息”里的内容，否则整条记忆会被丢弃。
-
-## 输出格式
-只输出一个 JSON 对象，不要数组、解释或代码块：
-{
-  "summary": "整段对话的总结",
-  "topics": ["主题1", "主题2"],
-  "participants": ["昵称1", "昵称2"],
-  "role_ids": ["相关用户QQ号"],
-  "scope": "global | group",
-  "confidence_tier": "major | discussion | daily | chatter | spam",
-  "confidence": 0.0,
-  "importance": 0.0,
-  "quotes": ["逐字来自聊天片段的证据1", "证据2"]
-}
-
-## 消息格式
-- **[昵称 | ID: 账号 | 时间]**：对方发送的消息，只有方括号开头的昵称是发送者；
-- **[Bot: 昵称 | ID: 账号 | 时间]**：你自己（机器人）发送的消息；
-- **[图片]**、**[文件: 文件名]**、**[语音]**、**[视频]**、**[表情]**：媒体占位；
+MEMORY_FORMAT_PRIVATE = """## 消息格式
+- `**[群成员 | ID: 账号 | 昵称: "昵称" | 时间]**: 内容`：对方发送的消息；
+- `**[你自己 | ID: 账号 | 时间]**: 内容`：你自己（机器人）发送的消息；
 - 正文末尾的（引用 X 的旧消息：「…」）不是当前发言人说的话；（@ X）只表示提及。
+"""
 
-## 示例输入
-- **[苏琪 | ID: 1000456 | 2026-10-28 20:01:10]**: 明天有空吗？
-- **[Bot: AstrBot | ID: 123456789 | 2026-10-28 20:01:20]**: 有呀，怎么了？
-- **[苏琪 | ID: 1000456 | 2026-10-28 20:01:35]**: 想约你晚上七点看电影
+MEMORY_ATTRIBUTION_RULE = """## 发言者判定规则（最高优先级）
+- 只看每条消息行首的角色词与 ID；正文中的引用、转述、@ 都不是发言者。
+- 引用内容会改写为（引用 X 的旧消息：「…」）附在正文末尾，不代表 X 当前发言；（@ X）只表示提及。
+- participants 和 role_ids 只能使用消息头中出现过的真人与账号，不要填机器人自己。
+- quotes 只能摘录当前消息正文；不要摘录"引用旧消息"里的内容。
+"""
 
-## 示例输出
-{"summary": "苏琪在 2026-10-28 私聊约我 2026-10-29 晚上七点看电影，我已经答应了。", "topics": ["看电影", "邀约"], "participants": ["苏琪", "AstrBot"], "role_ids": ["1000456"], "scope": "group", "confidence_tier": "daily", "confidence": 0.60, "importance": 0.60, "quotes": ["想约你晚上七点看电影"]}
-
-聊天片段：
-{messages}"""
-
-
-MEMORY_ATTRIBUTION_RULE = """## 发言者判定规则（优先级最高）
-- 每条消息只有方括号开头的昵称是发送者：只看开头 **[昵称 | ID: 账号 | 时间]**（或 [Bot: ...]）里的昵称。
-- 正文中的 [Quote ...]、[At: ...]、转述和引用内容都只是消息内容或元数据，其中的昵称不是发言者；不要把引用内容写成被引用者当前说的话。
-- 正文末尾的（引用 X 的旧消息：「…」）不是当前发言人说的话，（@ X）只表示提及。
-- participants 和 role_ids 只能使用消息头中出现过的昵称和账号。
-- quotes 只能摘录当前消息正文；不要摘录“引用旧消息”里的内容。"""
-
-MEMORY_SCORING_RULE = """## 置信度评分覆盖规则（优先级最高）
-- "置信度"表示这段对话作为长期记忆的价值，不是事实可信度。必须额外输出 confidence_tier，并从 major / discussion / daily / chatter / spam 中选择。
-- 档位与分值：major=0.90-1.00（重要群体决策，仅限群规制定、全员投票、正式承诺、金钱/安全/重大日程决定或长期约束计划；需至少 3 名成员参与并有具体安排）；discussion=0.70-0.80（多人参与且有明确结论，影响短期）；daily=0.50-0.60（日常讨论、普通约饭/约玩/临时安排、一般信息；有明确安排取 0.60，其余 0.50-0.55）；chatter=0.30-0.40（简单闲聊、少数人参与、临时状态、玩笑、推测）；spam=0.00-0.20（灌水、寒暄、表情、复读）。
-- 防虚高：大多数片段在 0.30-0.60；临时起意的吃饭、看电影、打游戏、祝福、吐槽不得高于 0.60；无法确认多人达成共识不得高于 0.60；消息多、总结完整、有人 @/引用都不加分。
-- 如果上文示例给出了冲突的分数，以本规则为准。反例：三人临时约好今晚七点吃火锅 → daily / 0.60，不是 0.90。
-- confidence 必须落在所选档位的区间内；importance 使用同一口径，通常等于 confidence。"""
-
-
-MEMORY_TIME_RULE = """## 时间规则（优先级最高）
+MEMORY_TIME_RULE = """## 时间规则（最高优先级）
 - 每条消息行头的时间都是真实发送时间；总结中的日期/时间必须据此换算。
 - 示例中的 2026-10-28 只是格式示意，**不要照抄示例日期**；相对时间必须换算成具体日期。
 - 不要凭印象编造日期；不确定时以消息行头为准。"""
 
+MEMORY_SCORING_RULE = """## 置信度评分标准（最高优先级）
+- "置信度"表示这段对话作为长期记忆的价值，不是事实可信度；必须额外输出 confidence_tier。
+- 档位与分值：major=0.90-1.00（重要群体决策，仅限群规制定、全员投票、正式承诺、金钱/安全/重大日程或长期约束计划；需至少 3 名真人参与并有具体安排）；discussion=0.70-0.80（多人参与且有明确结论，影响短期）；daily=0.50-0.60（日常讨论、普通约饭/约玩/临时安排、一般信息；有明确安排取 0.60，其余 0.50-0.55）；chatter=0.30-0.40（简单闲聊、少数人参与、临时状态、玩笑、推测）；spam=0.00-0.20（灌水、寒暄、表情、复读）。
+- 防虚高：大多数片段在 0.30-0.60；临时起意的吃饭、看电影、打游戏、祝福、吐槽不得高于 0.60；无法确认多人达成共识不得高于 0.60；消息多、总结完整、有人 @/引用都不加分。
+- confidence 必须落在所选档位的区间内，保留两位小数。
+"""
 
 MEMORY_ATOM_CONTRACT = """## 输出契约（最终，覆盖上文所有输出格式说明）
-把这段对话拆成 1-{max_items} 条**原子记忆**，每条只表达一个事实、决定、偏好、计划或关系。
+把这段对话整理成 1-{max_items} 条记忆：**第 1 条优先 episode**（150–240 字，保留时间、人物、因果与气氛），其余为原子事实（40–80 字，每条自包含）。
 只输出一个 JSON 对象，不要数组、解释或代码块：
 {"memories": [
-  {"content": "一句话，不超过 120 字，第一人称视角",
+  {"content": "第 1 条 episode 150–240 字；原子事实 40–80 字；第一人称视角",
+   "brief": "不超过 60 字，供注入卡片使用的摘要",
    "kind": "fact|preference|plan|episode|relation",
    "entities": ["人名/地点/主题，最多 8 个"],
    "topics": ["主题"],
@@ -360,64 +282,149 @@ MEMORY_ATOM_CONTRACT = """## 输出契约（最终，覆盖上文所有输出格
    "scope": "global|group",
    "confidence_tier": "major|discussion|daily|chatter|spam",
    "confidence": 0.0,
-   "importance": 0.0,
    "valid_until": "YYYY-MM-DD 或空字符串",
    "quotes": ["逐字来自聊天片段的证据"]}
 ]}
 规则：
+- 第 1 条把“发生了什么、谁说了什么、气氛如何”写成可读的 episode；后续只放可独立检索的事实/决定/偏好/计划/关系，不要把 episode 拆碎。
 - kind：约定/行程=plan，长期口味或习惯=preference，今天发生的事=episode，群规/身份/长期事实=fact，谁和谁的关系=relation。
+- scope 只在「自动」作用域下参考：个人偏好/身份/习惯用 global，只与这个群有关的事用 group。
+- participants 是显示名，身份以 role_ids 为准；只填片段中出现过的真人。
+- 正文提到参与者时用 `昵称#后四位`，不要写完整 QQ/账号。
 - 没有值得长期保留的内容时输出 {"memories": []}，不要为了凑数编造。
 - quotes 必须逐字来自对话正文，至少 1 条；证据不足的条目会被整条丢弃。
 - 相对时间按消息行头换算成具体日期；valid_until 只用于 plan 类，其他类型留空字符串。
 禁止输出 {"summary": ...} 单对象格式。"""
 
+MEMORY_EPISODE_CONTRACT = """## 输出契约（第一步：只写 episode）
+只输出一个 JSON 对象，不要数组、解释或代码块：
+{"memories": [
+  {"content": "150–180 字，第一人称，保留时间/人物/因果/气氛；最多 200 字，超过会被丢弃",
+   "brief": "不超过 40 字，供注入卡片",
+   "participants": ["昵称"],
+   "role_ids": ["QQ号"],
+   "scope": "global|group",
+   "confidence_tier": "major|discussion|daily|chatter|spam",
+   "confidence": 0.0,
+   "quotes": ["逐字来自聊天片段的证据，至少 1 条"]}
+]}
+规则：
+- 只输出 1 条 episode；不要把可独立检索的事实拆进 episode 正文。
+- content 必须 ≤200 字；宁可省略细节，也不要写长；超过 200 字会被解析器丢弃。
+- 正文提到参与者时用 `昵称#后四位`，不要写完整 QQ/账号。
+- 没有值得保留的内容时输出 {"memories": []}，不要编造。
+- 禁止输出 {"summary": ...} 单对象格式。"""
 
-def ensure_memory_prompt_rules(
-    prompt: str, *, multi_atom: bool = True, max_items: int = 3
-) -> str:
-    """给旧版或自定义记忆提示词补齐归属、评分与输出契约。
+MEMORY_ATOMS_CONTRACT = """## 输出契约（第二步：只写原子事实）
+只输出一个 JSON 对象，不要数组、解释或代码块：
+{"memories": [
+  {"content": "40–80 字，一条只表达一个事实/决定/偏好/计划/关系，自包含",
+   "brief": "不超过 60 字，供注入卡片",
+   "kind": "fact|preference|plan|relation",
+   "entities": ["人名/地点/主题，最多 8 个"],
+   "participants": ["昵称"],
+   "role_ids": ["QQ号"],
+   "scope": "global|group",
+   "confidence_tier": "major|discussion|daily|chatter|spam",
+   "confidence": 0.0,
+   "valid_until": "YYYY-MM-DD 或空字符串",
+   "quotes": ["逐字来自聊天片段的证据，至少 1 条"]}
+]}
+规则：
+- 最多输出 {max_items} 条；没有独立事实就输出 {"memories": []}，不要为凑数重复 episode。
+- 不要输出 kind=episode；episode 已由第一步写入。
+- 正文提到参与者时用 `昵称#后四位`，不要写完整 QQ/账号。
+- quotes 至少 1 条，证据不足的条目会被丢弃。
+- 禁止输出 {"summary": ...} 单对象格式。"""
 
-    只追加缺失的规则，不覆盖用户自定义内容；插入位置在 {messages}
-    占位符之前，确保规则出现在聊天片段前面。旧配置里保存的默认提示词
-    含高分示例，因此这里会明确声明覆盖规则优先。``multi_atom`` 为真时
-    追加原子记忆输出契约（``memory_prompt_contract`` 可关闭）。
+SINGLE_MEMORY_CONTRACT = """## 输出契约（最终，覆盖上文所有输出格式说明）
+只输出一个 JSON 对象，不要数组、解释或代码块：
+{"summary": "整段对话的总结，第一人称，不超过 240 字",
+ "brief": "不超过 60 字，供注入卡片使用的摘要",
+ "topics": ["主题"],
+ "participants": ["昵称"],
+ "role_ids": ["QQ号"],
+ "scope": "global|group",
+ "confidence_tier": "major|discussion|daily|chatter|spam",
+ "confidence": 0.0,
+ "valid_until": "YYYY-MM-DD 或空字符串",
+ "quotes": ["逐字来自聊天片段的证据"]}
+规则：没有值得保留的内容时输出 {"summary": ""}；quotes 至少 1 条，证据不足整条丢弃。"""
+
+
+def build_memory_prompt_parts(
+    prompt: str,
+    *,
+    kind: str = "group",
+    multi_atom: bool = True,
+    max_items: int = 3,
+    contract_override: str = "",
+) -> dict[str, str]:
+    """把用户补充层与系统固定层拼成最终提示词。
+
+    Args:
+        prompt: 用户在配置里写的补充要求（可为空，空时用内置默认）。
+        kind: ``group`` 或 ``private``，决定消息格式说明。
+        multi_atom: 是否使用多条原子记忆的输出契约。
+        max_items: 单次输出上限。
+
+    Returns:
+        ``{"supplement": ..., "rules": ..., "template": ...}``；``template``
+        里保留 ``{messages}`` 占位符，由调用方替换成当前时间与聊天片段。
     """
-    text = str(prompt or "").strip()
-    if not text:
-        return text
-    needs_scoring = "confidence_tier" not in text
-    if needs_scoring and '## 置信度评分标准 "importance"（0.0-1.0）' in text:
-        # 旧默认示例里的 0.90 / 0.80 是评分虚高的直接锚点，先替换成日常档示例。
-        text = text.replace(
-            '"confidence": 0.90, "importance": 0.80',
-            '"confidence_tier": "daily", "confidence": 0.60, "importance": 0.60',
-        )
-    additions: list[str] = []
-    if needs_scoring:
-        additions.append(MEMORY_SCORING_RULE)
-    if "只有方括号开头的昵称是发送者" not in text:
-        additions.append(MEMORY_ATTRIBUTION_RULE)
-    if "不要照抄示例日期" not in text:
-        additions.append(MEMORY_TIME_RULE)
-    if multi_atom and '"memories"' not in text:
-        limit = max(1, min(5, int(max_items)))
-        additions.append(MEMORY_ATOM_CONTRACT.replace("{max_items}", str(limit)))
-    if not additions:
-        return text
-    block = "\n\n".join(additions)
-    marker = "{messages}"
-    if marker not in text:
-        return f"{text}\n\n{block}"
-    head, tail = text.rsplit(marker, 1)
-    head = head.rstrip()
-    for heading in ("聊天片段：", "聊天片段:"):
-        if head.endswith(heading):
-            head = head[: -len(heading)].rstrip()
-            break
-    return f"{head}\n\n{block}\n\n聊天片段：\n{marker}{tail}"
+    private = str(kind or "").strip().lower() == "private"
+    default = (
+        DEFAULT_PRIVATE_SUMMARY_PROMPT if private else DEFAULT_GROUP_SUMMARY_PROMPT
+    )
+    supplement = str(prompt or "").strip()
+    if not supplement or is_legacy_default_prompt(
+        "private" if private else "group", supplement
+    ):
+        supplement = default.strip()
+    supplement = supplement.replace("{messages}", "").strip()
+    contract = str(contract_override or "").strip()
+    if not contract:
+        contract = MEMORY_ATOM_CONTRACT if multi_atom else SINGLE_MEMORY_CONTRACT
+    contract = contract.replace("{max_items}", str(max(1, min(5, int(max_items)))))
+    format_rule = MEMORY_FORMAT_PRIVATE if private else MEMORY_FORMAT_GROUP
+    blocks = [
+        "## 你的补充要求",
+        supplement,
+        MEMORY_IDENTITY_RULE,
+        format_rule,
+        MEMORY_ATTRIBUTION_RULE,
+        MEMORY_TIME_RULE,
+        MEMORY_SCORING_RULE,
+        contract,
+        "## 聊天片段",
+        "{messages}",
+    ]
+    return {
+        "supplement": supplement,
+        "rules": "\n\n".join(blocks[2:-2]),
+        "template": "\n\n".join(blocks),
+    }
 
 
-PROMPT_VERSION = 2
+def compose_memory_prompt(
+    prompt: str,
+    *,
+    kind: str = "group",
+    multi_atom: bool = True,
+    max_items: int = 3,
+    contract_override: str = "",
+) -> str:
+    """返回最终提示词模板（含 ``{messages}`` 占位符）。"""
+    return build_memory_prompt_parts(
+        prompt,
+        kind=kind,
+        multi_atom=multi_atom,
+        max_items=max_items,
+        contract_override=contract_override,
+    )["template"]
+
+
+PROMPT_VERSION = 5
 """记忆抽取提示词的契约版本；写入记忆元数据用于追溯。"""
 
 
@@ -447,6 +454,29 @@ class KindDecayConfig:
 
 
 @dataclass(frozen=True)
+class KindTtlConfig:
+    """按记忆类型区分的自适应 TTL 基准天数（r3.3）。
+
+    写入时按 ``base × (0.5 + importance/10) × 强化系数`` 计算有效期；计划类很快
+    过期，事实类长期有效；``0`` 表示该类型永不过期（不写 valid_until）。
+    """
+
+    plan: int = 2
+    episode: int = 7
+    preference: int = 60
+    relation: int = 90
+    fact: int = 180
+
+    def base_days(self, kind: str) -> int:
+        """返回该类型的基础有效期天数；未知类型按 fact，0 表示永不过期。"""
+        value = getattr(self, str(kind or "fact"), self.fact)
+        try:
+            return max(0, int(value or 0))
+        except (TypeError, ValueError):
+            return 180
+
+
+@dataclass(frozen=True)
 class MemoryRagConfig:
     """长期记忆检索及自动写入/抽取策略。
 
@@ -465,7 +495,7 @@ class MemoryRagConfig:
     batch_messages: int = 50
     auto_extract_interval_minutes: int = 10
     private_extract_every_n: int = 10
-    extract_max_chars: int = 1500
+    extract_max_chars: int = 6000
     window_gap_minutes: int = 60
     group_prompt: str = DEFAULT_GROUP_SUMMARY_PROMPT
     private_prompt: str = DEFAULT_PRIVATE_SUMMARY_PROMPT
@@ -477,7 +507,6 @@ class MemoryRagConfig:
     cross_group_personal: bool = True
     cross_group_private: bool = False
     # 读取与生命周期
-    decay_half_life_days: int = 10
     inject_max_chars: int = 600
     inject_max_items: int = 5
     multi_atom: bool = True
@@ -492,14 +521,33 @@ class MemoryRagConfig:
     lexical_recall: bool = True
     embedding_cache_ttl: int = 300
     embedding_cache_size: int = 256
+    recall_cache_ttl: int = 45
+    recall_cache_entries: int = 256
     consolidation_enable: bool = True
     consolidation_interval_days: int = 7
+    consolidation_archive_only: bool = True
     archive_enable: bool = True
-    archive_days: int = 15
-    archive_importance: float = 0.35
-    # 旧字段保留，兼容早期配置读取
-    auto_extract_every_n: int = 10
-    auto_extract_window: int = 20
+    archive_days: int = 30
+    archive_importance: float = 3.0
+    trash_retention_days: int = 30
+    # 遗忘机制（r3.3）：自适应 TTL、重要性随时间演化与归档区清理
+    ttl_adaptive_enable: bool = True
+    ttl_base: KindTtlConfig = field(default_factory=KindTtlConfig)
+    # 预留：当前写入时 access_count=0，强化系数恒 1.0；未在 schema 暴露，
+    # 避免界面出现无效配置项（r3.3m）。
+    ttl_reinforce_step: float = 0.1
+    ttl_reinforce_cap: float = 0.5
+    importance_decay_enable: bool = True
+    importance_decay_rate: float = 0.01
+    importance_decay_floor: float = 0.5
+    importance_decay_access_window_days: int = 30
+    importance_decay_access_max_count: int = 10
+    importance_protected_threshold: float = 10.0
+    archive_retention_days: int = 0
+    # 抽取质量（r3.3）
+    extract_min_substance_chars: int = 8
+    extract_skip_chatter: bool = True
+    max_participants: int = 8
 
 
 @dataclass(frozen=True)
@@ -509,6 +557,9 @@ class RuntimeConfig:
     max_origins: int = 500
     image_caption_timeout: float = 45.0
     model_choice_timeout: float = 45.0
+    embedding_timeout: float = 8.0
+    embedding_write_timeout: float = 12.0
+    recall_deadline: float = 3.0
 
 
 @dataclass(frozen=True)
@@ -517,7 +568,7 @@ class PluginConfig:
 
     各字段对应一个不可变配置区块，避免业务逻辑直接操作原始 JSON 字典。
     ``default_factory`` 为每个配置对象分别创建缺省子配置，避免实例之间共享状态。
-    ``history_enabled``、``react_enabled`` 等属性是底层开关组合出的便捷视图，
+    ``react_enabled`` 等属性是底层开关组合出的便捷视图，
     不会在解析过程中额外存储第二份可变状态。
     """
 
@@ -530,12 +581,6 @@ class PluginConfig:
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
 
     # ---- 派生属性 ------------------------------------------------------- #
-    @property
-    def history_enabled(self) -> bool:
-        """返回群聊历史记录与注入功能的总开关状态。"""
-        # 兼容调用方使用 history_enabled 命名访问上下文增强总开关。
-        return self.group_context.enable
-
     @property
     def react_enabled(self) -> bool:
         """群聊回复增强整块是否生效（由 React Pattern 总开关控制）。"""
@@ -595,8 +640,8 @@ def parse_plugin_config(raw: dict[str, Any] | None) -> PluginConfig:
     ctx_raw = _section(raw, "group_context_enhancement")
     group_context = GroupContextConfig(
         enable=_to_bool(ctx_raw.get("enable"), True),
-        max_messages=_to_int(ctx_raw.get("max_messages"), 40, 10, 1000),
-        history_max_chars=_to_int(ctx_raw.get("history_max_chars"), 3000, 500, 20000),
+        max_messages=_to_int(ctx_raw.get("max_messages"), 200, 10, 1000),
+        history_max_chars=_to_int(ctx_raw.get("history_max_chars"), 5000, 500, 20000),
         include_sender_id=_to_bool(ctx_raw.get("include_sender_id"), True),
         include_role_tag=_to_bool(ctx_raw.get("include_role_tag"), True),
         image_caption=_to_bool(ctx_raw.get("image_caption"), False),
@@ -648,13 +693,23 @@ def parse_plugin_config(raw: dict[str, Any] | None) -> PluginConfig:
     )
 
     mem_raw = _section(raw, "memory_rag")
-    scope_raw = _to_str(mem_raw.get("auto_extract_scope")) or "group_first"
-    if scope_raw not in {"group_first", "global", "group"}:
-        scope_raw = "group_first"
     control_raw = _section(mem_raw, "memory_control") or mem_raw
     gen_raw = _section(mem_raw, "memory_generation") or mem_raw
     inj_raw = _section(mem_raw, "memory_injection") or mem_raw
     eval_raw = _section(mem_raw, "memory_evaluation") or mem_raw
+    # r3.3n：性能/缓存/高级调参已从「记忆 RAG」迁移到「调用配置 → 记忆检索与缓存调优」；
+    # 这里优先读新位置，并回退旧的 memory_rag/memory_injection 等键，保证旧配置兼容。
+    tuned_raw = _section(_section(raw, "runtime"), "memory_tuning") or {}
+
+    def _tuned(name: str, *sources: Any) -> Any:
+        """按「新位置 → 传入的旧位置」顺序取配置值，全部缺失返回 None。"""
+        if isinstance(tuned_raw, dict) and name in tuned_raw:
+            return tuned_raw.get(name)
+        for source in sources:
+            if isinstance(source, dict) and name in source:
+                return source.get(name)
+        return None
+
     scope_value = str(
         gen_raw.get("auto_extract_scope")
         or mem_raw.get("auto_extract_scope")
@@ -667,6 +722,10 @@ def parse_plugin_config(raw: dict[str, Any] | None) -> PluginConfig:
     kind_decay_raw = eval_raw.get("memory_kind_decay")
     if not isinstance(kind_decay_raw, dict):
         kind_decay_raw = {}
+    # r3.3：自适应 TTL 基准也是嵌套对象，同样先收敛成 dict 再读。
+    ttl_base_raw = eval_raw.get("memory_ttl_base")
+    if not isinstance(ttl_base_raw, dict):
+        ttl_base_raw = {}
     memory_rag = MemoryRagConfig(
         enable=_to_bool(control_raw.get("enable", mem_raw.get("enable")), False),
         cross_group_personal=_to_bool(
@@ -689,12 +748,9 @@ def parse_plugin_config(raw: dict[str, Any] | None) -> PluginConfig:
                 "auto_extract_provider_id", mem_raw.get("auto_extract_provider_id")
             )
         ),
-        recall_k=_to_int(inj_raw.get("recall_k", mem_raw.get("recall_k")), 20, 1, 50),
+        recall_k=_to_int(_tuned("recall_k", inj_raw, mem_raw), 20, 1, 50),
         max_return_results=_to_int(
-            inj_raw.get("max_return_results", mem_raw.get("max_return_results")),
-            100,
-            1,
-            300,
+            _tuned("max_return_results", inj_raw, mem_raw), 100, 1, 300
         ),
         auto_extract_enable=_to_bool(
             gen_raw.get("auto_extract_enable", mem_raw.get("auto_extract_enable")), True
@@ -731,30 +787,18 @@ def parse_plugin_config(raw: dict[str, Any] | None) -> PluginConfig:
             gen_raw.get(
                 "memory_extract_max_chars", mem_raw.get("memory_extract_max_chars")
             ),
-            1500,
-            100,
             6000,
+            500,
+            10000,
         ),
         window_gap_minutes=_to_int(
-            gen_raw.get(
-                "memory_window_gap_minutes", mem_raw.get("memory_window_gap_minutes")
-            ),
-            60,
-            5,
-            240,
+            _tuned("memory_window_gap_minutes", gen_raw, mem_raw), 60, 0, 240
         ),
         dedup_threshold=_to_float(
-            gen_raw.get(
-                "memory_dedup_threshold", mem_raw.get("memory_dedup_threshold")
-            ),
-            0.90,
-            0.80,
-            0.99,
+            _tuned("memory_dedup_threshold", gen_raw, mem_raw), 0.90, 0.80, 0.99
         ),
         conflict_threshold=_to_float(
-            gen_raw.get(
-                "memory_conflict_threshold", mem_raw.get("memory_conflict_threshold")
-            ),
+            _tuned("memory_conflict_threshold", gen_raw, mem_raw),
             0.75,
             0.50,
             0.89,
@@ -776,15 +820,6 @@ def parse_plugin_config(raw: dict[str, Any] | None) -> PluginConfig:
         private_prompt=_to_str(
             gen_raw.get("memory_private_prompt", mem_raw.get("memory_private_prompt")),
             DEFAULT_PRIVATE_SUMMARY_PROMPT,
-        ),
-        decay_half_life_days=_to_int(
-            eval_raw.get(
-                "memory_decay_half_life_days",
-                mem_raw.get("memory_decay_half_life_days"),
-            ),
-            10,
-            7,
-            30,
         ),
         inject_max_chars=_to_int(
             inj_raw.get(
@@ -810,46 +845,58 @@ def parse_plugin_config(raw: dict[str, Any] | None) -> PluginConfig:
                 kind_decay_raw.get("plan_half_life_days"),
                 3,
                 1,
-                365,
+                30,
             ),
             episode=_to_int(
                 kind_decay_raw.get("episode_half_life_days"),
                 7,
                 1,
-                365,
+                60,
             ),
             preference=_to_int(
                 kind_decay_raw.get("preference_half_life_days"),
                 60,
-                1,
+                7,
                 365,
             ),
             fact=_to_int(
                 kind_decay_raw.get("fact_half_life_days"),
                 120,
-                1,
+                30,
                 365,
             ),
             relation=_to_int(
                 kind_decay_raw.get("relation_half_life_days"),
                 90,
-                1,
+                30,
                 365,
             ),
         ),
-        mmr_enabled=_to_bool(inj_raw.get("memory_mmr_enabled"), True),
-        kind_badge=_to_bool(inj_raw.get("memory_kind_badge"), True),
-        entity_boost=_to_float(inj_raw.get("memory_entity_boost"), 0.10, 0.0, 1.0),
-        online_scan_limit=_to_int(
-            inj_raw.get("memory_online_scan_limit"), 900, 100, 5000
+        mmr_enabled=_to_bool(_tuned("memory_mmr_enabled", inj_raw, mem_raw), True),
+        kind_badge=_to_bool(_tuned("memory_kind_badge", inj_raw, mem_raw), True),
+        entity_boost=_to_float(
+            _tuned("memory_entity_boost", inj_raw, mem_raw), 0.10, 0.0, 0.5
         ),
-        min_similarity=_to_float(inj_raw.get("memory_min_similarity"), 0.55, 0.0, 1.0),
-        lexical_recall=_to_bool(inj_raw.get("memory_lexical_recall"), True),
+        online_scan_limit=_to_int(
+            _tuned("memory_online_scan_limit", inj_raw, mem_raw), 900, 100, 5000
+        ),
+        min_similarity=_to_float(
+            _tuned("memory_min_similarity", inj_raw, mem_raw), 0.55, 0.0, 1.0
+        ),
+        lexical_recall=_to_bool(
+            _tuned("memory_lexical_recall", inj_raw, mem_raw), True
+        ),
         embedding_cache_ttl=_to_int(
-            inj_raw.get("memory_embedding_cache_ttl"), 300, 0, 3600
+            _tuned("memory_embedding_cache_ttl", inj_raw, mem_raw), 300, 0, 3600
         ),
         embedding_cache_size=_to_int(
-            inj_raw.get("memory_embedding_cache_size"), 256, 0, 2048
+            _tuned("memory_embedding_cache_size", inj_raw, mem_raw), 256, 0, 2048
+        ),
+        recall_cache_ttl=_to_int(
+            _tuned("memory_recall_cache_ttl_sec", inj_raw, mem_raw), 45, 0, 600
+        ),
+        recall_cache_entries=_to_int(
+            _tuned("memory_recall_cache_entries", inj_raw, mem_raw), 256, 8, 2048
         ),
         consolidation_enable=_to_bool(
             eval_raw.get(
@@ -867,13 +914,20 @@ def parse_plugin_config(raw: dict[str, Any] | None) -> PluginConfig:
             1,
             30,
         ),
+        consolidation_archive_only=_to_bool(
+            eval_raw.get(
+                "memory_consolidation_archive",
+                mem_raw.get("memory_consolidation_archive"),
+            ),
+            True,
+        ),
         archive_enable=_to_bool(
             eval_raw.get("memory_archive_enable", mem_raw.get("memory_archive_enable")),
             True,
         ),
         archive_days=_to_int(
             eval_raw.get("memory_archive_days", mem_raw.get("memory_archive_days")),
-            15,
+            30,
             7,
             120,
         ),
@@ -881,9 +935,91 @@ def parse_plugin_config(raw: dict[str, Any] | None) -> PluginConfig:
             eval_raw.get(
                 "memory_archive_importance", mem_raw.get("memory_archive_importance")
             ),
-            0.35,
+            3.0,
             0.0,
-            1.0,
+            10.0,
+        ),
+        trash_retention_days=_to_int(
+            eval_raw.get(
+                "memory_trash_retention_days",
+                mem_raw.get("memory_trash_retention_days"),
+            ),
+            30,
+            7,
+            365,
+        ),
+        # r3.3 遗忘机制：自适应 TTL（写入侧）与重要性演化（查询侧）。
+        ttl_adaptive_enable=_to_bool(eval_raw.get("memory_ttl_adaptive"), True),
+        ttl_base=KindTtlConfig(
+            plan=_to_int(ttl_base_raw.get("plan_days"), 2, 1, 365),
+            episode=_to_int(ttl_base_raw.get("episode_days"), 7, 1, 365),
+            preference=_to_int(ttl_base_raw.get("preference_days"), 60, 1, 365),
+            relation=_to_int(ttl_base_raw.get("relation_days"), 90, 1, 365),
+            fact=_to_int(ttl_base_raw.get("fact_days"), 180, 1, 365),
+        ),
+        ttl_reinforce_step=_to_float(
+            eval_raw.get("memory_ttl_reinforce_step"), 0.1, 0.0, 0.5
+        ),
+        ttl_reinforce_cap=_to_float(
+            eval_raw.get("memory_ttl_reinforce_cap"), 0.5, 0.0, 1.0
+        ),
+        importance_decay_enable=_to_bool(
+            _tuned("memory_importance_decay", eval_raw, mem_raw), True
+        ),
+        importance_decay_rate=_to_float(
+            _tuned("memory_importance_decay_rate", eval_raw, mem_raw), 0.01, 0.0, 0.2
+        ),
+        importance_decay_floor=_to_float(
+            _tuned("memory_importance_decay_floor", eval_raw, mem_raw),
+            0.5,
+            0.0,
+            5.0,
+        ),
+        importance_decay_access_window_days=_to_int(
+            _tuned("memory_importance_decay_access_window_days", eval_raw, mem_raw),
+            30,
+            1,
+            365,
+        ),
+        importance_decay_access_max_count=_to_int(
+            _tuned("memory_importance_decay_access_max_count", eval_raw, mem_raw),
+            10,
+            1,
+            100,
+        ),
+        importance_protected_threshold=_to_float(
+            _tuned("memory_importance_protected_threshold", eval_raw, mem_raw),
+            10.0,
+            5.0,
+            10.0,
+        ),
+        archive_retention_days=_to_int(
+            _tuned("memory_archive_retention_days", eval_raw, mem_raw), 0, 0, 3650
+        ),
+        # r3.3 抽取质量：无实质内容过滤、低价值档丢弃、参与者上限。
+        extract_min_substance_chars=_to_int(
+            gen_raw.get(
+                "memory_extract_min_substance_chars",
+                mem_raw.get("memory_extract_min_substance_chars"),
+            ),
+            8,
+            0,
+            100,
+        ),
+        extract_skip_chatter=_to_bool(
+            gen_raw.get(
+                "memory_extract_skip_chatter",
+                mem_raw.get("memory_extract_skip_chatter"),
+            ),
+            True,
+        ),
+        max_participants=_to_int(
+            gen_raw.get(
+                "memory_max_participants", mem_raw.get("memory_max_participants")
+            ),
+            8,
+            1,
+            20,
         ),
     )
 
@@ -897,6 +1033,13 @@ def parse_plugin_config(raw: dict[str, Any] | None) -> PluginConfig:
         ),
         model_choice_timeout=_to_float(
             timeouts_raw.get("model_choice_sec"), 45.0, 10.0, 120.0
+        ),
+        embedding_timeout=_to_float(timeouts_raw.get("embedding_sec"), 8.0, 0.1, 60.0),
+        embedding_write_timeout=_to_float(
+            timeouts_raw.get("embedding_write_sec"), 12.0, 0.1, 120.0
+        ),
+        recall_deadline=_to_float(
+            timeouts_raw.get("recall_deadline_sec"), 3.0, 0.1, 15.0
         ),
     )
 
@@ -926,102 +1069,87 @@ class GroupFieldSpec:
     minimum: float = 0
     maximum: float = 0
     step: float = 1
+    default: Any = None
+
+
+@lru_cache(maxsize=1)
+def _config_schema() -> dict[str, Any]:
+    """读取 schema 一次；缺失时返回空对象，避免配置模块导入失败。"""
+    try:
+        data = json.loads(
+            Path(__file__).with_name("_conf_schema.json").read_text(encoding="utf-8")
+        )
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _schema_node(path: str) -> dict[str, Any] | None:
+    """按点分路径读取 _conf_schema.json 的字段节点。"""
+    node: Any = _config_schema()
+    for part in path.split("."):
+        if not isinstance(node, dict):
+            return None
+        items = node.get("items") if isinstance(node.get("items"), dict) else node
+        if part not in items:
+            return None
+        node = items[part]
+    return node if isinstance(node, dict) else None
+
+
+def _group_spec(path: str) -> GroupFieldSpec:
+    """从 schema 派生群字段的标签/类型/范围/枚举，代码只保留路径白名单。"""
+    node = _schema_node(path) or {}
+    raw_type = str(node.get("type") or "str")
+    options = tuple(str(item) for item in (node.get("options") or ()))
+    kind = "enum" if options or raw_type == "string" else raw_type
+    if kind not in {"bool", "enum", "int", "float", "str", "text"}:
+        kind = "str"
+    slider = node.get("slider") if isinstance(node.get("slider"), dict) else {}
+    return GroupFieldSpec(
+        path=path,
+        label=str(node.get("description") or path.rsplit(".", 1)[-1]),
+        kind=kind,
+        options=options,
+        labels=tuple(str(item) for item in (node.get("labels") or ())),
+        minimum=float(slider.get("min", 0) or 0),
+        maximum=float(slider.get("max", 0) or 0),
+        step=float(slider.get("step", 1) or 1),
+        default=node.get("default"),
+    )
 
 
 # 说明：只允许覆盖与"群内行为"相关的字段（含记忆 RAG）；搜索/超时属于全局服务配置。
-GROUP_OVERRIDE_FIELDS: tuple[GroupFieldSpec, ...] = (
-    GroupFieldSpec("active_reply.enable", "启用主动回复", "bool"),
-    GroupFieldSpec(
-        "active_reply.mode",
-        "回复方式",
-        "enum",
-        options=("probability", "model_choice"),
-        labels=("概率", "模型判定"),
-    ),
-    GroupFieldSpec(
-        "active_reply.possibility", "回复概率", "float", minimum=0, maximum=1, step=0.1
-    ),
-    GroupFieldSpec(
-        "active_reply.model_history_messages",
-        "模型判定消息附带",
-        "int",
-        minimum=0,
-        maximum=100,
-    ),
-    GroupFieldSpec("active_reply.model_choice_provider_id", "模型判定提供商", "str"),
-    GroupFieldSpec(
-        "active_reply.trigger_threshold",
-        "回复触发积累",
-        "int",
-        minimum=2,
-        maximum=50,
-    ),
-    GroupFieldSpec("group_context_enhancement.enable", "启用群聊上下文增强", "bool"),
-    GroupFieldSpec(
-        "group_context_enhancement.max_messages",
-        "会话消息上限",
-        "int",
-        minimum=50,
-        maximum=1000,
-        step=10,
-    ),
-    GroupFieldSpec(
-        "group_context_enhancement.include_sender_id", "包含用户信息", "bool"
-    ),
-    GroupFieldSpec("group_context_enhancement.include_role_tag", "包含标签", "bool"),
-    GroupFieldSpec("group_context_enhancement.image_caption", "图片转述", "bool"),
-    GroupFieldSpec(
-        "group_context_enhancement.image_caption_provider_id", "图片转述提供商", "str"
-    ),
-    GroupFieldSpec(
-        "group_context_enhancement.image_caption_prompt", "图片转述文本", "text"
-    ),
-    GroupFieldSpec("group_reply_enhancement.react_pattern", "React Pattern", "bool"),
-    GroupFieldSpec("group_reply_enhancement.role_display", "用户角色显示", "bool"),
-    GroupFieldSpec("group_reply_enhancement.smart_reply", "智能回复", "bool"),
-    GroupFieldSpec("memory_rag.memory_control.enable", "启用记忆 RAG", "bool"),
-    GroupFieldSpec(
-        "memory_rag.memory_generation.auto_extract_enable", "自动产生记忆", "bool"
-    ),
-    GroupFieldSpec(
-        "memory_rag.memory_generation.memory_batch_messages",
-        "累计消息记忆",
-        "int",
-        minimum=10,
-        maximum=100,
-        step=1,
-    ),
-    GroupFieldSpec(
-        "memory_rag.memory_generation.auto_extract_interval_minutes",
-        "抽取间隔（分钟）",
-        "int",
-        minimum=1,
-        maximum=120,
-        step=1,
-    ),
-    GroupFieldSpec(
-        "memory_rag.memory_generation.auto_extract_scope",
-        "记忆作用域",
-        "enum",
-        options=("group_first", "global", "group"),
-        labels=("自动", "仅全局", "仅本群"),
-    ),
-    GroupFieldSpec(
-        "memory_rag.memory_injection.memory_inject_max_chars",
-        "注入字数上限",
-        "int",
-        minimum=100,
-        maximum=1200,
-        step=50,
-    ),
-    GroupFieldSpec(
-        "memory_rag.memory_injection.memory_inject_max_items",
-        "注入条数上限",
-        "int",
-        minimum=0,
-        maximum=15,
-        step=1,
-    ),
+# 路径白名单是唯一需要手写的部分，其余元数据全部来自 _conf_schema.json。
+_GROUP_OVERRIDE_PATHS: tuple[str, ...] = (
+    "active_reply.enable",
+    "active_reply.mode",
+    "active_reply.possibility",
+    "active_reply.model_history_messages",
+    "active_reply.model_choice_provider_id",
+    "active_reply.trigger_threshold",
+    "group_context_enhancement.enable",
+    "group_context_enhancement.max_messages",
+    "group_context_enhancement.include_sender_id",
+    "group_context_enhancement.include_role_tag",
+    "group_context_enhancement.image_caption",
+    "group_context_enhancement.image_caption_provider_id",
+    "group_context_enhancement.image_caption_prompt",
+    "group_reply_enhancement.react_pattern",
+    "group_reply_enhancement.role_display",
+    "group_reply_enhancement.smart_reply",
+    "memory_rag.memory_control.enable",
+    "memory_rag.memory_generation.auto_extract_enable",
+    "memory_rag.memory_generation.memory_batch_messages",
+    "memory_rag.memory_generation.auto_extract_interval_minutes",
+    "memory_rag.memory_generation.auto_extract_scope",
+    "memory_rag.memory_injection.memory_inject_max_chars",
+    "memory_rag.memory_injection.memory_inject_max_items",
+)
+
+
+GROUP_OVERRIDE_FIELDS: tuple[GroupFieldSpec, ...] = tuple(
+    _group_spec(path) for path in _GROUP_OVERRIDE_PATHS
 )
 
 GROUP_FIELD_BY_PATH = {spec.path: spec for spec in GROUP_OVERRIDE_FIELDS}
@@ -1088,35 +1216,27 @@ def coerce_group_value(spec: GroupFieldSpec, value: Any) -> Any:
     return _to_str(value, str(default))
 
 
+# 旧版静态默认值表：仅在 _conf_schema.json 缺失或无法解析时作为兜底，
+# 正常路径下默认值一律由 schema 派生（schema 是唯一真相）。
 def _field_default(spec: GroupFieldSpec) -> Any:
-    """根据群级字段定义返回该项的插件默认值。"""
-    # 群级覆盖表单使用独立默认值，避免依赖未加载的全局配置实例。
-    defaults: dict[str, Any] = {
-        "active_reply.enable": False,
-        "active_reply.mode": "probability",
-        "active_reply.possibility": 0.1,
-        "active_reply.model_history_messages": 0,
-        "active_reply.model_choice_provider_id": "",
-        "active_reply.trigger_threshold": 10,
-        "group_context_enhancement.enable": True,
-        "group_context_enhancement.max_messages": 200,
-        "group_context_enhancement.include_sender_id": True,
-        "group_context_enhancement.include_role_tag": True,
-        "group_context_enhancement.image_caption": False,
-        "group_context_enhancement.image_caption_provider_id": "",
-        "group_context_enhancement.image_caption_prompt": DEFAULT_IMAGE_CAPTION_PROMPT,
-        "group_reply_enhancement.react_pattern": True,
-        "group_reply_enhancement.role_display": True,
-        "group_reply_enhancement.smart_reply": True,
-        "memory_rag.memory_control.enable": False,
-        "memory_rag.memory_generation.auto_extract_enable": True,
-        "memory_rag.memory_generation.memory_batch_messages": 50,
-        "memory_rag.memory_generation.auto_extract_interval_minutes": 10,
-        "memory_rag.memory_generation.auto_extract_scope": "group_first",
-        "memory_rag.memory_injection.memory_inject_max_chars": 500,
-        "memory_rag.memory_injection.memory_inject_max_items": 5,
-    }
-    return defaults.get(spec.path, "")
+    """优先返回 schema 派生默认值，缺失时按类型给安全默认。"""
+    if spec.default is not None:
+        return spec.default
+    # 不能返回 ""：int/float 字段随后需要 int()/float()，空串会直接抛错。
+    logger.warning(
+        "[ActiveReply] schema 缺少群级字段 %s 的默认值，按 %s 类型回退",
+        spec.path,
+        spec.kind,
+    )
+    if spec.kind == "bool":
+        return False
+    if spec.kind == "int":
+        return int(spec.minimum)
+    if spec.kind == "float":
+        return float(spec.minimum)
+    if spec.kind == "enum":
+        return spec.options[0] if spec.options else ""
+    return ""
 
 
 def build_global_snapshot(cfg: PluginConfig) -> dict[str, Any]:

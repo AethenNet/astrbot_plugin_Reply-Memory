@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import json
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -15,6 +16,71 @@ _MAX_CALLS = 4
 _TIME_BUDGET_SECONDS = 20.0
 _MAX_RESULT_CHARS = 12000
 _EXTRA_KEY = "_areply_recall_budget"
+
+
+def dump_trimmed_json(
+    payload: dict[str, Any], max_chars: int, list_key: str = "records"
+) -> str:
+    """按记录裁剪超长 JSON，始终返回合法对象，不直接截断字符串。"""
+    original_count = 0
+    original_length = 0
+    if not isinstance(payload, dict):
+        payload = {}
+    else:
+        # 纯函数不修改调用方对象；列表裁剪也只作用于本地副本。
+        payload = dict(payload)
+        if isinstance(payload.get(list_key), list):
+            payload[list_key] = list(payload[list_key])
+    if isinstance(payload, dict):
+        try:
+            original_count = int(payload.get("count") or 0)
+        except (TypeError, ValueError, OverflowError):
+            pass
+        records = payload.get(list_key)
+        if isinstance(records, list):
+            original_length = len(records)
+    try:
+        limit = max(1, int(max_chars))
+    except (TypeError, ValueError, OverflowError):
+        limit = _MAX_RESULT_CHARS
+    try:
+        text = json.dumps(payload, ensure_ascii=False)
+    except (TypeError, ValueError, OverflowError):
+        original_length = max(original_length, original_count)
+        return json.dumps(
+            {
+                "status": "ok",
+                "count": original_count,
+                "truncated": True,
+                "omitted": original_length,
+                "note": "结果过长，已省略正文；可用 read_memory 按 id 读取单条。",
+            },
+            ensure_ascii=False,
+        )
+    if len(text) <= limit:
+        return text
+    records = payload.get(list_key)
+    if isinstance(records, list):
+        while records:
+            records.pop()
+            payload["truncated"] = True
+            payload["omitted"] = original_length - len(records)
+            try:
+                text = json.dumps(payload, ensure_ascii=False)
+            except (TypeError, ValueError, OverflowError):
+                break
+            if len(text) <= limit:
+                return text
+    return json.dumps(
+        {
+            "status": "ok",
+            "count": original_count,
+            "truncated": True,
+            "omitted": original_length,
+            "note": "结果过长，已省略正文；可用 read_memory 按 id 读取单条。",
+        },
+        ensure_ascii=False,
+    )
 
 
 @dataclass
@@ -26,11 +92,6 @@ class RecallBudget:
     max_result_chars: int = _MAX_RESULT_CHARS
     calls: int = 0
     elapsed: float = 0.0
-
-    @property
-    def remaining_calls(self) -> int:
-        """剩余可用调用次数。"""
-        return max(0, self.max_calls - self.calls)
 
     @property
     def remaining_seconds(self) -> float:
@@ -55,15 +116,6 @@ class RecallBudget:
         if len(value) <= self.max_result_chars:
             return value
         return value[: self.max_result_chars] + "…（已截断）"
-
-    def status(self) -> dict[str, Any]:
-        """给日志/调试用的预算状态。"""
-        return {
-            "calls": self.calls,
-            "max_calls": self.max_calls,
-            "elapsed": round(self.elapsed, 3),
-            "remaining_seconds": round(self.remaining_seconds, 3),
-        }
 
 
 def get_budget(event: Any) -> RecallBudget:
@@ -98,4 +150,4 @@ class budgeted:
         return False
 
 
-__all__ = ["RecallBudget", "budgeted", "get_budget"]
+__all__ = ["RecallBudget", "budgeted", "dump_trimmed_json", "get_budget"]
