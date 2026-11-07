@@ -7,8 +7,9 @@ numpy 可用时把一批候选拼成矩阵做一次矩阵乘法；不可用时�
 
 from __future__ import annotations
 
+from astrbot.api import logger
+
 import json
-import logging
 import math
 from collections.abc import Sequence
 from typing import Any
@@ -18,7 +19,6 @@ try:  # numpy 是 AstrBot/FAISS 的既有依赖，但没有它也要能跑
 except Exception:  # pragma: no cover - 取决于运行环境
     _np = None
 
-logger = logging.getLogger(__name__)
 
 # F26：维度不一致（通常是换了 embedding 模型）以前静默过滤，语义召回声量
 # 变小却没有任何提示。这里只计数 + 同类只告警一次，返回语义仍是 -1.0。

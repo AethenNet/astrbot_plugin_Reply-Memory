@@ -8,7 +8,7 @@
 
 [![AstrBot](https://img.shields.io/badge/AstrBot-%3E%3D4.29.0-4b8bf5)](https://docs.astrbot.app/dev/star/plugin-new.html)
 [![Python](https://img.shields.io/badge/Python-%3E%3D3.10-3776ab)](https://www.python.org/)
-[![Version](https://img.shields.io/badge/version-v1.1.0--beta.2-12a37a)](./CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-v1.1.0--beta.3-12a37a)](./CHANGELOG.md)
 [![GitHub](https://img.shields.io/badge/GitHub-astrbot__plugin__Reply--Memory-181717?logo=github)](https://github.com/AethenNet/astrbot_plugin_Reply-Memory)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-blue)](./LICENSE)
 
@@ -17,12 +17,22 @@
 </div>
 
 ---
+>## 必须要做的事情！！
+- 关闭 AstrBot 内置群聊上下文感知，避免重复注入
+- 关闭 AstrBot 内置主动回复，避免同一条消息回复两次
+- 关闭 AstrBot 内置引用回复，让插件按需引用
+- 开启 AstrBot 用户识别，历史中的用户 ID/角色显示依赖它
+- 使用 **记忆RAG** 功能前请确保关闭了其他记忆插件！
+
+>## 可选配置
+- **默认开启** 需要真实 @ 与引用：开启「群聊回复增强 → React Pattern」和「智能回复」
+- **默认关闭** 需要记忆能力：先配置 Embedding 提供商，关闭    其他记忆类插件
 
 ## 简介
 
 ActiveReply 是面向 AstrBot 的群聊增强插件，把主动回复、群聊上下文、长期记忆 RAG、用户屏蔽和可视化控制台组合在一起。
 
-当前版本：**v1.1.0-beta.2**。本版重点：
+当前版本：**v1.1.0-beta.3**。本版重点：
 
 - 记忆采用「事件 + 原子记忆」两层结构；
 - 重要性统一为 0–10，并按类型设置有效期与半衰期；
@@ -72,15 +82,6 @@ ActiveReply 是面向 AstrBot 的群聊增强插件，把主动回复、群聊�
 - 自动创建/迁移 SQLite 表；
 - 每次插件启动时，若当天快照不存在则生成一份记忆库快照（在版本检查/迁移前执行）；
 - 检查 `STORE_VERSION`；数据库版本高于插件时只读，不再写入。
-
-## 使用前检查
-
-1. 关闭 AstrBot 内置群聊上下文感知，避免重复注入；
-2. 关闭 AstrBot 内置主动回复，避免同一条消息回复两次；
-3. 关闭 AstrBot 内置引用回复，让插件按需引用；
-4. 开启 AstrBot 用户识别，历史中的用户 ID/角色显示依赖它；
-5. 需要真实 @ 与引用：开启「群聊回复增强 → React Pattern」和「智能回复」；
-6. 需要记忆：先配置 Embedding 提供商。
 
 ## 指令
 

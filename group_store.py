@@ -9,9 +9,10 @@
 
 from __future__ import annotations
 
+from astrbot.api import logger
+
 import copy
 import json
-import logging
 import threading
 import time
 from pathlib import Path
@@ -19,7 +20,6 @@ from typing import Any
 
 from .config_model import GROUP_OVERRIDE_FIELDS, get_by_path
 
-logger = logging.getLogger(__name__)
 
 STORE_VERSION = 1
 
