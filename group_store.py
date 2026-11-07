@@ -9,20 +9,39 @@
 
 from __future__ import annotations
 
+import copy
 import json
+import logging
 import threading
 import time
 from pathlib import Path
 from typing import Any
 
-from .config_model import (
-    GROUP_OVERRIDE_FIELDS,
-    coerce_group_value,
-    get_by_path,
-    set_by_path,
-)
+from .config_model import GROUP_OVERRIDE_FIELDS, get_by_path
+
+logger = logging.getLogger(__name__)
 
 STORE_VERSION = 1
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    """把任意 JSON 值转成有限浮点数；非法值回退默认值（F20）。"""
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    if number != number or number in (float("inf"), float("-inf")):
+        return default
+    return number
+
+
+def _as_text(value: Any) -> str:
+    """把 JSON 标量转成清理后的文本；对象/数组等结构返回空串（F20）。"""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return str(value)
+    return ""
 
 
 class GroupStore:
@@ -50,23 +69,62 @@ class GroupStore:
     # 读写
     # ------------------------------------------------------------------ #
     def _load(self) -> None:
-        """从磁盘恢复群记录，并忽略不完整或不兼容的顶层数据。
+        """从磁盘恢复群记录，并逐条清洗坏数据（F20）。
 
         文件缺失、读取失败或 JSON 语法损坏时初始化为空配置，不因本地群配置
-        文件问题阻断插件启动；载入后仍会确认 ``groups`` 是字典，避免后续
-        查询把任意 JSON 类型当作群映射使用。
+        文件问题阻断插件启动；群条目必须是 dict，``config`` 必须是 dict，
+        ``updated_at`` 必须是数字，否则忽略坏值并告警。
         """
         # 读取旧配置；文件不存在或损坏时从空映射启动，不阻塞插件启动。
+        self._data = {}
         if not self.path.exists():
-            self._data = {}
             return
         try:
             payload = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            self._data = {}
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+            logger.warning("[ActiveReply] 群配置读取失败，按空配置启动: %s", exc)
             return
         groups = payload.get("groups") if isinstance(payload, dict) else None
-        self._data = groups if isinstance(groups, dict) else {}
+        if not isinstance(groups, dict):
+            if payload is not None:
+                logger.warning("[ActiveReply] groups.json 的 groups 不是对象，已忽略")
+            return
+        cleaned: dict[str, dict[str, Any]] = {}
+        for group_id, entry in groups.items():
+            normalized = self._normalize_entry(entry, str(group_id))
+            if normalized is not None:
+                cleaned[str(group_id)] = normalized
+        self._data = cleaned
+
+    @staticmethod
+    def _normalize_entry(entry: Any, group_id: str) -> dict[str, Any] | None:
+        """清洗单个群条目；返回 None 表示丢弃（F20）。"""
+        if not isinstance(entry, dict):
+            logger.warning(
+                "[ActiveReply] 群配置条目 %s 不是对象，已忽略", group_id[:64]
+            )
+            return None
+        config = entry.get("config")
+        if config is None:
+            config = {}
+        elif not isinstance(config, dict):
+            logger.warning(
+                "[ActiveReply] 群 %s 的 config 不是对象，已按空覆盖处理", group_id[:64]
+            )
+            config = {}
+        # 保留未知顶层键，避免升级/降级时静默丢失未来字段。
+        normalized = dict(entry)
+        normalized["independent"] = bool(entry.get("independent"))
+        normalized["config"] = config
+        normalized["note"] = _as_text(entry.get("note"))
+        updated_at = _safe_float(entry.get("updated_at"), 0.0)
+        if "updated_at" in entry and entry.get("updated_at") not in (None, ""):
+            if updated_at <= 0:
+                logger.warning(
+                    "[ActiveReply] 群 %s 的 updated_at 非法，已回退 0", group_id[:64]
+                )
+        normalized["updated_at"] = updated_at
+        return normalized
 
     def _save(self) -> None:
         """将当前群配置快照以临时文件替换方式持久化。"""
@@ -82,28 +140,31 @@ class GroupStore:
     # ------------------------------------------------------------------ #
     # 查询
     # ------------------------------------------------------------------ #
-    def is_independent(self, group_id: str) -> bool:
-        """判断指定群是否已启用独立配置。"""
-        # 仅当群记录明确启用独立配置时返回 True。
-        entry = self._data.get(str(group_id))
-        return bool(entry and entry.get("independent"))
-
     def get_overrides(self, group_id: str) -> dict[str, Any]:
-        """返回该群生效的覆盖值（嵌套 dict），未独立配置时返回空 dict。"""
+        """返回该群生效的覆盖值（嵌套 dict），坏值一律按空 dict 处理（F20）。"""
         entry = self._data.get(str(group_id))
         if not entry or not entry.get("independent"):
             return {}
         overrides = entry.get("config")
-        return overrides if isinstance(overrides, dict) else {}
+        if not isinstance(overrides, dict):
+            if overrides is not None:
+                logger.warning(
+                    "[ActiveReply] 群 %s 的覆盖值不是对象，已按空处理",
+                    str(group_id)[:64],
+                )
+            return {}
+        return overrides
 
     def get_meta(self, group_id: str) -> dict[str, Any]:
         """获取面板展示所需的群状态、更新时间和备注。"""
         # 返回面板需要的状态、最近更新时间与可读备注，不暴露内部配置对象。
         entry = self._data.get(str(group_id)) or {}
+        if not isinstance(entry, dict):
+            return {"independent": False, "updated_at": 0.0, "note": ""}
         return {
             "independent": bool(entry.get("independent")),
-            "updated_at": float(entry.get("updated_at") or 0),
-            "note": str(entry.get("note") or ""),
+            "updated_at": _safe_float(entry.get("updated_at"), 0.0),
+            "note": _as_text(entry.get("note")),
         }
 
     def known_groups(self) -> list[str]:
@@ -114,80 +175,41 @@ class GroupStore:
     # ------------------------------------------------------------------ #
     # 写入
     # ------------------------------------------------------------------ #
-    def save_overrides(
+    def save_group_config(
         self,
         group_id: str,
         values: dict[str, Any],
         *,
+        independent: bool,
         note: str = "",
     ) -> dict[str, Any]:
-        """保存某个群的覆盖值。
-
-        Args:
-            group_id: 群号。
-            values: 形如 ``{"active_reply.enable": True, ...}`` 的扁平字段字典。
-            note: 可选备注（群名等）。
-        """
-        group_id = str(group_id or "").strip()
-        if not group_id:
-            raise ValueError("group_id 不能为空")
-
-        def _lookup(path: str) -> tuple[bool, Any]:
-            """在扁平或嵌套提交值中查找字段；缺失表示跟随全局。"""
-            if path in values:
-                return True, values[path]
-            current: Any = values
-            for key in path.split("."):
-                if not isinstance(current, dict) or key not in current:
-                    return False, None
-                current = current[key]
-            return True, current
-
-        nested: dict[str, Any] = {}
-        for spec in GROUP_OVERRIDE_FIELDS:
-            present, raw = _lookup(spec.path)
-            if not present:
-                continue
-            coerced = coerce_group_value(spec, raw)
-            set_by_path(nested, spec.path, coerced)
-
-        with self._lock:
-            self._data[group_id] = {
-                "independent": True,
-                "config": nested,
-                "note": str(note or "").strip(),
-                "updated_at": time.time(),
-            }
-            self._save()
-        return nested
-
-    def set_independent(self, group_id: str, independent: bool, note: str = "") -> None:
-        """切换群级独立状态，并更新备注或清理无配置的空记录。"""
-        # 切换跟随全局/独立状态；关闭后若没有覆盖值则移除空记录。
+        """一次提交群配置（覆盖值 + 独立状态 + 备注），失败回滚内存。"""
         group_id = str(group_id or "").strip()
         if not group_id:
             raise ValueError("group_id 不能为空")
         with self._lock:
-            entry = self._data.setdefault(group_id, {})
-            entry["independent"] = bool(independent)
-            if note:
-                entry["note"] = str(note).strip()
-            entry["updated_at"] = time.time()
-            if not independent and not entry.get("config"):
-                self._data.pop(group_id, None)
-            self._save()
-
-    def set_note(self, group_id: str, note: str) -> None:
-        """保存本地群备注，不修改群当前的独立配置状态。"""
-        # 更新群的本地展示备注，不改变其独立配置启用状态。
-        group_id = str(group_id or "").strip()
-        if not group_id:
-            return
-        with self._lock:
-            entry = self._data.setdefault(group_id, {"independent": False})
-            entry["note"] = str(note or "").strip()
-            entry["updated_at"] = time.time()
-            self._save()
+            previous = copy.deepcopy(self._data)
+            try:
+                if independent:
+                    self._data[group_id] = {
+                        "independent": True,
+                        "config": dict(values or {}),
+                        "note": str(note or "").strip(),
+                        "updated_at": time.time(),
+                    }
+                else:
+                    entry = self._data.setdefault(group_id, {})
+                    entry["independent"] = False
+                    if note:
+                        entry["note"] = str(note).strip()
+                    entry["updated_at"] = time.time()
+                    if not entry.get("config"):
+                        self._data.pop(group_id, None)
+                self._save()
+            except Exception:
+                self._data = previous
+                raise
+        return dict(values or {}) if independent else {}
 
     def remove(self, group_id: str) -> bool:
         """删除指定群的记录，并返回是否实际删除了数据。"""

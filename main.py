@@ -19,17 +19,19 @@ import asyncio
 import base64
 import contextlib
 import datetime
+import ipaddress
 import json
-import math
 import mimetypes
 import random
 import re
+import socket
 import time
 import uuid
 from collections import deque
 from collections.abc import AsyncGenerator
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
 import aiohttp
@@ -40,7 +42,6 @@ from astrbot.api.message_components import At, Image, Node, Nodes, Plain, Reply
 from astrbot.api.platform import MessageType
 from astrbot.api.provider import LLMResponse, Provider, ProviderRequest
 from astrbot.core.agent.message import TextPart
-from astrbot.core.provider.provider import EmbeddingProvider
 
 try:  # 新版本提供插件数据目录 helper
     from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
@@ -54,9 +55,9 @@ except ImportError:  # pragma: no cover - 兼容更早的 4.x
 
 
 from astrbot.core.message.message_event_result import MessageChain
-from astrbot.core.utils.io import download_image_by_url
 from mcp import types as mcp_types
 
+from .access_buffer import AccessBuffer
 from .block_store import BlockStore, format_remaining, parse_until
 from .config_model import (
     DEFAULT_GROUP_SUMMARY_PROMPT,
@@ -66,12 +67,23 @@ from .config_model import (
     active_reply_allowed,
     build_global_snapshot,
     deep_merge,
-    ensure_memory_prompt_rules,
+    is_legacy_default_prompt,
     parse_plugin_config,
 )
+from .extract_runner import ExtractionRunner
 from .group_store import GroupStore
+from .history_format import (
+    format_self_line,
+    format_user_line,
+    resolve_self_id,
+    sanitize_inline,
+)
+
+from .event_utils import is_synthetic_event
+from .memory_ops import MemoryOpsMixin
 from .memory_store import MemoryStore
 from .page_api import PageApi
+from .recall_cache import RecallCache
 from .runtime_state import RuntimeState
 from .tags import (
     bounded_chat_history,
@@ -102,36 +114,31 @@ BLOCK_HINT_TEXT = "你已被屏蔽，暂时无法与机器人互动。原因：{
 MAX_MENTIONS_PER_MESSAGE = 3
 MSG_ID_PATTERN = re.compile(r"#msg([^:]+):")
 
-# 记忆摘要置信度档位：模型先选档位，再把分数限制在对应区间，避免评分虚高。
-CONFIDENCE_TIER_RANGES: dict[str, tuple[float, float]] = {
-    "major": (0.90, 1.00),
-    "discussion": (0.70, 0.80),
-    "daily": (0.50, 0.60),
-    "chatter": (0.30, 0.40),
-    "spam": (0.00, 0.20),
-}
-CONFIDENCE_TIER_DEFAULTS = {
-    "major": 0.95,
-    "discussion": 0.75,
-    "daily": 0.55,
-    "chatter": 0.35,
-    "spam": 0.10,
-}
-CONFIDENCE_TIER_ALIASES: dict[str, tuple[str, ...]] = {
-    "major": (
-        "major",
-        "major_decision",
-        "important",
-        "high",
-        "重要",
-        "重要决策",
-        "重大决策",
-    ),
-    "discussion": ("discussion", "valuable", "讨论", "有价值", "有结论"),
-    "daily": ("daily", "daily_discussion", "normal", "日常", "日常讨论", "一般"),
-    "chatter": ("chatter", "chat", "casual", "闲聊", "简单闲聊", "随意"),
-    "spam": ("spam", "low", "灌水", "无信息", "刷屏", "寒暄"),
-}
+# F11：用户原始文本（正文/引用/昵称/@ 名）进历史前统一单行化并截断。
+MAX_INLINE_HISTORY_CHARS = 1000
+# F29：图片引用只允许公网 http(s)，单张下载上限 8 MiB，超时沿用 30s 的下载超时。
+MAX_IMAGE_DOWNLOAD_BYTES = 8 * 1024 * 1024
+IMAGE_DOWNLOAD_TIMEOUT_SEC = 30.0
+# F47：联网搜索响应与工具结果都有上限，避免一次请求把内存/上下文吃满。
+MAX_SEARCH_RESPONSE_BYTES = 2 * 1024 * 1024
+MAX_TOOL_OUTPUT_CHARS = 12000
+# F48：群成员角色缓存的容量上限（按最后写入时间淘汰）。
+MAX_GROUP_ROLE_CACHE = 200
+
+# F29：不允许访问的本机/内网域名（解析后仍可能指向私网，属于已知残余风险）。
+_BLOCKED_MEDIA_HOSTS = frozenset(
+    {"localhost", "localhost.localdomain", "ip6-localhost", "ip6-loopback", "0.0.0.0"}
+)
+_BLOCKED_MEDIA_HOST_SUFFIXES = (
+    ".local",
+    ".localhost",
+    ".localdomain",
+    ".internal",
+    ".lan",
+    ".home.arpa",
+)
+
+# 图片占位符（历史正文里的 [Image] / [Image: url]），用于识别图片消息。
 IMAGE_MARKER_PATTERN = re.compile(r"\[Image(?:: [^\]]*)?\]")
 
 JUDGE_PROMPT_TEMPLATE = (
@@ -153,76 +160,17 @@ ACTIVE_REPLY_PROMPT = (
 # 长期记忆提示：让模型知道什么时候该写入/检索，避免工具闲置
 MEMORY_INSTRUCTIONS = (
     "\n\n## 长期记忆\n"
-    "你可以使用两个长期记忆工具：\n"
+    "你可以使用三个长期记忆工具：\n"
     "- `enhance_memory_rag_write`：写入一条长期记忆；\n"
-    "- `enhance_memory_rag_read`：按角色 / 时间 / 群范围检索长期记忆。\n"
+    "- `enhance_memory_rag_read`：按角色 / 时间 / 群范围检索长期记忆；\n"
+    "- `read_memory`：按编号深读一条记忆的完整正文与证据。\n"
     "使用规则：\n"
     "- 当用户明确说「记住」「记一下」「别忘了」，或提供了值得长期保存的信息"
     "（偏好、身份、约定、日程、重要事实）时，调用 `enhance_memory_rag_write` 保存；\n"
     "- 当用户问「你还记得…」「之前说过什么」或需要过去的信息时，"
     "先调用 `enhance_memory_rag_read` 检索，再基于结果回答；\n"
-    "- 检索结果为空就如实说不知道，不要编造记忆；不要每句话都检索。"
-)
-
-# 消息里出现这些词时，插件会兜底自动写入一条记忆（不依赖模型是否调用工具）
-MEMORY_KEYWORDS = ("记住", "记一下", "帮我记", "记着", "别忘了")
-
-# 用户问到「过去 / 偏好」类问题时，插件会先语义检索一次并注入提示词
-# 个人事实类表述：关键词通道写入时默认存成「全局记忆」，跨群也能回忆
-PERSONAL_FACT_RE = re.compile(
-    r"我喜欢|我讨厌|我爱|我不喜欢|我叫|我是|我的|我在|我住|我养|我玩|我生日|我习惯|我通常|我平时"
-)
-
-# 后台记忆抽取提示词
-MEMORY_TYPE_IMPORTANCE = {
-    "identity": 0.9,
-    "agreement": 0.85,
-    "preference": 0.7,
-    "plan": 0.7,
-    "fact": 0.55,
-}
-RECALL_TIME_WORDS = (
-    "上次",
-    "以前",
-    "之前",
-    "曾经",
-    "过去",
-    "那天",
-    "当时",
-    "回忆",
-    "记得",
-    "说过",
-)
-RECALL_PRONOUNS = ("你", "我", "他", "她", "它", "我们", "你们", "他们")
-RECALL_QUESTION_MARKS = (
-    "？",
-    "?",
-    "吗",
-    "呢",
-    "什么",
-    "怎么",
-    "哪",
-    "谁",
-    "多少",
-    "是否",
-)
-EXTRACT_SKIP_PATTERN = re.compile(
-    r"^(?:/[^\s]+|https?://\S+|\[Image\]|[\W_]+|\w{1,2})$"
-)
-
-RECALL_KEYWORDS = (
-    "记得",
-    "还记得",
-    "之前",
-    "上次",
-    "我说过",
-    "我喜欢",
-    "我讨厌",
-    "我偏好",
-    "以前",
-    "曾经",
-    "回忆",
-    "想起来",
+    "- 检索结果为空就如实说不知道，不要编造记忆；不要每句话都检索；\n"
+    "- 需要某条记忆的完整原文时，调用 `read_memory`（卡片里的 #编号）。"
 )
 
 
@@ -248,16 +196,45 @@ def _optional_hook(name: str):
 class _PluginLogHandler:
     """把本插件经 ``astrbot.api.logger`` 输出的日志收进环形缓冲。
 
-    仅使用 logger 对象本身（不导入 logging / loguru），符合插件市场规范；
-    因此只能拿到本插件自己的日志，无法读取 AstrBot 核心日志。
+    只使用 logger 对象本身（不导入 logging / loguru），符合插件市场规范。
+    4.15 的 ``astrbot.api.logger`` 是全局 ``logging.getLogger("astrbot")``，
+    ``addHandler`` 能收到核心与其它插件的日志（report1 P2），因此这里必须自己
+    过滤：只接受 ``record.name`` 含插件名、或 ``record.pathname`` 位于本插件
+    目录的记录，其余一律丢弃（F13）。4.29 的 logger 是插件上下文代理，通常
+    只会收到本插件日志，过滤同样成立。
     """
 
     level = 20  # logging.INFO，避免导入 logging 模块
 
-    def __init__(self, buffer: deque[tuple[float, str]]) -> None:
+    def __init__(
+        self, buffer: deque[tuple[float, str]], plugin_dir: Path | None = None
+    ) -> None:
         self.buffer = buffer
+        self.plugin_dir = (
+            Path(plugin_dir) if plugin_dir is not None else Path(__file__).parent
+        )
+
+    def _is_plugin_record(self, record: Any) -> bool:
+        """判断日志记录是否来自本插件（插件名或插件目录）。"""
+        name = str(getattr(record, "name", "") or "")
+        if PLUGIN_NAME in name:
+            return True
+        pathname = str(getattr(record, "pathname", "") or "")
+        if not pathname:
+            return False
+        try:
+            Path(pathname).resolve().relative_to(self.plugin_dir.resolve())
+        except (OSError, ValueError):
+            return False
+        return True
+
+    def filter(self, record: Any) -> bool:
+        """兼容 ``logging.Handler.filter`` 语义：返回 False 时丢弃记录。"""
+        return self._is_plugin_record(record)
 
     def handle(self, record: Any) -> None:
+        if not self._is_plugin_record(record):
+            return
         try:
             created = float(getattr(record, "created", 0.0))
             stamp = datetime.datetime.fromtimestamp(created).strftime("%H:%M:%S")
@@ -270,7 +247,57 @@ class _PluginLogHandler:
         self.buffer.append((created, f"[{stamp}] [{name}] {text}"))
 
 
-class ActiveReplyPlugin(star.Star):
+def _parse_ip_literal(host: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    """把主机名解析成 IP 字面量；不是 IP 时返回 None（不发起 DNS 查询）。"""
+    text = str(host or "").strip()
+    if not text:
+        return None
+    try:
+        return ipaddress.ip_address(text)
+    except ValueError:
+        pass
+    # socket.inet_aton 兼容 ``127.1``、``0x7f.1`` 等缩写形式的 IPv4 字面量。
+    try:
+        return ipaddress.IPv4Address(socket.inet_aton(text))
+    except OSError:
+        return None
+
+
+def media_url_rejection(url: str) -> str:
+    """校验图片引用 URL；返回拒绝原因，空串表示允许下载（F29）。
+
+    只允许 http/https；拒绝 ``file://`` 等其它协议、本机名、``.local`` 等
+    内网域名，以及回环/私网/链路本地/保留地址的字面量。DNS 解析到私网地址
+    的情况未在这里拦截（下载器无法把连接钉在已校验的 IP 上），属于已知残余
+    风险；插件自己的下载器也不跟随重定向，避免跳转绕过主机校验。
+    """
+    reference = str(url or "").strip()
+    if not reference:
+        return "图片地址为空"
+    try:
+        parsed = urlparse(reference)
+        port = parsed.port
+    except ValueError:
+        return "图片地址不合法"
+    scheme = str(parsed.scheme or "").lower()
+    if scheme not in {"http", "https"}:
+        return f"仅允许 http/https 协议（拒绝 {scheme or '无协议'}）"
+    if port is not None and not 0 < port < 65536:
+        return "图片地址端口不合法"
+    host = str(parsed.hostname or "").strip().lower().rstrip(".")
+    if not host:
+        return "图片地址缺少主机名"
+    address = _parse_ip_literal(host)
+    if address is not None:
+        if not address.is_global or address.is_multicast:
+            return f"拒绝访问本机/内网地址 {host}"
+        return ""
+    if host in _BLOCKED_MEDIA_HOSTS or host.endswith(_BLOCKED_MEDIA_HOST_SUFFIXES):
+        return f"拒绝访问本机/内网域名 {host}"
+    return ""
+
+
+class ActiveReplyPlugin(MemoryOpsMixin, star.Star):
     """AstrBot 主动回复插件入口及各子系统之间的协调器。
 
     插件对象持有框架上下文、解析配置所需的原始配置、进程内运行态、
@@ -289,12 +316,26 @@ class ActiveReplyPlugin(star.Star):
         super().__init__(context, config)
         self.config = config or {}
         self.state = RuntimeState()
-        self.version = PLUGIN_VERSION
         self._groups_cache: list[dict[str, Any]] = []
         self._groups_cache_at = 0.0
         self._group_role_cache: dict[str, tuple[float, dict[str, str]]] = {}
         self._maintenance_task: asyncio.Task | None = None
+        self._background_tasks: set[asyncio.Task] = set()
         self._last_consolidation_at = 0.0
+        # 检索结果缓存：同一句话在 TTL 内复用上次注入块；时长与容量进配置（M-18）。
+        initial_cfg = self._global_cfg()
+        self._recall_cache = RecallCache(
+            ttl_seconds=initial_cfg.memory_rag.recall_cache_ttl,
+            max_entries=initial_cfg.memory_rag.recall_cache_entries,
+        )
+        # 访问计数批量写：请求路径只累积，由后台任务按窗口落库（L-02/A-01）。
+        self._access_buffer: AccessBuffer | None = None
+        self._access_flush_task: asyncio.Task | None = None
+        # 时区对象缓存：避免每个调用点都读宿主配置（L-10）。
+        self._tzinfo_cache: datetime.tzinfo | None = None
+        self.extractions = ExtractionRunner(self)
+        # 串行化「查相似 → 决策 → 写库」，防止并发写入同一件事时双写。
+        self._memory_write_lock = asyncio.Lock()
 
         data_dir = Path(get_astrbot_plugin_data_path()) / PLUGIN_NAME
         data_dir.mkdir(parents=True, exist_ok=True)
@@ -302,6 +343,9 @@ class ActiveReplyPlugin(star.Star):
 
         self._migrate_memory_layout()
         self._migrate_memory_scoring()
+        self._migrate_recall_timeouts()
+        self._migrate_importance_scale()
+        self._migrate_memory_prompts()
         self.memory_store: MemoryStore | None = None
         try:
             self.memory_store = MemoryStore(
@@ -310,9 +354,13 @@ class ActiveReplyPlugin(star.Star):
             )
         except Exception as exc:  # 记忆库失败不应影响插件其余功能
             logger.error(f"[ActiveReply] 初始化记忆库失败: {exc}", exc_info=True)
+        self._access_buffer = (
+            AccessBuffer(self.memory_store) if self.memory_store is not None else None
+        )
+        # L-09：作用域归一与角色回填由 MemoryStore.ensure_backfills 按数据版本
+        # 短路执行；这里不再重复做一次全表扫描。
 
         self.group_store = GroupStore(data_dir / "groups.json")
-        self._repair_group_memory_overrides()
         self.block_store = BlockStore(data_dir / "user_blocks.json")
         try:
             self.block_store.sync_from_config(self._global_cfg().user_block.blacklist)
@@ -334,7 +382,13 @@ class ActiveReplyPlugin(star.Star):
         )
 
     def _migrate_memory_layout(self) -> None:
-        """把旧版扁平记忆配置迁移到新版四块嵌套结构（幂等）。"""
+        """把旧版扁平记忆配置迁移到新版四块嵌套结构（幂等）。
+
+        迁移以旧块为底做深合并：硬编码的四块只补它认识的字段，旧块里的
+        其它键（自定义提示词、抽取字数/切窗、召回缓存等）原样保留——其中
+        解析器仍读的旧键会被提升到对应新块，未知键留在顶层，避免整块替换
+        导致升级丢配置（F16）。
+        """
         try:
             mem = self.config.get("memory_rag")
             if not isinstance(mem, dict) or "memory_control" in mem:
@@ -361,15 +415,12 @@ class ActiveReplyPlugin(star.Star):
                 "auto_extract_scope": mem.get("auto_extract_scope", "group_first"),
             }
             injection = {
-                "memory_inject_max_chars": mem.get("memory_inject_max_chars", 500),
+                "memory_inject_max_chars": mem.get("memory_inject_max_chars", 600),
                 "memory_inject_max_items": mem.get("memory_inject_max_items", 5),
                 "recall_k": mem.get("recall_k", 20),
                 "max_return_results": mem.get("max_return_results", 100),
             }
             evaluation = {
-                "memory_decay_half_life_days": mem.get(
-                    "memory_decay_half_life_days", 10
-                ),
                 "memory_consolidation_enable": mem.get(
                     "memory_consolidation_enable", True
                 ),
@@ -377,20 +428,119 @@ class ActiveReplyPlugin(star.Star):
                     "memory_consolidation_interval_days", 7
                 ),
                 "memory_archive_enable": mem.get("memory_archive_enable", True),
-                "memory_archive_days": mem.get("memory_archive_days", 15),
-                "memory_archive_importance": mem.get("memory_archive_importance", 0.35),
+                "memory_archive_days": mem.get("memory_archive_days", 30),
+                "memory_archive_importance": mem.get(
+                    "memory_archive_importance", 3.0
+                ),
             }
-            self.config["memory_rag"] = {
+            sections = {
                 "memory_control": control,
                 "memory_generation": generation,
                 "memory_injection": injection,
                 "memory_evaluation": evaluation,
             }
-            saver = getattr(self.config, "save_config", None)
-            if callable(saver):
-                saver()
+            # 旧扁平键里没有被上面硬编码覆盖、但解析器继续读取的键：
+            # 生成嵌套块后 parse 不再回退到顶层，必须显式提升才能继续生效。
+            promoted: dict[str, tuple[str, ...]] = {
+                "memory_control": ("cross_group_personal", "cross_group_private"),
+                "memory_generation": (
+                    "memory_extract_max_chars",
+                    "memory_window_gap_minutes",
+                    "memory_multi_atom",
+                    "memory_atom_max_items",
+                    "memory_prompt_contract",
+                    "memory_group_prompt",
+                    "memory_private_prompt",
+                ),
+                "memory_injection": (
+                    "memory_mmr_enabled",
+                    "memory_kind_badge",
+                    "memory_entity_boost",
+                    "memory_online_scan_limit",
+                    "memory_min_similarity",
+                    "memory_lexical_recall",
+                    "memory_embedding_cache_ttl",
+                    "memory_embedding_cache_size",
+                    "memory_recall_cache_ttl_sec",
+                    "memory_recall_cache_entries",
+                ),
+                "memory_evaluation": (
+                    "memory_consolidation_archive",
+                    "memory_trash_retention_days",
+                    "memory_kind_decay",
+                ),
+            }
+            # 以旧块为底：未知旧键（可能来自更新版本）全部保留在顶层。
+            migrated = dict(mem)
+            for name, values in sections.items():
+                base = migrated.get(name)
+                base = dict(base) if isinstance(base, dict) else {}
+                merged = deep_merge(base, values)
+                for key in promoted[name]:
+                    if key in mem:
+                        merged[key] = mem[key]
+                migrated[name] = merged
+            # 已经搬进新块的扁平旧键从顶层移除，避免同一配置存在两份。
+            for keys in promoted.values():
+                for key in keys:
+                    migrated.pop(key, None)
+            for legacy_key in (
+                "enable",
+                "embedding_provider_id",
+                "auto_extract_provider_id",
+                "auto_extract_enable",
+                "memory_batch_messages",
+                "auto_extract_window",
+                "auto_extract_interval_minutes",
+                "private_extract_every_n",
+                "memory_dedup_threshold",
+                "memory_conflict_threshold",
+                "auto_extract_min_confidence",
+                "auto_extract_scope",
+                "memory_inject_max_chars",
+                "memory_inject_max_items",
+                "recall_k",
+                "max_return_results",
+                "memory_consolidation_enable",
+                "memory_consolidation_interval_days",
+                "memory_archive_enable",
+                "memory_archive_days",
+                "memory_archive_importance",
+            ):
+                migrated.pop(legacy_key, None)
+            self.config["memory_rag"] = migrated
+            self._save_config()
         except Exception as exc:
             logger.debug(f"[ActiveReply] 迁移记忆配置结构失败: {exc}")
+
+    def _migrate_memory_prompts(self) -> None:
+        """把旧版内置默认提示词替换为新的补充层默认值。
+
+        只认 sha256 完全一致的旧默认；用户真正改过的提示词原样保留，
+        不会被静默覆盖。
+        """
+        try:
+            section = self.config.get("memory_rag")
+            generation = (
+                section.get("memory_generation") if isinstance(section, dict) else None
+            )
+            if not isinstance(generation, dict):
+                return
+            changed = False
+            for kind, key, default in (
+                ("group", "memory_group_prompt", DEFAULT_GROUP_SUMMARY_PROMPT),
+                ("private", "memory_private_prompt", DEFAULT_PRIVATE_SUMMARY_PROMPT),
+            ):
+                value = generation.get(key)
+                if isinstance(value, str) and is_legacy_default_prompt(kind, value):
+                    generation[key] = default
+                    changed = True
+            if not changed:
+                return
+            self._save_config()
+            logger.info("[ActiveReply] 旧版默认提示词已迁移为补充层默认值")
+        except Exception as exc:
+            logger.warning(f"[ActiveReply] 迁移记忆提示词失败: {exc}")
 
     def _migrate_memory_scoring(self) -> None:
         """把旧默认的最低置信度 0.60 迁移到新评分口径的 0.50。
@@ -412,66 +562,101 @@ class ActiveReplyPlugin(star.Star):
             if abs(float(raw) - 0.6) > 1e-9:
                 return
             gen["auto_extract_min_confidence"] = 0.5
-            saver = getattr(self.config, "save_config", None)
-            if callable(saver):
-                saver()
+            self._save_config()
             logger.info("[ActiveReply] 记忆最低置信度已从旧默认 0.60 迁移到 0.50")
         except Exception as exc:
             logger.debug(f"[ActiveReply] 迁移最低置信度失败: {exc}")
 
-    def _repair_group_memory_overrides(self) -> None:
-        """清理群配置里被旧版自动填充的“记忆默认关闭”覆盖项。
-
-        旧版保存群独立配置时会把所有字段的默认值一并写入，其中
-        memory_rag.memory_control.enable 默认 False；这会覆盖全局的
-        记忆开关，导致该群 12 小时也没有任何自动记忆。这里只移除
-        “7 个记忆字段全部等于旧默认值”的覆盖；只要用户改过其中任一
-        字段，就视为有意配置并保留。
-        """
+    def _migrate_recall_timeouts(self) -> None:
+        """把旧默认的召回超时迁移到新默认值（只迁移一次）。"""
+        marker = self.data_dir / ".migrated_recall_timeouts"
+        if marker.exists():
+            return
         try:
-            expected = {
-                "memory_control.enable": False,
-                "memory_generation.auto_extract_enable": True,
-                "memory_generation.memory_batch_messages": 50,
-                "memory_generation.auto_extract_interval_minutes": 10,
-                "memory_generation.auto_extract_scope": "group_first",
-                "memory_injection.memory_inject_max_chars": 500,
-                "memory_injection.memory_inject_max_items": 5,
+            runtime = self.config.get("runtime")
+            timeouts = runtime.get("timeouts") if isinstance(runtime, dict) else None
+            if not isinstance(timeouts, dict):
+                # 没有可迁移的区块也落标记，避免之后新增配置时被误迁移。
+                marker.write_text("1", encoding="utf-8")
+                return
+            mapping = {
+                "embedding_sec": (0.5, 8.0),
+                "embedding_write_sec": (3.0, 12.0),
+                "recall_deadline_sec": (0.5, 3.0),
             }
-
-            def _flatten(node: dict[str, Any], prefix: str = "") -> dict[str, Any]:
-                flat: dict[str, Any] = {}
-                for key, value in node.items():
-                    path = f"{prefix}.{key}" if prefix else str(key)
-                    if isinstance(value, dict):
-                        flat.update(_flatten(value, path))
-                    else:
-                        flat[path] = value
-                return flat
-
-            repaired: list[str] = []
-            for group_id in self.group_store.known_groups():
-                overrides = self.group_store.get_overrides(group_id)
-                memory = overrides.get("memory_rag")
-                if not isinstance(memory, dict):
+            changed: list[str] = []
+            for key, (old_value, new_value) in mapping.items():
+                raw = timeouts.get(key)
+                if raw is None:
                     continue
-                if _flatten(memory) != expected:
+                try:
+                    value = float(raw)
+                except (TypeError, ValueError):
                     continue
-                overrides.pop("memory_rag", None)
-                note = self.group_store.get_meta(group_id).get("note") or ""
-                if overrides:
-                    self.group_store.save_overrides(group_id, overrides, note=note)
-                else:
-                    self.group_store.save_overrides(group_id, {}, note=note)
-                    self.group_store.set_independent(group_id, False, note=note)
-                repaired.append(group_id)
-            if repaired:
-                logger.warning(
-                    "[ActiveReply] 已修复群级记忆默认关闭覆盖 | groups=%s",
-                    ",".join(repaired[:20]),
+                if abs(value - old_value) <= 1e-9:
+                    timeouts[key] = new_value
+                    changed.append(key)
+            if changed:
+                self._save_config()
+                logger.info(
+                    "[ActiveReply] 召回超时已迁移到新默认 | keys=%s",
+                    ",".join(changed),
                 )
+            # 即使没有需要迁移的项也落标记：之后用户手动改回 0.5 不会被再次改写。
+            marker.write_text("1", encoding="utf-8")
         except Exception as exc:
-            logger.warning(f"[ActiveReply] 修复群级记忆配置失败: {exc}")
+            logger.warning(f"[ActiveReply] 迁移召回超时失败: {exc}")
+
+    def _migrate_importance_scale(self) -> None:
+        """把旧 0-1 口径的重要性配置迁移到 0-10（只执行一次）。
+
+        只放大 ``(0, 1.0]`` 区间内的值：旧默认 0.3/0.05/1.0 变成
+        3.0/0.5/10.0，已经是 0-10 的值不会被重复放大。无论是否发生变更
+        都写标记文件，避免之后新增配置或用户手动改回旧值时被再次迁移；
+        过程异常只告警且不写标记，下次启动重试。
+        """
+        marker = self.data_dir / ".migrated_importance_scale"
+        if marker.exists():
+            return
+        paths = (
+            ("memory_rag", "memory_evaluation", "memory_archive_importance"),
+            ("memory_rag", "memory_evaluation", "memory_importance_decay_floor"),
+            (
+                "memory_rag",
+                "memory_evaluation",
+                "memory_importance_protected_threshold",
+            ),
+            ("runtime", "memory_tuning", "memory_importance_decay_floor"),
+            ("runtime", "memory_tuning", "memory_importance_protected_threshold"),
+        )
+        try:
+            changed: list[str] = []
+            for keys in paths:
+                node: Any = self.config
+                for key in keys[:-1]:
+                    node = node.get(key) if isinstance(node, dict) else None
+                    if node is None:
+                        break
+                if not isinstance(node, dict):
+                    continue
+                try:
+                    value = float(node.get(keys[-1]))
+                except (TypeError, ValueError):
+                    continue
+                # 只乘 (0, 1.0]：0 或缺失不动，已是 0-10 的值保持不变。
+                if 0.0 < value <= 1.0:
+                    node[keys[-1]] = round(value * 10.0, 6)
+                    changed.append(".".join(keys))
+            if changed:
+                self._save_config()
+                logger.info(
+                    "[ActiveReply] 重要性配置已从 0-1 迁移到 0-10 | keys=%s",
+                    ",".join(changed),
+                )
+            # 即使无变更也落标记：之后用户手动改回 0.3/0.05/1.0 不会被再次放大。
+            marker.write_text("1", encoding="utf-8")
+        except Exception as exc:
+            logger.warning(f"[ActiveReply] 迁移重要性口径失败: {exc}")
 
     # ------------------------------------------------------------------ #
     # 配置与上下文工具
@@ -488,12 +673,17 @@ class ActiveReplyPlugin(star.Star):
         return str(base_cfg.get("timezone") or "").strip() or "Asia/Shanghai"
 
     def _tzinfo(self) -> datetime.tzinfo:
-        """将全局时区名称转换为 datetime 时区对象。"""
+        """将全局时区名称转换为 datetime 时区对象（结果按配置版本缓存）。"""
+        cached = getattr(self, "_tzinfo_cache", None)
+        if isinstance(cached, datetime.tzinfo):
+            return cached
         # 将时区名称转为 datetime 可用对象；无效名称回退到 UTC+8。
         try:
-            return ZoneInfo(self._resolve_timezone_name())
+            tzinfo: datetime.tzinfo = ZoneInfo(self._resolve_timezone_name())
         except Exception:
-            return datetime.timezone(datetime.timedelta(hours=8))
+            tzinfo = datetime.timezone(datetime.timedelta(hours=8))
+        self._tzinfo_cache = tzinfo
+        return tzinfo
 
     @staticmethod
     def _group_id(event: AstrMessageEvent) -> str:
@@ -509,6 +699,12 @@ class ActiveReplyPlugin(star.Star):
     # ------------------------------------------------------------------ #
     # 用户屏蔽
     # ------------------------------------------------------------------ #
+    def _save_config(self) -> None:
+        """把当前原始配置写回 AstrBot；宿主没有 save_config 时静默跳过。"""
+        saver = getattr(self.config, "save_config", None)
+        if callable(saver):
+            saver()
+
     def _sync_blacklist_config(self) -> None:
         """把 store 中的全局屏蔽列表写回插件配置，保持两边一致。"""
         try:
@@ -516,9 +712,7 @@ class ActiveReplyPlugin(star.Star):
             section = self.config.setdefault("group_reply_enhancement", {})
             block = section.setdefault("user_block", {})
             block["blacklist"] = ids
-            saver = getattr(self.config, "save_config", None)
-            if callable(saver):
-                saver()
+            self._save_config()
             self.invalidate_config_cache()
         except Exception as exc:
             logger.warning(f"[ActiveReply] 同步屏蔽列表到配置失败: {exc}")
@@ -580,8 +774,51 @@ class ActiveReplyPlugin(star.Star):
         return parse_plugin_config(merged)
 
     def invalidate_config_cache(self) -> None:
-        """配置变化后让页面侧的群列表缓存失效。"""
+        """配置变化后让页面缓存、时区缓存与召回缓存一起失效。"""
         self._groups_cache_at = 0.0
+        self._tzinfo_cache = None
+        cache = getattr(self, "_recall_cache", None)
+        if cache is not None:
+            try:
+                cfg = self._global_cfg()
+                # ttl/容量统一走 configure：ttl<=0 表示关闭缓存（P2-2）。
+                cache.configure(
+                    cfg.memory_rag.recall_cache_ttl,
+                    cfg.memory_rag.recall_cache_entries,
+                )
+            except Exception as exc:  # 配置解析失败不应阻断保存流程
+                logger.debug(f"[ActiveReply] 刷新召回缓存配置失败: {exc}")
+            cache.invalidate()
+
+    def _invalidate_recall_cache(self, reason: str = "") -> None:
+        """数据变更后立即让召回缓存失效，避免注入已删除/已修改的旧卡片（M-05）。"""
+        cache = getattr(self, "_recall_cache", None)
+        if cache is None:
+            return
+        try:
+            cache.invalidate()
+        except Exception as exc:
+            logger.debug(f"[ActiveReply] 召回缓存失效失败: {exc}")
+            return
+        if reason:
+            logger.debug("[ActiveReply] 召回缓存已失效 | %s", reason)
+
+    def _buffer_access(self, memory_ids: list[int]) -> None:
+        """请求路径只累积访问计数，由后台窗口批量落库（L-02/A-01）。"""
+        ids = [int(item) for item in memory_ids if int(item or 0)]
+        if not ids:
+            return
+        buffer = getattr(self, "_access_buffer", None)
+        if buffer is not None:
+            buffer.add(ids)
+            return
+        if self.memory_store is None:
+            return
+        # 兜底：没有批量缓冲时仍走后台线程，绝不在请求路径同步写库。
+        self._spawn(
+            asyncio.to_thread(self.memory_store.bump_access, ids),
+            name="areply-bump-access",
+        )
 
     def _touch(self, origin: str, cfg: PluginConfig) -> None:
         """刷新会话来源的 LRU 顺序，并按配置上限淘汰旧状态。"""
@@ -619,6 +856,32 @@ class ActiveReplyPlugin(star.Star):
                 return False
         return True
 
+    @staticmethod
+    def _addressed_to_bot(event: AstrMessageEvent) -> bool:
+        """判断群消息是否在对 Bot 说话：唤醒指令、@Bot 或引用 Bot（M-02）。
+
+        关键词记忆只对「说给 Bot 听」的消息生效，避免群里第三人称闲聊
+        里出现「记住」就被写成长期记忆。
+        """
+        if getattr(event, "is_at_or_wake_command", False):
+            return True
+        self_id = str(event.get_self_id() or "")
+        if not self_id:
+            return False
+        try:
+            components = event.get_messages()
+        except Exception:
+            return False
+        for comp in components:
+            if isinstance(comp, At) and str(getattr(comp, "qq", "")) == self_id:
+                return True
+            if (
+                isinstance(comp, Reply)
+                and str(getattr(comp, "sender_id", "")) == self_id
+            ):
+                return True
+        return False
+
     # ------------------------------------------------------------------ #
     # 生命周期
     # ------------------------------------------------------------------ #
@@ -636,6 +899,8 @@ class ActiveReplyPlugin(star.Star):
             self.memory_store.set_display_timezone(timezone_name)
         self._install_log_buffer()
         self._start_maintenance()
+        self._start_access_flush()
+        self.extractions.start()
         logger.info(
             "[ActiveReply] 已加载 | 主动回复=%s(%s) 上下文增强=%s React=%s 智能回复=%s "
             "联网搜索=%s 记忆RAG=%s 时区=%s",
@@ -648,7 +913,31 @@ class ActiveReplyPlugin(star.Star):
             cfg.memory_rag.enable,
             self._resolve_timezone_name(),
         )
+        if cfg.group_context.max_messages > 80:
+            logger.warning(
+                "[ActiveReply] 群聊历史上限=%s 条，数值较大；历史每轮都会注入，"
+                "可能显著增加 token 与延迟，建议调到 40 左右并配置 history_max_chars",
+                cfg.group_context.max_messages,
+            )
+        if cfg.runtime.model_choice_timeout > 30:
+            # L-06：判定多一次模型往返，默认 45s 偏大；只提示，不擅自改默认值。
+            logger.warning(
+                "[ActiveReply] 主动回复判定超时=%.0fs，模型慢时会明显拖后插话；"
+                "建议在真实模型上确认后调低",
+                cfg.runtime.model_choice_timeout,
+            )
         if cfg.memory_rag.enable:
+            logger.info(
+                "[ActiveReply] 记忆检索配置 | 词法=%s 注入=%s条/%s字 在线扫描=%s "
+                "最低相似度=%.2f 向量缓存=%ss×%s",
+                cfg.memory_rag.lexical_recall,
+                cfg.memory_rag.inject_max_items,
+                cfg.memory_rag.inject_max_chars,
+                cfg.memory_rag.online_scan_limit,
+                cfg.memory_rag.min_similarity,
+                cfg.memory_rag.embedding_cache_ttl,
+                cfg.memory_rag.embedding_cache_size,
+            )
             logger.info(
                 "[ActiveReply] 记忆自动抽取配置 | 自动=%s 累计=%s 间隔=%s 分钟 "
                 "最低置信度=%.2f 私聊频率=%s",
@@ -668,12 +957,109 @@ class ActiveReplyPlugin(star.Star):
                 logger.debug(f"[ActiveReply] 检查 Embedding 提供商失败: {exc}")
 
     async def terminate(self) -> None:
-        """插件卸载时移除日志捕获。"""
+        """插件卸载时停止维护循环与后台任务，再移除日志捕获。
+
+        维护循环是 ``while True`` 任务，不取消会一直持有旧实例、旧 SQLite
+        连接与旧配置；重载几次就会叠加几条循环，日志里出现重复归档。
+        """
+        self.extractions.stop()
+        # 卸载前把累积的访问计数落库一次（L-02）；有界等待，失败不拖住卸载。
+        buffer = getattr(self, "_access_buffer", None)
+        if buffer is not None:
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(buffer.aclose(), timeout=2)
+        pending = [
+            task
+            for task in [
+                self._maintenance_task,
+                getattr(self, "_access_flush_task", None),
+                *self._background_tasks,
+            ]
+            if task is not None and not task.done()
+        ]
+        for task in pending:
+            task.cancel()
+        if pending:
+            # 有界等待：即使某个任务卡在模型调用上，也不能拖住卸载流程。
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(
+                    asyncio.gather(*pending, return_exceptions=True), timeout=5
+                )
+        self._maintenance_task = None
+        self._background_tasks.clear()
         handler = getattr(self, "_log_handler", None)
         if handler is not None:
             with contextlib.suppress(Exception):
                 logger.removeHandler(handler)
         logger.info("[ActiveReply] 插件已卸载")
+
+    def _spawn(self, coro: Any, *, name: str) -> None:
+        """启动后台任务并保存强引用。
+
+        ``asyncio`` 只对任务持弱引用，不保存引用时任务可能执行到一半被回收，
+        异常也只会变成「Task exception was never retrieved」。
+        """
+        try:
+            task = asyncio.create_task(coro, name=name)
+        except Exception as exc:
+            # 没有运行中的事件循环时要把协程关掉，否则会留下未 await 警告。
+            close = getattr(coro, "close", None)
+            if callable(close):
+                close()
+            logger.debug(f"[ActiveReply] 启动后台任务失败({name}): {exc}")
+            return
+        tasks = getattr(self, "_background_tasks", None)
+        if tasks is None:
+            # 少数直接构造插件对象的测试/宿主路径没有初始化集合，这里懒初始化，
+            # 避免后台任务因缺属性直接抛错。
+            tasks = set()
+            self._background_tasks = tasks
+        tasks.add(task)
+        task.add_done_callback(self._finish_background_task)
+
+    def _finish_background_task(self, task: asyncio.Task) -> None:
+        """回收后台任务引用，并把未处理的异常写入日志。"""
+        self._background_tasks.discard(task)
+        if task.cancelled():
+            return
+        try:
+            exc = task.exception()
+        except Exception:
+            return
+        if exc is not None:
+            logger.warning(
+                f"[ActiveReply] 后台任务异常({task.get_name()}): "
+                f"{type(exc).__name__}: {exc}"
+            )
+
+    def _start_access_flush(self) -> None:
+        """启动访问计数批量落库的后台循环（L-02/A-01）。"""
+        buffer = getattr(self, "_access_buffer", None)
+        if buffer is None:
+            return
+        task = getattr(self, "_access_flush_task", None)
+        if task is not None and not task.done():
+            return
+        try:
+            self._access_flush_task = asyncio.create_task(
+                self._access_flush_loop(), name="areply-access-flush"
+            )
+        except Exception as exc:
+            logger.debug(f"[ActiveReply] 启动访问计数刷写失败: {exc}")
+
+    async def _access_flush_loop(self) -> None:
+        """每 3 秒把累积的记忆访问计数合并写库，失败只告警不退出。"""
+        buffer = self._access_buffer
+        if buffer is None:
+            return
+        while True:
+            await asyncio.sleep(3.0)
+            try:
+                await buffer.flush()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(f"[ActiveReply] 访问计数刷写失败: {exc}")
 
     # ------------------------------------------------------------------ #
     # 页面后端
@@ -724,10 +1110,34 @@ class ActiveReplyPlugin(star.Star):
                 "删除记忆",
             ),
             (
+                f"/{PLUGIN_NAME}/rag/<memory_id>/archive",
+                self.page_api.rag_archive,
+                ["POST"],
+                "归档记忆",
+            ),
+            (
+                f"/{PLUGIN_NAME}/rag/<memory_id>/unarchive",
+                self.page_api.rag_unarchive,
+                ["POST"],
+                "取消归档记忆",
+            ),
+            (
+                f"/{PLUGIN_NAME}/rag/<memory_id>/purge",
+                self.page_api.rag_purge,
+                ["POST"],
+                "彻底删除记忆",
+            ),
+            (
                 f"/{PLUGIN_NAME}/rag/restore",
                 self.page_api.rag_restore,
                 ["POST"],
                 "撤销删除记忆",
+            ),
+            (
+                f"/{PLUGIN_NAME}/config/prompt-preview",
+                self.page_api.prompt_preview,
+                ["POST"],
+                "最终提示词预览",
             ),
             (
                 f"/{PLUGIN_NAME}/rag/cleanup",
@@ -740,6 +1150,30 @@ class ActiveReplyPlugin(star.Star):
                 self.page_api.rag_selftest,
                 ["POST"],
                 "记忆 RAG 自检",
+            ),
+            (
+                f"/{PLUGIN_NAME}/dev/login",
+                self.page_api.dev_login,
+                ["POST"],
+                "开发者登录",
+            ),
+            (
+                f"/{PLUGIN_NAME}/dev/logout",
+                self.page_api.dev_logout,
+                ["POST"],
+                "开发者退出",
+            ),
+            (
+                f"/{PLUGIN_NAME}/dev/prompts",
+                self.page_api.dev_prompts,
+                ["POST"],
+                "开发者提示词读取",
+            ),
+            (
+                f"/{PLUGIN_NAME}/dev/prompts/save",
+                self.page_api.dev_prompts_save,
+                ["POST"],
+                "开发者提示词保存",
             ),
             (
                 f"/{PLUGIN_NAME}/memory/auto",
@@ -821,36 +1255,30 @@ class ActiveReplyPlugin(star.Star):
             if cache:
                 role_tag = cache[1].get(sender_id, role_tag)
 
-        header_parts = [nickname]
-        if ctx_cfg.include_sender_id:
-            header_parts.append(sender_id)
-        header_parts.append(now_text)
-        header = f"[{'/'.join(header_parts)}]"
-        if role_tag:
-            header += f"({role_tag})"
-        if normalized_id:
-            header += f" #msg{normalized_id}:"
-
-        # 记忆历史始终带发送者 ID 和完整日期，避免群聊上下文关闭 ID 时
-        # 抽取器无法解析，也避免摘要模型只能看到 HH:MM:SS 后猜错日期。
-        memory_nick = nickname.replace("/", "／").replace("[", "［").replace("]", "］")
-        memory_header = f"[{memory_nick}/{sender_id or '0'}/{memory_time_text}]"
-        if role_tag:
-            memory_header += f"({role_tag})"
-        if normalized_id:
-            memory_header += f" #msg{normalized_id}:"
-
+        # 行格式统一由 history_format 生成：昵称在引号内并已清洗，用户改名
+        # 造不出 [SELF/ 行首；记忆历史始终带发送者 ID 与完整日期。
+        # F11：正文/引用/昵称/@ 名都是用户可控文本，进历史前必须单行化并
+        # 转义方括号，否则换行 + "[SELF/..." 可伪造一整条历史行。只清洗用户
+        # 原文，[Quote ...]/[At: ...]/[Image] 这些结构标记由这里追加，不清洗。
         segments: list[str] = []
         image_urls: list[str] = []
         for comp in event.get_messages():
             if isinstance(comp, Reply):
-                quote_nick = str(getattr(comp, "sender_nickname", "") or "未知")
-                quote_text = str(getattr(comp, "message_str", "") or "").strip()
+                quote_nick = sanitize_inline(
+                    getattr(comp, "sender_nickname", "") or "未知",
+                    MAX_INLINE_HISTORY_CHARS,
+                )
+                quote_text = sanitize_inline(
+                    str(getattr(comp, "message_str", "") or ""),
+                    MAX_INLINE_HISTORY_CHARS,
+                )
                 quote_id = normalize_target_id(getattr(comp, "id", ""))
                 prefix = f"#msg{quote_id} " if quote_id else ""
                 segments.append(f" [Quote {prefix}{quote_nick}: {quote_text or '...'}]")
             elif isinstance(comp, Plain):
-                segments.append(f" {comp.text}")
+                segments.append(
+                    f" {sanitize_inline(comp.text, MAX_INLINE_HISTORY_CHARS)}"
+                )
             elif isinstance(comp, Image):
                 image_ref = str(comp.url or comp.file or "").strip()
                 if not image_ref:
@@ -858,10 +1286,30 @@ class ActiveReplyPlugin(star.Star):
                 image_urls.append(image_ref)
                 segments.append(" [Image]")
             elif isinstance(comp, At):
-                segments.append(f" [At: {comp.name or comp.qq}]")
+                at_name = sanitize_inline(
+                    comp.name or comp.qq, MAX_INLINE_HISTORY_CHARS
+                )
+                segments.append(f" [At: {at_name}]")
 
-        line = header + "".join(segments)
-        memory_line = memory_header + "".join(segments)
+        body_text = "".join(segments).strip()
+        line = format_user_line(
+            nickname,
+            sender_id,
+            now_text,
+            role_tag=role_tag,
+            msg_id=normalized_id,
+            body=body_text,
+            include_uid=ctx_cfg.include_sender_id,
+        )
+        memory_line = format_user_line(
+            nickname,
+            sender_id or "0",
+            memory_time_text,
+            role_tag=role_tag,
+            msg_id=normalized_id,
+            body=body_text,
+            include_uid=True,
+        )
         self._touch(origin, cfg)
 
         removed = ""
@@ -881,11 +1329,15 @@ class ActiveReplyPlugin(star.Star):
         self.state.remember_sender(origin, sender_id, nickname)
 
         if normalized_id and image_urls:
-            self.state.image_registry[origin][normalized_id] = {
-                "urls": image_urls,
-                "captions": {},
-                "resolved": [""] * len(image_urls),
-            }
+            self.state.remember_images(
+                origin,
+                normalized_id,
+                {
+                    "urls": image_urls,
+                    "captions": {},
+                    "resolved": [""] * len(image_urls),
+                },
+            )
         logger.debug(
             "[ActiveReply] 记录群消息 | origin=%s | dialogue=%s | memory=%s",
             origin,
@@ -914,13 +1366,14 @@ class ActiveReplyPlugin(star.Star):
         Yields:
             AstrBot 请求 LLM 回复时产生的事件处理结果。
         """
+        if is_synthetic_event(event):
+            return
         if event.get_message_type() != MessageType.GROUP_MESSAGE:
             return
 
         # 流式输出会绕过 on_decorating_result，标签会被原样发出；模型还可能从
-        # 历史里模仿出 <quote/> 写法。凡是本插件看得到的群消息都关掉流式，
-        # 这样 @ / 唤醒回复也会走非流式路径（token 用量才完整）。
-        event.set_extra("enable_streaming", False)
+        # 历史里模仿出 <quote/> 写法。是否必须关流式取决于配置，取到 cfg 后再判断，
+        # 避免只开了记忆 RAG 的群也被迫放弃流式输出。
 
         # 屏蔽优先于一切处理：被屏蔽用户的消息（含指令）都不进入插件逻辑
         if await self._enforce_user_block(event):
@@ -934,10 +1387,16 @@ class ActiveReplyPlugin(star.Star):
             return
 
         cfg = self.cfg_for_event(event)
+        # 本插件会改写/转换本轮输出，必须走非流式：流式分支不经过
+        # on_decorating_result，<mention/>、<quote/> 会被原样发出去。
+        # 群消息入口是宿主读取 enable_streaming 之前最早的钩子（F15 主保险）。
+        self._forbid_streaming(event, cfg)
         # 新的一轮消息：重置 token 用量与执行日志（@ 唤醒的回复也要单独计一轮）
         self.state.reset_turn(event.unified_msg_origin)
         # 只要收到过群消息就标记该群活跃（即使历史增强关闭，状态页也能看到）
         self._touch(event.unified_msg_origin, cfg)
+        # 群主/群管身份后台预热：供记忆角色徽标与历史角色标记使用（不阻塞回复）。
+        self._prime_group_roles(event)
 
         self._journal(
             event.unified_msg_origin,
@@ -999,6 +1458,8 @@ class ActiveReplyPlugin(star.Star):
     @filter.event_message_type(filter.EventMessageType.PRIVATE_MESSAGE)
     async def on_private_message(self, event: AstrMessageEvent) -> None:
         """私聊：先做屏蔽检查，再按条数收集并总结私聊记忆。"""
+        if is_synthetic_event(event):
+            return
         if await self._enforce_user_block(event):
             return
         cfg = self._global_cfg()
@@ -1026,7 +1487,8 @@ class ActiveReplyPlugin(star.Star):
         )
         role = "owner" if event.is_admin() else "member"
         window_size = max(10, min(30, int(cfg.memory_rag.private_extract_every_n) * 2))
-        asyncio.create_task(
+        persona_name, _ = await self._resolve_persona(event)
+        self._spawn(
             self._extract_memories(
                 origin,
                 list(self.state.memory_history(origin))[-window_size:],
@@ -1035,7 +1497,10 @@ class ActiveReplyPlugin(star.Star):
                 scope_override=scope,
                 sender_id_override=user_id,
                 sender_role_override=role,
-            )
+                self_id=self._resolve_self_id(event),
+                persona_name=persona_name,
+            ),
+            name="areply-private-memory",
         )
 
     def _format_private_message(self, event: AstrMessageEvent) -> str:
@@ -1045,14 +1510,15 @@ class ActiveReplyPlugin(star.Star):
         sender_id = str(event.get_sender_id() or "")
         stamp = datetime.datetime.now(self._tzinfo()).strftime("%Y-%m-%d %H:%M:%S")
         msg_id = normalize_target_id(getattr(event.message_obj, "message_id", ""))
-        text = str(event.message_str or "").strip()
-        safe_nickname = (
-            nickname.replace("/", "／").replace("[", "［").replace("]", "］")
+        # F11：私聊正文同样是用户原文，单行化后才能写进记忆历史。
+        text = sanitize_inline(event.message_str or "", MAX_INLINE_HISTORY_CHARS)
+        return format_user_line(
+            nickname,
+            sender_id or "0",
+            stamp,
+            msg_id=msg_id,
+            body=text,
         )
-        header = f"[{safe_nickname}/{sender_id}/{stamp}]"
-        if msg_id:
-            header += f" #msg{msg_id}:"
-        return f"{header} {text}"
 
     async def _decide_reply(self, event: AstrMessageEvent, cfg: PluginConfig) -> bool:
         """根据主动回复模式做一次触发判断，并维护该会话的消息计数。
@@ -1284,11 +1750,16 @@ class ActiveReplyPlugin(star.Star):
         其他项或原始 LLM 请求。最后安装流式/普通发送包装器作为标签转换的
         兜底；对可控的群消息关闭流式输出时，装饰钩子仍可执行完整转换。
         """
-        if event.get_message_type() == MessageType.GROUP_MESSAGE:
-            # 双保险：即使入口钩子被其他插件提前终止，这里也强制非流式
-            event.set_extra("enable_streaming", False)
-            event.set_extra("_areply_stream_forbidden", True)
+        if is_synthetic_event(event):
+            return
         cfg = self.cfg_for_event(event)
+        if event.get_message_type() == MessageType.GROUP_MESSAGE:
+            # 时序边界（F15）：宿主在进入 LLM 阶段前就读取 enable_streaming
+            # （4.15 的 internal.py 在 process() 开头读取），on_llm_request 晚于
+            # 该读取点，单独在这里设置对已经在跑的请求无效；真正生效的是
+            # on_group_message 的提前设置。这里再设一次是幂等兜底，并记录
+            # _areply_stream_forbidden 供 /replytest 展示。
+            self._forbid_streaming(event, cfg)
         if cfg.role_display_enabled:
             try:
                 self._inject_role(event, req)
@@ -1301,182 +1772,35 @@ class ActiveReplyPlugin(star.Star):
                 logger.error(f"[ActiveReply] 注入群聊上下文失败: {exc}", exc_info=True)
         if cfg.memory_rag.enable:
             try:
-                req.system_prompt = (req.system_prompt or "") + MEMORY_INSTRUCTIONS
+                if MEMORY_INSTRUCTIONS not in (req.system_prompt or ""):
+                    req.system_prompt = (req.system_prompt or "") + MEMORY_INSTRUCTIONS
             except Exception as exc:
                 logger.debug(f"[ActiveReply] 注入记忆提示失败: {exc}")
             try:
-                await self._inject_recalled_memories(event, req)
+                await self._inject_recalled_memories(event, req, cfg)
             except Exception as exc:
                 logger.debug(f"[ActiveReply] 自动回忆注入失败: {exc}")
         # 流式回复不经过 on_decorating_result，这里给发送函数包一层处理标签
         self._patch_streaming_send(event, cfg)
         # 最后一道兜底：发送前再清理一次残留标签（覆盖任何绕过装饰钩子的路径）
-        self._patch_send(event, cfg)
+        self._patch_send(event)
+        self._track_system_prefix(event, req)
 
-    def _should_recall(self, event: AstrMessageEvent, text: str) -> bool:
-        """判断是否需要自动回忆：疑问 + 人称/时间，或命中已出现过的实体。"""
-        if not text:
-            return False
-        question = any(mark in text for mark in RECALL_QUESTION_MARKS)
-        person = any(word in text for word in RECALL_PRONOUNS)
-        time_word = any(word in text for word in RECALL_TIME_WORDS)
-        if question and (person or time_word):
-            return True
-        if any(word in text for word in RECALL_KEYWORDS):
-            return True
-        for line in list(self.state.session_chats.get(event.unified_msg_origin, []))[
-            -20:
-        ]:
-            match = re.match(r"\[([^/\]]{2,20})/", line)
-            if match and match.group(1) in text:
-                return True
-        return False
-
-    @staticmethod
-    def _rerank_score(
-        item: dict[str, Any],
-        text: str,
-        sender: str,
-        now: float,
-        half_life_days: float,
-    ) -> float:
-        """本地重排：相似度 + 关键词重合 + 角色匹配 + 时间衰减 + 重要性。"""
-        similarity = float(item.get("similarity") or 0.0)
-        content = str(item.get("content") or "")
-        meta = item.get("extra_metadata") or {}
-        topics = meta.get("topics") if isinstance(meta, dict) else None
-        topic_text = " ".join(str(topic) for topic in topics or [])
-        source_text = f"{content} {topic_text}".strip()
-        a = {text[i : i + 2] for i in range(max(0, len(text) - 1))}
-        b = {source_text[i : i + 2] for i in range(max(0, len(source_text) - 1))}
-        overlap = len(a & b) / max(1, len(a))
-        roles = [str(role) for role in item.get("related_role_ids") or []]
-        role_bonus = 1.0 if sender and sender in roles else 0.0
-        memory_time = float(item.get("memory_time") or now)
-        age_days = max(0.0, (now - memory_time) / 86400)
-        decay = max(0.2, math.exp(-age_days / max(1.0, half_life_days)))
-        importance = float(
-            item.get("importance") if item.get("importance") is not None else 0.5
-        )
-        participants = meta.get("participants") if isinstance(meta, dict) else None
-        mentioned = any(
-            str(name) in text
-            for name in participants or []
-            if len(str(name).strip()) >= 2
-        )
-        base = (
-            similarity * 0.55
-            + overlap * 0.2
-            + role_bonus * 0.1
-            + decay * 0.1
-            + (0.05 if mentioned else 0.0)
-        )
-        return base * (0.5 + importance) * decay
-
-    async def _inject_recalled_memories(
+    def _track_system_prefix(
         self, event: AstrMessageEvent, req: ProviderRequest
     ) -> None:
-        """自动回忆：规则触发一次 embedding，召回 top20 后本地重排并限量注入。"""
-        if event.get_extra("_areply_memory_recalled"):
-            return
-        text = str(event.message_str or "").strip()
-        if not text or not self._should_recall(event, text):
-            return
-        if self.memory_store is None:
-            return
-        provider = self._embedding_provider()
-        if provider is None:
-            return
-        # 每条消息最多触发一次 embedding
-        event.set_extra("_areply_memory_recalled", True)
-        try:
-            vector = await asyncio.wait_for(provider.get_embedding(text), timeout=3)
-        except Exception as exc:
-            logger.debug(f"[ActiveReply] 回忆向量化失败: {exc}")
-            return
-        cfg = self._global_cfg()
-        sender = str(event.get_sender_id() or "").strip()
-        platform_id = self._platform_id(event)
-        if event.get_message_type() == MessageType.GROUP_MESSAGE:
-            scope = self._canonical_scope(platform_id, self._group_id(event))
-        else:
-            scope = (
-                f"{platform_id}:private:{sender}"
-                if platform_id
-                else f"private:{sender}"
-            )
-        records: list[dict[str, Any]] = []
-        seen: set[int] = set()
-        used_scopes: list[str] = []
-        for search_scope in self._recall_scopes(cfg, scope):
-            used_scopes.append(search_scope or "(global)")
-            try:
-                hits = self.memory_store.search_memories(
-                    query_embedding=vector,
-                    recall_k=20,
-                    group_scope=search_scope,
-                    max_results=20,
-                )
-            except Exception as exc:
-                logger.debug(f"[ActiveReply] 回忆检索失败: {exc}")
-                continue
-            for item in hits:
-                memory_id = int(item.get("memory_id") or 0)
-                if memory_id in seen:
-                    continue
-                seen.add(memory_id)
-                records.append(item)
-        if not records:
-            logger.info(
-                "[ActiveReply] 记忆自动回忆 | origin=%s hits=0 scopes=%s",
-                event.unified_msg_origin,
-                ",".join(used_scopes),
-            )
-            return
-        now = time.time()
-        half_life = float(cfg.memory_rag.decay_half_life_days)
-        for item in records:
-            item["_score"] = self._rerank_score(item, text, sender, now, half_life)
-        records.sort(key=lambda item: float(item.get("_score") or 0), reverse=True)
-        max_items = max(0, min(15, int(cfg.memory_rag.inject_max_items)))
-        if max_items == 0:
-            return
-        budget = max(200, int(cfg.memory_rag.inject_max_chars))
-        chosen: list[dict[str, Any]] = []
-        used = 0
-        for item in records:
-            content = str(item.get("content") or "").replace("\n", " ").strip()
-            stamp = str(item.get("memory_time_iso") or "")[:10]
-            line = f"- [{stamp}] {content}"
-            if chosen and used + len(line) > budget:
-                continue
-            if not chosen and len(line) > budget:
-                line = line[:budget]
-            chosen.append(item)
-            used += len(line)
-            if len(chosen) >= max_items:
-                break
-        if not chosen:
-            return
-        lines = [
-            "",
-            "## 相关长期记忆（来自记忆库，回答时优先参考；与当前问题无关可忽略）",
-        ]
-        for item in chosen:
-            content = str(item.get("content") or "").replace("\n", " ").strip()
-            stamp = str(item.get("memory_time_iso") or "")[:10]
-            lines.append(f"- [{stamp}] {content}")
-        req.system_prompt = (req.system_prompt or "") + "\n".join(lines)
-        self.memory_store.bump_access(
-            [int(item.get("memory_id") or 0) for item in chosen]
-        )
-        logger.info(
-            "[ActiveReply] 记忆自动回忆 | origin=%s hits=%s scopes=%s chars=%s",
-            event.unified_msg_origin,
-            len(chosen),
-            ",".join(used_scopes),
-            used,
-        )
+        """记录本轮 system 段指纹，判断前缀缓存是否仍然可用。
+
+        历史与记忆都放到 user 侧临时块之后，system 段应当逐轮稳定；这里把
+        “与上一轮相同”记成 1、“发生变化”记成 0，供 ``/replytest`` 展示。
+        """
+        origin = event.unified_msg_origin
+        text = str(getattr(req, "system_prompt", "") or "")
+        digest = hash(text)
+        previous = self.state.last_system_hash.get(origin)
+        self.state.last_system_hash[origin] = digest
+        stable = 1 if previous is None or previous == digest else 0
+        self.state.bump_metric(origin, "cache_prefix_stable", stable)
 
     def _inject_role(self, event: AstrMessageEvent, req: ProviderRequest) -> None:
         """在 system_reminder 中补上 admin/member 角色标记。"""
@@ -1514,6 +1838,25 @@ class ActiveReplyPlugin(star.Star):
         reminder = f"<system_reminder>Role: {role}</system_reminder>"
         req.extra_user_content_parts.append(TextPart(text=reminder))
 
+    @staticmethod
+    def _trim_history_by_budget(lines: list[str], max_chars: int) -> list[str]:
+        """按字符预算裁剪群聊历史，从最早的消息开始丢弃。
+
+        条数上限只能约束条数：一条长消息就可能吃掉上千 token。这里再按字符
+        预算裁一次，保证每轮注入的历史规模可控，同时保留最近的消息。
+        """
+        budget = max(200, int(max_chars or 0))
+        kept: list[str] = []
+        used = 0
+        for line in reversed(lines):
+            size = len(line) + 1
+            if kept and used + size > budget:
+                break
+            kept.append(line)
+            used += size
+        kept.reverse()
+        return kept
+
     def _inject_context(
         self, event: AstrMessageEvent, req: ProviderRequest, cfg: PluginConfig
     ) -> None:
@@ -1521,11 +1864,15 @@ class ActiveReplyPlugin(star.Star):
 
         普通回复时，当前消息已经由 AstrBot 放入请求，因此若历史末尾对应
         当前消息就先移除，防止模型看到两遍；主动回复则需要明确告诉模型
-        最新群消息并给出接话要求。React 模式会重建用户提示词以符合“基于
-        群聊记录作出反应”的行为，其余模式只追加 system prompt，尽量不改写
-        框架原有的用户消息内容。
+        最新群消息并给出接话要求。历史与提示统一走 ``extra_user_content_parts``
+        的临时块，``system_prompt`` 保持逐轮稳定，避免击穿前缀缓存；旧版
+        AstrBot 没有临时块时才回退到原路径。
         """
-        # 在普通模式追加历史；React 模式则以历史和当前消息重建完整 prompt。
+        # system 段保持静态，历史与参与提示都放到本轮临时内容块里。
+        if getattr(req, "_areply_context_injected", False):
+            return
+        with contextlib.suppress(Exception):
+            req._areply_context_injected = True  # type: ignore[attr-defined]
         origin = event.unified_msg_origin
         chats = self.state.session_chats.get(origin)
         if not chats:
@@ -1545,6 +1892,9 @@ class ActiveReplyPlugin(star.Star):
             ):
                 # 正常回复时，当前消息会单独出现在 prompt 里，历史中不再重复
                 history_lines = history_lines[:-1]
+        history_lines = self._trim_history_by_budget(
+            history_lines, cfg.group_context.history_max_chars
+        )
         history_text = (
             bounded_chat_history(history_lines)
             if history_lines
@@ -1573,19 +1923,10 @@ class ActiveReplyPlugin(star.Star):
                 "\n\n需要实时信息时可以调用 `grok_web_search(query)` 联网检索。"
             )
 
-        if not cfg.react_enabled:
-            req.system_prompt = (
-                (req.system_prompt or "")
-                + "\n\n### 群聊历史\n"
-                + history_text
-                + instructions
-            )
-            return
-
-        # 按官方建议：不去改写 req.prompt、也不清空 req.contexts，
-        # 而是把群聊历史与参与提示作为「临时用户内容块」追加到本轮请求。
-        # 临时块带 _no_save 标记，不会写进会话历史，因此既不影响后续轮次，
-        # 也保留了已有上下文的缓存前缀。
+        # 按官方建议：不去改写 req.prompt、也不清空 req.contexts，而是把
+        # 群聊历史与参与提示作为「临时用户内容块」追加到本轮请求。临时块带
+        # _no_save 标记，不会写进会话历史；system 段逐轮保持稳定，前缀缓存
+        # 才能命中。React Pattern 只影响参与提示的措辞，不再决定注入位置。
         if active_triggered:
             guidance = (
                 "\n\n### 参与提示\n"
@@ -1604,15 +1945,23 @@ class ActiveReplyPlugin(star.Star):
             f"{history_text}{guidance}{instructions}"
         )
         parts = getattr(req, "extra_user_content_parts", None)
-        if parts is None:
-            # 旧版 AstrBot 没有临时内容块：只追加到提示词尾部，仍不清空上下文
-            req.prompt = f"{req.prompt or ''}{block}"
+        if parts is not None:
+            part = TextPart(text=block.strip())
+            marker = getattr(part, "mark_as_temp", None)
+            if callable(marker):
+                marker()
+            parts.append(part)
             return
-        part = TextPart(text=block.strip())
-        marker = getattr(part, "mark_as_temp", None)
-        if callable(marker):
-            marker()
-        parts.append(part)
+        # 旧版 AstrBot 没有临时内容块：保持各自的历史行为，不清空上下文。
+        if cfg.react_enabled:
+            req.prompt = f"{req.prompt or ''}{block}"
+        else:
+            req.system_prompt = (
+                (req.system_prompt or "")
+                + "\n\n### 群聊历史\n"
+                + history_text
+                + instructions
+            )
 
     # ------------------------------------------------------------------ #
     # 结果处理
@@ -1620,13 +1969,45 @@ class ActiveReplyPlugin(star.Star):
     # ------------------------------------------------------------------ #
     # 流式输出的标签处理
     # ------------------------------------------------------------------ #
+    @staticmethod
+    def _needs_non_streaming(cfg: PluginConfig) -> bool:
+        """判断本轮是否必须关闭流式输出。
+
+        只有会注入群聊历史/互动规则、或需要把模型输出里的 ``<mention/>``、
+        ``<quote/>`` 转换成平台组件的配置才必须非流式；流式分支不经过
+        ``on_decorating_result``，标签会原样发出。只开记忆 RAG 的群没有这个
+        需要，保留用户原本的流式体验，也避免别的插件被连带影响。
+        """
+        return bool(cfg.group_context.enable or cfg.smart_reply_enabled)
+
+    def _forbid_streaming(
+        self, event: AstrMessageEvent, cfg: PluginConfig, *, force: bool = False
+    ) -> None:
+        """需要时在事件上关闭流式输出（幂等）。
+
+        F15：关闭流式必须发生在宿主读取 ``enable_streaming`` 之前。宿主在进入
+        LLM 阶段前就读取该标记（4.15 ``internal.py`` 的 ``process()`` 开头），
+        ``on_llm_request`` 只在进入 agent 之后触发、晚于读取点；因此这里由
+        ``on_group_message`` 提前调用作为主保险，``on_llm_request`` 再调用一次
+        只是幂等兜底（并写 ``_areply_stream_forbidden`` 供 /replytest 展示）。
+        绕过消息钩子直接进入 LLM 的宿主路径无法更早设置，属于宿主时序边界，
+        不能通过改宿主行为解决。``set_extra`` 缺失时静默跳过以兼容旧宿主。
+        """
+        if not force and not self._needs_non_streaming(cfg):
+            return
+        try:
+            event.set_extra("enable_streaming", False)
+            event.set_extra("_areply_stream_forbidden", True)
+        except Exception as exc:
+            logger.debug(f"[ActiveReply] 关闭流式输出失败: {exc}")
+
     def _patch_streaming_send(self, event: AstrMessageEvent, cfg: PluginConfig) -> None:
         """给 event.send_streaming 包一层，逐段处理 @ / 引用标签。
 
         AstrBot 的流式分支直接调用 ``event.send_streaming``，不会走
         ``on_decorating_result``；若不拦截，<mention/> 与 <quote/> 会被原样发出。
         """
-        if getattr(event, "_areply_stream_patched", False):
+        if event.get_extra("_areply_stream_patched"):
             return
         original = getattr(event, "send_streaming", None)
         if not callable(original):
@@ -1658,9 +2039,9 @@ class ActiveReplyPlugin(star.Star):
         except Exception as exc:
             logger.debug(f"[ActiveReply] 挂载流式处理失败: {exc}")
 
-    def _patch_send(self, event: AstrMessageEvent, cfg: PluginConfig) -> None:
+    def _patch_send(self, event: AstrMessageEvent) -> None:
         """给 event.send 包一层：发送前再清理一次残留标签，作为最后兜底。"""
-        if getattr(event, "_areply_send_patched", False):
+        if event.get_extra("_areply_send_patched"):
             return
         original = getattr(event, "send", None)
         if not callable(original):
@@ -1672,7 +2053,7 @@ class ActiveReplyPlugin(star.Star):
             """清理单条待发送消息后委托给 AstrBot 原发送方法。"""
             # 在 AstrBot 原发送方法之前执行最后一道消息标签清理。
             try:
-                message = plugin._transform_outgoing(event, cfg, message)
+                message = plugin._transform_outgoing(event, message)
             except Exception as exc:  # 兜底失败不能影响正常发送
                 logger.debug(f"[ActiveReply] 发送前标签清理失败: {exc}")
                 message = message
@@ -1686,34 +2067,46 @@ class ActiveReplyPlugin(star.Star):
         except Exception as exc:
             logger.debug(f"[ActiveReply] 挂载发送前清理失败: {exc}")
 
-    def _transform_outgoing(self, event: AstrMessageEvent, cfg: PluginConfig, message):
-        """把待发送消息里的标签清理掉（找不到目标时只删标签，保留正文）。"""
-        chain = getattr(message, "chain", None)
-        if not isinstance(chain, list) or not chain:
-            return message
+    def _transform_chain(self, event: AstrMessageEvent, chain: list) -> list | None:
+        """统一的标签转换入口：白名单、自身 ID、昵称映射只在这里读取。"""
         origin = event.unified_msg_origin
-        if cfg.group_context.enable:
-            registry = self.state.message_senders.get(origin, {})
-            allowed_qq: set[str] | None = set(registry.values())
-            allowed_msg_ids: set[str] | None = set(registry.keys())
-        else:
-            allowed_qq = None
-            allowed_msg_ids = None
-        transformed = transform_result_chain(
+        # F46：无群历史时也传空集合而不是 None。None 表示“不限制”，会让模型
+        # 编造的 ID 被转成真实 @ / 引用；空集合表示“一个都不允许”。
+        registry = self.state.message_senders.get(origin, {})
+        return transform_result_chain(
             chain,
-            allowed_qq=allowed_qq,
-            allowed_msg_ids=allowed_msg_ids,
+            allowed_qq=set(registry.values()),
+            allowed_msg_ids=set(registry.keys()),
             self_id=str(event.get_self_id() or ""),
             max_mentions=MAX_MENTIONS_PER_MESSAGE,
             name_to_qq=self.state.name_map(origin),
         )
+
+    def _transform_outgoing(self, event: AstrMessageEvent, message):
+        """把待发送消息里的标签清理掉（找不到目标时只删标签，保留正文）。"""
+        chain = getattr(message, "chain", None)
+        if not isinstance(chain, list) or not chain:
+            return message
+        transformed = self._transform_chain(event, chain)
         if transformed is None:
             return message
         if not transformed:
-            logger.debug("[ActiveReply] 消息只包含无法解析的标签，已跳过发送")
-            return None
+            # F45：标签清理后整条为空时不能静默丢弃回复，回退到原始正文/占位。
+            logger.debug("[ActiveReply] 标签清理后无正文，回退原始文本发送")
+            transformed = self._fallback_plain_chain(chain)
         message.chain = transformed
         return message
+
+    @staticmethod
+    def _fallback_plain_chain(chain: list) -> list:
+        """标签都被清理掉时生成兜底文本链：原纯文本，否则中性占位（F45）。"""
+        texts = [
+            str(getattr(comp, "text", "") or "")
+            for comp in chain
+            if isinstance(comp, Plain)
+        ]
+        text = clean_text_for_history("".join(texts)).strip()
+        return [Plain(text=text)] if text else [Plain(text="……")]
 
     def _transform_stream_chunk(
         self, event: AstrMessageEvent, cfg: PluginConfig, chunk: Any
@@ -1732,23 +2125,9 @@ class ActiveReplyPlugin(star.Star):
         if not isinstance(components, list) or not components:
             return True
 
-        origin = event.unified_msg_origin
-        if cfg.group_context.enable:
-            registry = self.state.message_senders.get(origin, {})
-            allowed_qq: set[str] | None = set(registry.values())
-            allowed_msg_ids: set[str] | None = set(registry.keys())
-        else:
-            allowed_qq = None
-            allowed_msg_ids = None
-
-        transformed = transform_result_chain(
-            components,
-            allowed_qq=allowed_qq,
-            allowed_msg_ids=allowed_msg_ids,
-            self_id=str(event.get_self_id() or ""),
-            max_mentions=MAX_MENTIONS_PER_MESSAGE,
-            name_to_qq=self.state.name_map(origin),
-        )
+        # 流式分片里被清空的是“仅含标签的片段”，丢弃是正常逐段过滤
+        # （不能为每个空片段补占位，否则占位会重复出现）。
+        transformed = self._transform_chain(event, components)
         if transformed is None:
             return True
         if not transformed:
@@ -1764,38 +2143,24 @@ class ActiveReplyPlugin(star.Star):
         result = event.get_result()
         if not result or not result.chain:
             return
-        cfg = self.cfg_for_event(event)
         # 注意：这里不能按“智能回复”开关提前返回。模型经常从历史里模仿出
         # <quote id="..."/> 这种写法，即使没开智能回复也会出现在正文里；
         # 一律解析并剥离标签，避免把标签当成普通文字发出去。
         origin = event.unified_msg_origin
-        if cfg.group_context.enable:
-            allowed_qq: set[str] | None = set(
-                self.state.message_senders.get(origin, {}).values()
-            )
-            allowed_msg_ids: set[str] | None = set(
-                self.state.message_senders.get(origin, {}).keys()
-            )
-        else:
-            allowed_qq = None
-            allowed_msg_ids = None
-
-        transformed = transform_result_chain(
-            result.chain,
-            allowed_qq=allowed_qq,
-            allowed_msg_ids=allowed_msg_ids,
-            self_id=str(event.get_self_id() or ""),
-            max_mentions=MAX_MENTIONS_PER_MESSAGE,
-            name_to_qq=self.state.name_map(origin),
+        # 模型编造的 @ / 引用 ID 不会被转成真实组件。
+        transformed = self._transform_chain(event, result.chain)
+        if transformed is None:
+            return
+        if not transformed:
+            # F45：标签清理后整条为空时不能静默丢弃回复，回退原文/中性占位。
+            transformed = self._fallback_plain_chain(result.chain)
+        logger.debug(
+            "[ActiveReply] 标签解析 | origin=%s before=%s after=%s",
+            origin,
+            len(result.chain),
+            len(transformed),
         )
-        if transformed is not None:
-            logger.debug(
-                "[ActiveReply] 标签解析 | origin=%s before=%s after=%s",
-                origin,
-                len(result.chain),
-                len(transformed),
-            )
-            result.chain = transformed
+        result.chain = transformed
 
     # ------------------------------------------------------------------ #
     # 调试报告：合并转发「群聊聊天记录」
@@ -1955,6 +2320,40 @@ class ActiveReplyPlugin(star.Star):
             f"合计：{total:,}",
             f"缓存命中率：{rate:.1f}%",
         ]
+        hits = int(bucket.get("memory_hits", 0) or 0)
+        lexical = int(bucket.get("lexical_hits", 0) or 0)
+        recall_ms = int(bucket.get("recall_ms", 0) or 0)
+        vector_cached = int(bucket.get("embedding_cache_hit", 0) or 0)
+        if hits or lexical or recall_ms:
+            degraded_flags: list[str] = []
+            if int(bucket.get("recall_deadline_hit", 0) or 0):
+                degraded_flags.append("检索超时")
+            if int(bucket.get("embedding_timeout", 0) or 0):
+                degraded_flags.append("向量化超时")
+            suffix = f"｜降级：{'、'.join(degraded_flags)}" if degraded_flags else ""
+            lines.append(
+                f"记忆召回：注入 {hits} 条 / 词法候选 {lexical} 条 / "
+                f"{recall_ms}ms / 向量缓存{'命中' if vector_cached else '未命中'}"
+                + suffix
+            )
+        stage_ms: list[str] = []
+        for key, label in (
+            ("lexical_ms", "词法"),
+            ("embedding_ms", "向量化"),
+            ("vector_ms", "语义检索"),
+        ):
+            value = int(bucket.get(key, 0) or 0)
+            if value:
+                stage_ms.append(f"{label} {value}ms")
+        if stage_ms:
+            lines.append("召回分阶段：" + " / ".join(stage_ms))
+        if "cache_prefix_stable" in bucket:
+            stable = bool(int(bucket.get("cache_prefix_stable", 0) or 0))
+            recall_cached = int(bucket.get("recall_cache_hit", 0) or 0)
+            lines.append(
+                f"前缀缓存：{'system 段未变，可命中' if stable else 'system 段变化，本轮失效'}"
+                + ("｜检索缓存命中" if recall_cached else "")
+            )
         if not calls:
             lines.insert(0, "（模型未返回 token 用量）")
         return lines
@@ -2005,7 +2404,19 @@ class ActiveReplyPlugin(star.Star):
     @filter.on_llm_response()
     async def on_llm_response(self, event: AstrMessageEvent, resp: LLMResponse) -> None:
         """记录 token 用量，并把 Bot 自己的回复写回群聊历史。"""
+        if is_synthetic_event(event):
+            return
         origin = event.unified_msg_origin
+        # F14：模型请求失败时宿主会发 role="err" 的 LLMResponse（4.15
+        # astr_agent_run_util.py、4.29 tool_loop_agent_runner.py），其正文是
+        # 「请求失败」之类的错误文案；把它当机器人回复写进历史/记忆会污染
+        # 后续上下文与长期记忆，因此这里直接跳过写历史/记忆（也不计 token）。
+        if str(getattr(resp, "role", "") or "").strip().lower() == "err":
+            logger.warning(
+                "[ActiveReply] 模型返回错误响应，已跳过历史/记忆写入 | origin=%s",
+                origin,
+            )
+            return
         if (
             event.get_message_type() == MessageType.GROUP_MESSAGE
             and self.state.is_debug(origin)
@@ -2073,16 +2484,13 @@ class ActiveReplyPlugin(star.Star):
         now_dt = datetime.datetime.now(self._tzinfo())
         now_text = now_dt.strftime("%H:%M:%S")
         memory_time_text = now_dt.strftime("%Y-%m-%d %H:%M:%S")
-        try:
-            self_id = str(event.get_self_id() or "0")
-        except Exception:
-            self_id = "0"
+        self_id = self._resolve_self_id(event)
         self._touch(origin, cfg)
         if cfg.group_context.enable and origin in self.state.session_chats:
-            line = f"[Bot/{self_id}/{now_text}](admin): {text}"
+            line = format_self_line(self_id, now_text, body=text)
             self.state.append_chat(origin, line, cfg.group_context.max_messages)
         if cfg.memory_rag.enable:
-            memory_line = f"[Bot/{self_id}/{memory_time_text}](admin): {text}"
+            memory_line = format_self_line(self_id, memory_time_text, body=text)
             limit = max(200, min(1000, int(cfg.memory_rag.batch_messages) * 4))
             self.state.append_memory_chat(origin, memory_line, limit)
 
@@ -2108,7 +2516,9 @@ class ActiveReplyPlugin(star.Star):
             yield event.plain_result("当前群不在主动回复的允许范围内。")
             return
 
-        event.set_extra("enable_streaming", False)
+        # 指令入口同样在进入 LLM 前关闭流式（F15：命令路径没有 on_group_message；
+        # /执行回复 始终走非流式，保证标签转换与用量统计完整）。
+        self._forbid_streaming(event, cfg, force=True)
         origin = event.unified_msg_origin
         self.state.reset_counter(origin)
         self.state.reset_turn(origin)
@@ -2208,15 +2618,24 @@ class ActiveReplyPlugin(star.Star):
         self.state.turn_logs[origin] = []
         self._journal(origin, "指令触发记忆总结")
         collected: list[dict[str, Any]] = []
+        diag: dict[str, Any] = {}
+        persona_name, _ = await self._resolve_persona(event)
         if is_group:
             with contextlib.suppress(Exception):
-                await self._member_role(event, str(event.get_sender_id() or ""))
-            await self._extract_memories(
+                await self._member_role(
+                    event,
+                    self._group_id(event),
+                    str(event.get_sender_id() or ""),
+                )
+            status = await self._extract_memories(
                 origin,
                 window,
                 cfg,
                 collected=collected,
                 enforce_min_confidence=False,
+                self_id=self._resolve_self_id(event),
+                persona_name=persona_name,
+                diagnostics=diag,
             )
         else:
             sender_id = str(event.get_sender_id() or "")
@@ -2227,20 +2646,26 @@ class ActiveReplyPlugin(star.Star):
                 else f"private:{sender_id}"
             )
             role = "owner" if event.is_admin() else "member"
-            await self._extract_memories(
+            status = await self._extract_memories(
                 origin,
                 window,
                 cfg,
+                self_id=self._resolve_self_id(event),
                 memory_type_override="private",
                 scope_override=scope,
                 sender_id_override=sender_id,
                 sender_role_override=role,
                 collected=collected,
                 enforce_min_confidence=False,
+                persona_name=persona_name,
+                diagnostics=diag,
             )
-        last_msg = self._last_message_id(window)
-        if last_msg:
-            self.state.last_extract_msg[origin] = last_msg
+        # 手动总结也遵守同一规则：只有真正跑完（或明确为空）才前移游标，
+        # 失败时下次 /总结记忆 还能重新覆盖这段窗口。
+        if status in {"ok", "empty"}:
+            last_msg = self._last_message_id(window)
+            if last_msg:
+                self.state.last_extract_msg[origin] = last_msg
         saved = [item for item in collected if item.get("status") == "saved"]
         duplicates = [item for item in collected if item.get("status") == "duplicate"]
         dropped = [item for item in collected if item.get("status") == "dropped"]
@@ -2264,9 +2689,61 @@ class ActiveReplyPlugin(star.Star):
             tier = str(item.get("confidence_tier") or "").strip()
             tier_text = f"（{tier}）" if tier else ""
             lines.append(f"置信度：{float(item.get('confidence') or 0):.2f}{tier_text}")
-            lines.append("本次未写入：置信度不足或证据不足（详见记忆日志）。")
+            reason = str(item.get("reason") or "")
+            if reason == "tier_chatter":
+                lines.append(
+                    "本次未写入：模型把它评为 chatter/spam 低价值档；受"
+                    "「丢弃闲聊/灌水档」开关控制（全局设置 → 记忆 RAG → 记忆生成）。"
+                    "关闭该开关后，即使最低置信度为 0 也会保留。"
+                )
+            elif reason == "low_confidence":
+                lines.append(
+                    "本次未写入：置信度 "
+                    f"{float(item.get('confidence') or 0):.2f} 低于最低置信度配置。"
+                )
+            elif reason == "evidence_missing":
+                lines.append(
+                    "本次未写入：摘要里的引文在原始消息中找不到（证据校验未通过）。"
+                )
+            elif reason == "no_roles":
+                lines.append("本次未写入：找不到可关联的真实参与者。")
+            else:
+                lines.append("本次未写入：置信度不足或证据不足（详见记忆日志）。")
         else:
-            lines.append("本次没有写入新记忆（证据不足或摘要为空）。")
+            reason = str(diag.get("reason") or "")
+            reason_text = {
+                "output_not_json": "模型回复不是可解析的 JSON",
+                "output_schema_invalid": "模型回复是 JSON，但没有符合契约的记忆条目（摘要/字段/证据校验未通过）",
+                "empty_payload": "模型明确返回空摘要（这窗没有值得记的内容）",
+                "valid_messages_too_few": "有效消息不足 3 条",
+                "no_substantive_content": (
+                    "窗口几乎没有实质文字（"
+                    f"{diag.get('substance_chars', '?')} 字 < 门槛）"
+                ),
+                "no_provider": "没有可用的抽取模型",
+                "empty_prompt": "格式化后没有可发送的消息",
+                "model_error": f"模型调用失败：{diag.get('error') or '未知错误'}",
+            }.get(reason, "模型未返回符合契约的记忆")
+            lines.append(f"本次未写入：{reason_text}。")
+        raw_reply = str(diag.get("raw_output") or "").strip()
+        repair_reply = str(diag.get("repair_output") or "").strip()
+        force_raw = any(
+            str(arg).lower() in {"raw", "debug", "原始", "详细"} for arg in args
+        )
+        if raw_reply and (not written or force_raw):
+            shown = raw_reply[:1500]
+            if len(raw_reply) > len(shown):
+                shown += "…（已截断）"
+            lines.append("")
+            lines.append("【模型原始回复】")
+            lines.append(shown)
+        if repair_reply and (not written or force_raw):
+            shown_repair = repair_reply[:1000]
+            if len(repair_reply) > len(shown_repair):
+                shown_repair += "…（已截断）"
+            lines.append("")
+            lines.append("【修复重试回复】")
+            lines.append(shown_repair)
         logs = list(self.state.turn_logs.get(origin) or [])[-15:]
         if logs:
             lines.append("")
@@ -2475,7 +2952,21 @@ class ActiveReplyPlugin(star.Star):
                     async with session.post(
                         spec["url"], json=spec["body"], headers=spec["headers"]
                     ) as response:
-                        raw_text = await response.text()
+                        # F47：响应正文必须有上限，避免异常端点返回超大内容
+                        # 把内存与后续工具输出撑爆。
+                        raw_text, too_large = await self._read_limited_response_text(
+                            response
+                        )
+                        if too_large:
+                            last_error = {
+                                "ok": False,
+                                "error": (
+                                    f"{mode} 响应超过 "
+                                    f"{MAX_SEARCH_RESPONSE_BYTES // 1024}KB 上限，"
+                                    "已丢弃"
+                                ),
+                            }
+                            continue
                         if response.status != 200:
                             last_error = {
                                 "ok": False,
@@ -2535,6 +3026,36 @@ class ActiveReplyPlugin(star.Star):
             logger.exception("[ActiveReply] 联网搜索异常")
             return {"ok": False, "error": str(exc)}
         return last_error
+
+    @staticmethod
+    async def _read_limited_response_text(
+        response: Any, limit: int = MAX_SEARCH_RESPONSE_BYTES
+    ) -> tuple[str, bool]:
+        """按字节上限读取 HTTP 响应正文（F47）。
+
+        Returns:
+            ``(文本, 是否超限)``；超限时文本为空串，调用方按失败处理。
+        """
+        limit = max(1, int(limit))
+        content = getattr(response, "content", None)
+        if content is None:
+            # 兼容没有 stream reader 的响应对象；仍按 text() 兜底并截断。
+            text = str(await response.text() or "")
+            if len(text.encode("utf-8", errors="replace")) <= limit:
+                return text, False
+            return "", True
+        raw = await content.read(limit + 1)
+        if len(raw) > limit:
+            return "", True
+        encoding = "utf-8"
+        getter = getattr(response, "get_encoding", None)
+        if callable(getter):
+            with contextlib.suppress(Exception):
+                encoding = str(getter() or "utf-8")
+        try:
+            return raw.decode(encoding, errors="replace"), False
+        except LookupError:
+            return raw.decode("utf-8", errors="replace"), False
 
     def _resolve_search_provider(self, cfg: PluginConfig) -> Provider | None:
         """按 web_search 配置查找指定模型提供商，不隐式回退其他模型。"""
@@ -2828,8 +3349,11 @@ class ActiveReplyPlugin(star.Star):
 
     def _format_search_result(self, result: dict[str, Any], cfg: PluginConfig) -> str:
         """按来源展示配置把搜索正文及有限条引用格式化为文本。"""
-        # 根据 show_sources 与 max_sources 决定工具结果中是否显示来源。
-        lines = [f"搜索结果：\n{result.get('content', '')}"]
+        # F47：工具输出必须截断，避免超长搜索正文整段塞进模型上下文。
+        content = str(result.get("content", "") or "")
+        if len(content) > MAX_TOOL_OUTPUT_CHARS:
+            content = content[:MAX_TOOL_OUTPUT_CHARS] + "\n…（结果过长，已截断）"
+        lines = [f"搜索结果：\n{content}"]
         sources = result.get("sources") or []
         if cfg.web_search.show_sources and sources:
             lines.append("\n参考来源：")
@@ -2985,1439 +3509,6 @@ class ActiveReplyPlugin(star.Star):
             payload["caption_error"] = caption_error
         yield self._text_result(json.dumps(payload, ensure_ascii=False))
 
-    @staticmethod
-    def _text_result(text: str) -> mcp_types.CallToolResult:
-        """将字符串包装为 MCP 工具标准的文本结果对象。"""
-        # 将普通文本包装为 MCP 工具标准的文本内容结构。
-        return mcp_types.CallToolResult(
-            content=[mcp_types.TextContent(type="text", text=str(text or ""))]
-        )
-
-    async def _caption_image(
-        self, image_ref: str, provider_id: str, prompt: str, timeout: float
-    ) -> str:
-        """调用指定或当前会话模型描述图片，并限制调用超时。
-
-        Raises:
-            RuntimeError: 没有可用的文本模型提供商。
-            asyncio.TimeoutError: 图片描述请求超过指定时限。
-        """
-        # 调用指定或当前会话模型描述图片，使用独立会话且不写入聊天记录。
-        if provider_id:
-            provider = self.context.get_provider_by_id(provider_id)
-        else:
-            provider = self.context.get_using_provider()
-        if not isinstance(provider, Provider):
-            raise RuntimeError("没有可用的图片转述提供商")
-        response = await asyncio.wait_for(
-            provider.text_chat(
-                prompt=prompt,
-                session_id=uuid.uuid4().hex,
-                image_urls=[image_ref],
-                persist=False,
-            ),
-            timeout=timeout,
-        )
-        return str(response.completion_text or "")
-
-    @staticmethod
-    async def _resolve_image_ref(image_ref: str) -> str:
-        """将本地路径或远程图片地址解析为本地文件路径。"""
-        # 将本地文件 URI/路径或 HTTP 图片地址解析为本地文件路径。
-        reference = str(image_ref or "").strip()
-        if reference.startswith("file://"):
-            reference = reference[7:]
-        path = Path(reference)
-        if reference and path.exists() and path.is_file():
-            return str(path)
-        if reference.startswith(("http://", "https://")):
-            downloaded = await download_image_by_url(reference)
-            return str(downloaded or "")
-        return ""
-
-    @staticmethod
-    def _encode_image(image_path: str) -> tuple[str, str]:
-        """读取并编码图片，返回 Base64 内容与 MIME 类型。
-
-        Raises:
-            FileNotFoundError: 图片文件不存在。
-            ValueError: 图片为空或超过允许的大小上限。
-        """
-        # 检查图片存在、非空且不超过 12 MiB，再编码为 Base64 与 MIME 类型。
-        path = Path(image_path)
-        if not path.exists() or not path.is_file():
-            raise FileNotFoundError(f"图片不存在: {image_path}")
-        raw = path.read_bytes()
-        if not raw:
-            raise ValueError(f"图片内容为空: {image_path}")
-        if len(raw) > 12 * 1024 * 1024:
-            raise ValueError("图片超过 12MB，已拒绝附加")
-        mime = mimetypes.guess_type(str(path))[0] or "image/jpeg"
-        if not mime.startswith("image/"):
-            mime = "image/jpeg"
-        return base64.b64encode(raw).decode("ascii"), mime
-
-    def _write_caption_to_history(
-        self, origin: str, msg_id: str, image_index: int, caption: str
-    ) -> bool:
-        """替换指定历史消息中的图片占位符，并返回是否成功修改。"""
-        # 精确替换指定消息中对应序号的 [Image] 标记，并保留其他历史内容。
-        marker = f"#msg{msg_id}:"
-        safe = str(caption).replace("]", ")").strip()
-        updated = False
-        for chats in (
-            self.state.session_chats.get(origin),
-            self.state.memory_chats.get(origin),
-        ):
-            if not chats:
-                continue
-            for line_index, line in enumerate(chats):
-                if marker not in line:
-                    continue
-                matches = list(IMAGE_MARKER_PATTERN.finditer(line))
-                if image_index >= len(matches):
-                    continue
-                target = matches[image_index]
-                chats[line_index] = (
-                    line[: target.start()] + f"[Image: {safe}]" + line[target.end() :]
-                )
-                updated = True
-                break
-        return updated
-
-    # ------------------------------------------------------------------ #
-    # LLM 工具：记忆 RAG
-    # ------------------------------------------------------------------ #
-    # ------------------------------------------------------------------ #
-    # 长期记忆：自动兜底写入
-    # ------------------------------------------------------------------ #
-    def _cached_member_role(self, group_id: str, user_id: str) -> str:
-        """从缓存读取群成员身份；未缓存时按普通成员处理。"""
-        cache = self._group_role_cache.get(str(group_id or ""))
-        if cache and time.time() - cache[0] < 600:
-            return cache[1].get(str(user_id or ""), "member")
-        return "member"
-
-    async def _member_role(
-        self, event: AstrMessageEvent, group_id: str, user_id: str
-    ) -> str:
-        """解析身份：AstrBot 管理员=所有者，群主/群管理/群成员来自平台 API。"""
-        gid = str(group_id or "")
-        cache = self._group_role_cache.get(gid) if gid else None
-        if cache and time.time() - cache[0] < 600:
-            roles = cache[1]
-        else:
-            roles = {}
-            if gid:
-                try:
-                    group = await event.get_group()
-                    owner = str(getattr(group, "group_owner", "") or "")
-                    if owner:
-                        roles[owner] = "group_owner"
-                    for admin in getattr(group, "group_admins", None) or []:
-                        roles[str(admin)] = "group_admin"
-                except Exception as exc:
-                    logger.debug(f"[ActiveReply] 获取群成员身份失败: {exc}")
-                self._group_role_cache[gid] = (time.time(), roles)
-        if event.is_admin():
-            if gid:
-                roles[str(user_id or "")] = "owner"
-                self._group_role_cache[gid] = (time.time(), roles)
-            return "owner"
-        return roles.get(str(user_id or ""), "member")
-
-    async def _schedule_auto_memory(
-        self, event: AstrMessageEvent, cfg: PluginConfig
-    ) -> None:
-        # 检测用户明确的“记住”表达并派发后台写入任务，不阻塞消息处理。
-        """用户明确说「记住…」时，后台写一条个人记忆，不阻塞回复。"""
-        text = str(event.message_str or "").strip()
-        if not text or not any(word in text for word in MEMORY_KEYWORDS):
-            return
-        content = text
-        for word in MEMORY_KEYWORDS:
-            index = content.find(word)
-            if index != -1:
-                stripped = content[index + len(word) :].strip(" ：:，,。.!！？?")
-                if stripped:
-                    content = stripped
-                break
-        sender = str(event.get_sender_id() or "").strip()
-        if not sender:
-            return
-        platform_id = self._platform_id(event) or ""
-        group_id = self._group_id(event) or ""
-        role = await self._member_role(event, group_id, sender)
-        asyncio.create_task(
-            self._auto_write_memory(
-                content=content,
-                sender=sender,
-                origin=event.unified_msg_origin,
-                group_id=group_id,
-                platform_id=platform_id,
-                scope="",
-                sender_role=role,
-                source_msg_id=normalize_target_id(
-                    getattr(event.message_obj, "message_id", "")
-                ),
-                source_time=time.time(),
-                cfg=cfg,
-            )
-        )
-
-    async def _auto_write_memory(
-        self,
-        *,
-        content: str,
-        sender: str,
-        origin: str,
-        group_id: str,
-        platform_id: str,
-        scope: str,
-        sender_role: str = "member",
-        source_msg_id: str = "",
-        source_time: float | None = None,
-        cfg: PluginConfig | None = None,
-    ) -> None:
-        """把用户明确要求记住的内容异步转成长期记忆。
-
-        自动写入前会确认记忆库和 embedding 服务就绪。仅在配置为
-        ``group_first`` 且正文匹配个人事实模式时，才把该记录提升为全局范围；
-        其他内容沿用消息所属群的作用域。最终由 ``_store_memory`` 负责向量化、
-        相似记忆去重以及持久化，因此此方法可以在后台执行而不阻塞消息回复。
-        """
-        # 将关键词提取结果向量化、去重后持久化；个人事实可跨群存储。
-        cfg = cfg or self._global_cfg()
-        ready, reason = self._memory_ready(cfg)
-        if not ready or self.memory_store is None:
-            logger.info("[ActiveReply] 记忆自动写入跳过：%s", reason)
-            return
-        # 个人事实优先存成全局记忆，跨群也能回忆
-        if (
-            cfg.memory_rag.auto_extract_scope == "group_first"
-            and PERSONAL_FACT_RE.search(content)
-        ):
-            scope, group_id, platform_id = "", "", ""
-        saved, dup = await self._store_memory(
-            content=content,
-            role_ids=[sender],
-            scope=scope,
-            group_id=group_id,
-            platform_id=platform_id,
-            source="keyword",
-            origin=origin,
-            memory_type="personal",
-            sender_id=sender,
-            sender_role=sender_role,
-            source_msg_id=source_msg_id,
-            source_time=source_time,
-            importance=MEMORY_TYPE_IMPORTANCE["identity"],
-            cfg=cfg,
-        )
-        if saved:
-            logger.info(
-                "[ActiveReply] 记忆自动写入 | source=keyword id=%s user=%s scope=%s content=%s",
-                saved,
-                sender,
-                scope or "(global)",
-                content[:40],
-            )
-        elif dup:
-            logger.info("[ActiveReply] 记忆自动写入跳过：已有相似记忆 id=%s", dup)
-
-    async def _store_memory(
-        self,
-        *,
-        content: str,
-        role_ids: list[str],
-        scope: str,
-        group_id: str,
-        platform_id: str,
-        source: str,
-        origin: str,
-        confidence: float | None = None,
-        memory_type: str = "group",
-        sender_id: str = "",
-        sender_role: str = "member",
-        source_msg_id: str = "",
-        source_time: float | None = None,
-        importance: float = 0.5,
-        extra: dict[str, Any] | None = None,
-        cfg: PluginConfig | None = None,
-    ) -> tuple[int | None, int | None]:
-        """将正文编码为向量，按作用域去重后写入 SQLite。
-
-        空正文、空角色集合或存储未初始化时不执行写入；embedding 服务失败
-        也会记录错误并返回空结果。去重只比较相同作用域及可参与该范围的
-        全局记忆，余弦相似度达到 ``0.92`` 时认为已有相近记录，不再重复保存。
-        写入元数据会标明来源、自动写入状态和会话来源，供控制台统计与追踪。
-
-        Returns:
-            ``(新记忆 ID, None)`` 表示成功写入；``(None, 已有记忆 ID)`` 表示
-            判定为重复；无法写入时返回 ``(None, None)``。
-        """
-        if not content or not role_ids or self.memory_store is None:
-            return None, None
-        exact_id = self.memory_store.find_exact_memory(content, scope)
-        if exact_id:
-            return None, exact_id
-        provider = self._embedding_provider()
-        if provider is None:
-            logger.info("[ActiveReply] 记忆写入跳过：没有可用的 embedding provider")
-            self._journal(origin, "记忆写入跳过：没有可用的 embedding provider")
-            return None, None
-        try:
-            vector = await provider.get_embedding(content)
-        except Exception as exc:
-            logger.error(f"[ActiveReply] 记忆向量化失败: {exc}")
-            return None, None
-        try:
-            effective_cfg = cfg or self._global_cfg()
-            dedup_threshold = float(effective_cfg.memory_rag.dedup_threshold)
-            conflict_threshold = float(effective_cfg.memory_rag.conflict_threshold)
-            similar = self.memory_store.find_similar_memory(
-                vector, group_scope=scope, threshold=conflict_threshold
-            )
-            conflict_id: int | None = None
-            if similar is not None:
-                similarity = float(similar.get("similarity") or 0)
-                if similarity >= dedup_threshold:
-                    return None, int(similar["memory_id"])
-                conflict_id = int(similar["memory_id"])
-            metadata: dict[str, Any] = {
-                "source": source,
-                "auto": True,
-                "origin": origin,
-            }
-            if confidence is not None:
-                metadata["confidence"] = round(float(confidence), 3)
-            if isinstance(extra, dict):
-                metadata.update(extra)
-            memory_id = self.memory_store.add_memory(
-                content=content,
-                embedding=vector,
-                role_ids=role_ids,
-                memory_time=float(source_time or time.time()),
-                group_scope=scope,
-                group_id=group_id,
-                platform_id=platform_id,
-                extra_metadata=metadata,
-                memory_type=memory_type,
-                sender_id=sender_id,
-                sender_role=sender_role,
-                source_msg_id=source_msg_id,
-                source_time=source_time,
-                importance=importance,
-            )
-            if conflict_id is not None:
-                self.memory_store.supersede(conflict_id, memory_id)
-                logger.info(
-                    "[ActiveReply] 记忆冲突：旧记忆被取代 | old=%s new=%s",
-                    conflict_id,
-                    memory_id,
-                )
-            return memory_id, None
-        except Exception as exc:
-            logger.error(f"[ActiveReply] 记忆写入失败: {exc}", exc_info=True)
-            return None, None
-
-    # ------------------------------------------------------------------ #
-    # 自动记忆：后台模型抽取
-    # ------------------------------------------------------------------ #
-    def _maybe_schedule_extraction(
-        self, event: AstrMessageEvent, cfg: PluginConfig
-    ) -> None:
-        """按「累计条数 + 冷却」或「对话停顿」切窗，后台总结当前片段。"""
-        if not (cfg.memory_rag.enable and cfg.memory_rag.auto_extract_enable):
-            return
-        origin = event.unified_msg_origin
-        counter = self.state.extract_counters.get(origin, 0) + 1
-        self.state.extract_counters[origin] = counter
-        batch = max(10, min(100, int(cfg.memory_rag.batch_messages)))
-        now = time.time()
-        last_extract = self.state.last_extract_at.get(origin, 0.0)
-        gap = float(event.get_extra("_areply_chat_gap") or 0.0)
-        gap_limit = max(10, min(180, int(cfg.memory_rag.window_gap_minutes))) * 60
-        history = self.state.memory_history(origin)
-        history_len = len(history)
-        flush_by_gap = gap >= gap_limit and counter >= 3
-        # 除了用户消息计数，也用记忆历史长度兜底：计数器因重启/异常被清空时，
-        # 只要历史上已经积累到 batch 条，且冷却结束，就照常抽取。
-        flush_by_batch = (
-            counter >= batch or history_len >= batch
-        ) and now - last_extract >= cfg.memory_rag.auto_extract_interval_minutes * 60
-        if not (flush_by_gap or flush_by_batch):
-            return
-        window_size = max(3, min(batch, history_len or 3))
-        last_msg = self.state.last_extract_msg.get(origin, "")
-        start = 0
-        if last_msg:
-            for index in range(len(history) - 1, -1, -1):
-                if f"#msg{last_msg}:" in history[index]:
-                    start = index + 1
-                    break
-        window = history[start:][-window_size:]
-        if len(window) < 3:
-            return
-        logger.info(
-            "[ActiveReply] 自动记忆触发 | origin=%s counter=%s history=%s window=%s",
-            origin,
-            counter,
-            history_len,
-            len(window),
-        )
-        new_last_msg = self._last_message_id(window)
-        if new_last_msg:
-            self.state.last_extract_msg[origin] = new_last_msg
-        self.state.extract_counters[origin] = 0
-        self.state.last_extract_at[origin] = now
-        if flush_by_gap:
-            self._journal(
-                origin,
-                f"对话停顿 {int(gap // 60)} 分钟，触发片段总结（{len(window)} 条）",
-            )
-        else:
-            self._journal(
-                origin, f"累计 {counter} 条，触发片段总结（{len(window)} 条）"
-            )
-
-        async def run_extraction() -> None:
-            with contextlib.suppress(Exception):
-                await self._member_role(event, str(event.get_sender_id() or ""))
-            await self._extract_memories(origin, list(window), cfg)
-
-        asyncio.create_task(run_extraction())
-
-    def _extract_provider(self, origin: str, cfg: PluginConfig) -> Provider | None:
-        """选择后台记忆抽取模型；专用模型不可用时使用当前会话模型。"""
-        # 后台抽取优先使用专用模型，未配置或无效时回退到会话模型。
-        provider_id = str(cfg.memory_rag.auto_extract_provider_id or "").strip()
-        if provider_id:
-            try:
-                provider = self.context.get_provider_by_id(provider_id)
-            except Exception:
-                provider = None
-            if isinstance(provider, Provider):
-                return provider
-            logger.warning(
-                "[ActiveReply] auto_extract_provider_id 无效: %s，回退到会话模型",
-                provider_id,
-            )
-        try:
-            provider = self.context.get_using_provider(origin)
-        except Exception:
-            provider = None
-        return provider if isinstance(provider, Provider) else None
-
-    @staticmethod
-    def _normalize_confidence_tier(value: Any) -> str:
-        """把模型返回的中英文档位统一成内部档位名。
-
-        兼容 confidence_tier（daily/major/...）与 A 版本的
-        confidence_band（0.50-0.60 这类区间字符串）。
-        """
-        raw = re.sub(r"\s+", "", str(value or "").lower())
-        if not raw:
-            return ""
-        numbers = re.findall(r"\d+(?:\.\d+)?", raw)
-        if len(numbers) == 2:
-            try:
-                low, high = float(numbers[0]), float(numbers[1])
-            except ValueError:
-                low = high = -1.0
-            if high > 1.0:
-                low, high = low / 100.0, high / 100.0
-            if 0.0 <= low <= high <= 1.0:
-                if low >= 0.90:
-                    return "major"
-                if low >= 0.70:
-                    return "discussion"
-                if low >= 0.50:
-                    return "daily"
-                if low >= 0.30:
-                    return "chatter"
-                return "spam"
-        # 模型可能原样抄下模板里的 "major | discussion | ..."，这种枚举串
-        # 不能按包含关系猜成某一档，直接交给保守校准处理。
-        if any(sep in raw for sep in ("|", ",", "，")):
-            return ""
-        for tier, aliases in CONFIDENCE_TIER_ALIASES.items():
-            if raw in aliases:
-                return tier
-        for tier, aliases in CONFIDENCE_TIER_ALIASES.items():
-            if any(alias in raw for alias in aliases if len(alias) >= 2):
-                return tier
-        return ""
-
-    @staticmethod
-    def _calibrate_confidence(raw: float, tier: str) -> float:
-        """把模型评分限制在档位区间内，避免日常对话被评成 0.90。"""
-        value = max(0.0, min(float(raw), 1.0))
-        bounds = CONFIDENCE_TIER_RANGES.get(tier)
-        if bounds is None:
-            # 旧版提示词或模型漏掉档位：保留低分，高分统一压到日常档上限。
-            if value <= 0.60:
-                return round(value, 2)
-            return 0.60
-        low, high = bounds
-        if value > high:
-            value = high
-        elif value < low:
-            value = max(0.0, value)
-        return round(value, 2)
-
-    @staticmethod
-    def _parse_summary_output(text: str) -> dict[str, Any] | None:
-        """解析模型返回的整段摘要对象。"""
-        raw = str(text or "").strip()
-        if not raw:
-            return None
-        raw = re.sub(r"^```(?:json)?", "", raw).strip()
-        raw = re.sub(r"```$", "", raw).strip()
-        start = raw.find("{")
-        end = raw.rfind("}")
-        if start == -1 or end == -1 or end <= start:
-            return None
-        try:
-            data = json.loads(raw[start : end + 1])
-        except Exception:
-            return None
-        if not isinstance(data, dict):
-            return None
-        summary = str(data.get("summary") or "").strip()
-        if not (2 <= len(summary) <= 240):
-            return None
-        quotes = data.get("quotes") or data.get("evidence") or []
-        if isinstance(quotes, str):
-            quotes = [quotes]
-        quote_list = [
-            str(item).strip()
-            for item in quotes
-            if isinstance(item, str) and len(str(item).strip()) >= 3
-        ][:5]
-        if not quote_list:
-            return None
-        topics = data.get("topics") or []
-        if isinstance(topics, str):
-            topics = [topics]
-        topic_list = [str(item).strip() for item in topics if str(item).strip()][:5]
-        participants = data.get("participants") or []
-        if isinstance(participants, str):
-            participants = [participants]
-        participant_list = [
-            str(item).strip() for item in participants if str(item).strip()
-        ][:10]
-        roles = data.get("role_ids") or []
-        if isinstance(roles, str):
-            roles = [part for part in re.split(r"[,\s]+", roles) if part]
-        role_ids = [str(role).strip() for role in roles if str(role).strip()]
-        scope = str(data.get("scope") or "group").strip().lower()
-        if scope not in {"global", "group"}:
-            scope = "group"
-        tier = ActiveReplyPlugin._normalize_confidence_tier(
-            data.get("confidence_tier")
-            or data.get("confidence_band")
-            or data.get("tier")
-        )
-        try:
-            raw_confidence = float(data.get("confidence"))
-        except (TypeError, ValueError):
-            raw_confidence = None
-        if raw_confidence is None:
-            confidence = CONFIDENCE_TIER_DEFAULTS.get(tier, 0.0)
-        else:
-            confidence = ActiveReplyPlugin._calibrate_confidence(raw_confidence, tier)
-        try:
-            importance = float(data.get("importance", confidence))
-        except (TypeError, ValueError):
-            importance = confidence
-        importance = max(0.0, min(importance, 1.0))
-        # confidence 与 importance 使用同一口径，避免 importance 单独虚高。
-        importance = min(importance, confidence)
-        return {
-            "content": summary,
-            "topics": topic_list,
-            "participants": participant_list,
-            "role_ids": role_ids,
-            "scope": scope,
-            "confidence_tier": tier,
-            "confidence": confidence,
-            "importance": round(importance, 2),
-            "quotes": quote_list,
-            "evidence": quote_list[0],
-        }
-
-    @staticmethod
-    def _strip_chat_annotations(text: str) -> str:
-        """删除历史行正文里的 [Quote ...] / [At: ...] 结构化标记。
-
-        这些标记由 _record_message 添加，里面的昵称是引用目标或 @ 对象，
-        不是当前消息的发送者。按方括号层级扫描，避免引用文本里的括号
-        提前截断标记。
-        """
-        value = str(text or "")
-        if "[" not in value:
-            return value
-        result: list[str] = []
-        index = 0
-        length = len(value)
-        while index < length:
-            if value[index] != "[":
-                result.append(value[index])
-                index += 1
-                continue
-            depth = 0
-            end = index
-            while end < length:
-                char = value[end]
-                if char == "[":
-                    depth += 1
-                elif char == "]":
-                    depth -= 1
-                    if depth == 0:
-                        end += 1
-                        break
-                end += 1
-            if depth != 0:
-                result.append(value[index:])
-                break
-            inner = value[index + 1 : end - 1]
-            if not (inner.startswith("Quote ") or inner.startswith("At:")):
-                result.append(value[index:end])
-            index = end
-        return "".join(result)
-
-    @staticmethod
-    def _normalize_message_body(text: str, *, strip_annotations: bool = True) -> str:
-        """清理正文中的记录层标记并压成单行。"""
-        body = (
-            ActiveReplyPlugin._strip_chat_annotations(text)
-            if strip_annotations
-            else str(text or "")
-        )
-        return " ".join(body.split()).strip()
-
-    @staticmethod
-    def _split_quote_notes(body: str) -> tuple[str, list[str]]:
-        """提取 [Quote ...] 标注，返回剩余正文和可读的引用说明。
-
-        引用内容本身可能带有方括号（例如被引用的消息里有 @ 或图片占位），
-        因此使用括号配对扫描，而不是简单的正则匹配。
-        """
-        text = str(body)
-        notes: list[str] = []
-        chunks: list[str] = []
-        index = 0
-        while True:
-            start = text.find("[Quote ", index)
-            if start < 0:
-                chunks.append(text[index:])
-                break
-            chunks.append(text[index:start])
-            depth = 0
-            end = -1
-            for pos in range(start, len(text)):
-                char = text[pos]
-                if char == "[":
-                    depth += 1
-                elif char == "]":
-                    depth -= 1
-                    if depth == 0:
-                        end = pos
-                        break
-            if end < 0:
-                chunks.append(text[start:])
-                break
-            inner = text[start + len("[Quote ") : end]
-            match = re.match(r"(?:#msg\S+ )?([^:]+):\s*(.*)$", inner, re.S)
-            if match:
-                nickname = match.group(1).strip() or "未知"
-                quoted = match.group(2).strip() or "..."
-                notes.append(f"（引用 {nickname} 的旧消息：「{quoted}」）")
-            else:
-                notes.append(f"（引用旧消息：「{inner.strip() or '...'}」）")
-            index = end + 1
-        return "".join(chunks), notes
-
-    @staticmethod
-    def _render_extract_body(body: str) -> str:
-        """把引用/@ 标注移到正文末尾并改写成明确说明，保留上下文。"""
-        cleaned, notes = ActiveReplyPlugin._split_quote_notes(body)
-
-        def _mention(match: re.Match[str]) -> str:
-            name = match.group(1).strip()
-            if name:
-                notes.append(f"（@ {name}）")
-            return ""
-
-        cleaned = re.sub(r"\[At:\s*([^\]]+)\]", _mention, cleaned)
-        cleaned = re.sub(r"\s+", " ", cleaned).strip()
-        if notes:
-            return f"{cleaned} {' '.join(notes)}".strip()
-        return cleaned
-
-    @staticmethod
-    def _history_body(line: str) -> str:
-        """从一条历史记录中取出真正的消息正文。"""
-        text = str(line or "")
-        header = re.match(
-            r"^\[[^\]]*\](?:\([^)]*\))?\s*:?\s*(?:#msg[^:]+:\s*)?",
-            text,
-        )
-        body = text[header.end() :] if header else text
-        return ActiveReplyPlugin._normalize_message_body(body)
-
-    @staticmethod
-    def _filter_extract_window(lines: list[str]) -> list[str]:
-        """过滤纯表情、单字、复读、指令、链接、疑问/反问句。"""
-        kept: list[str] = []
-        seen: set[str] = set()
-        for line in lines:
-            body = ActiveReplyPlugin._history_body(line)
-            if not body or EXTRACT_SKIP_PATTERN.match(body):
-                continue
-            if body.endswith(("？", "?")) or body.startswith(("问：", "请问")):
-                continue
-            normalized = re.sub(r"\s+", "", body)
-            if normalized in seen:
-                continue
-            seen.add(normalized)
-            kept.append(line)
-        return kept
-
-    @staticmethod
-    def _history_timestamp(line: str) -> str:
-        """从记忆历史行头提取 YYYY-MM-DD HH:MM:SS 时间文本。"""
-        match = re.match(
-            r"^\[(?:Bot/[^/\]]+|[^/\]]+/[^/\]]+)/([^\]]+)\]", str(line or "")
-        )
-        return match.group(1).strip() if match else ""
-
-    @staticmethod
-    def _last_message_id(lines: list[str]) -> str:
-        """取窗口内最后一条消息 ID，用作增量抽取水位。"""
-        for line in reversed(lines):
-            match = re.search(r"#msg([^:]+):", str(line))
-            if match:
-                return match.group(1)
-        return ""
-
-    @staticmethod
-    def _format_extract_lines(
-        lines: list[str], max_chars: int = 1500, *, model_input: bool = True
-    ) -> list[str]:
-        """把历史记录转换为抽取模型要求的标准消息格式。
-
-        model_input=True 时把 [Quote ...] / [At: ...] 改写成正文末尾的
-        引用/@ 说明，既保留上下文又不会被误当成当前发言者；model_input=False
-        时保留原始标记，用于记忆详情里的「原始消息」展示。
-        """
-        user_pattern = re.compile(
-            r"^\[([^/\]]+)/([^/\]]+)/([^\]]+)\](?:\([^)]*\))?\s*"
-            r"(?:#msg([^:]+):)?\s*(.*)$",
-            re.DOTALL,
-        )
-        bot_patterns = [
-            re.compile(
-                r"^\[Bot/([^/\]]+)/([^\]]+)\](?:\([^)]*\))?\s*:\s*(.*)$",
-                re.DOTALL,
-            ),
-            re.compile(r"^\[Bot/([^\]]+)\](?:\([^)]*\))?\s*:\s*(.*)$", re.DOTALL),
-        ]
-        rendered: list[str] = []
-        for line in lines:
-            text = str(line)
-            bot_match = bot_patterns[0].match(text)
-            if bot_match:
-                uid, stamp, body = bot_match.groups()
-                body = (
-                    ActiveReplyPlugin._render_extract_body(body)
-                    if model_input
-                    else ActiveReplyPlugin._normalize_message_body(
-                        body, strip_annotations=False
-                    )
-                )
-                if body:
-                    rendered.append(
-                        f"- **[Bot: AstrBot | ID: {uid} | {stamp}]**: {body}"
-                    )
-                continue
-            bot_match = bot_patterns[1].match(text)
-            if bot_match:
-                stamp, body = bot_match.groups()
-                body = (
-                    ActiveReplyPlugin._render_extract_body(body)
-                    if model_input
-                    else ActiveReplyPlugin._normalize_message_body(
-                        body, strip_annotations=False
-                    )
-                )
-                if body:
-                    rendered.append(f"- **[Bot: AstrBot | ID: 0 | {stamp}]**: {body}")
-                continue
-            match = user_pattern.match(text)
-            if match:
-                nick, uid, stamp, _msg_id, body = match.groups()
-                body = (
-                    ActiveReplyPlugin._render_extract_body(body)
-                    if model_input
-                    else ActiveReplyPlugin._normalize_message_body(
-                        body, strip_annotations=False
-                    )
-                )
-                if body:
-                    rendered.append(f"- **[{nick} | ID: {uid} | {stamp}]**: {body}")
-                continue
-        normalized = []
-        for line in rendered:
-            line = line.replace("[Image]", "[图片]")
-            line = re.sub(r"\[File: ([^\]]+)\]", r"[文件: \1]", line)
-            line = line.replace("[Voice]", "[语音]").replace("[Video]", "[视频]")
-            line = line.replace("[Sticker]", "[表情]")
-            normalized.append(line)
-        selected: list[str] = []
-        used = 0
-        budget = max(300, int(max_chars))
-        for line in reversed(normalized):
-            if selected and used + len(line) > budget:
-                break
-            selected.append(line)
-            used += len(line)
-        selected.reverse()
-        return selected
-
-    @staticmethod
-    def _evidence_supported(evidence: str, lines: list[str]) -> bool:
-        """校验证据是否来自消息正文：子串优先，否则做一次相似度比较。"""
-        target = re.sub(r"\s+", "", str(evidence or ""))
-        if len(target) < 3:
-            return False
-        bodies: list[str] = []
-        for line in lines:
-            text = str(line)
-            marker = "]**:"
-            if marker in text:
-                text = text.split(marker, 1)[1]
-            else:
-                text = ActiveReplyPlugin._history_body(text)
-            body = re.sub(r"\s+", "", text)
-            if body:
-                bodies.append(body)
-        if not bodies:
-            return False
-        joined = "\n".join(bodies)
-        if target in joined:
-            return True
-        from difflib import SequenceMatcher
-
-        for body in bodies:
-            if SequenceMatcher(None, target, body).ratio() >= 0.8:
-                return True
-        return False
-
-    @staticmethod
-    def _sender_ids_from_history(lines: list[str]) -> list[str]:
-        """从消息头提取并去重出现过的 QQ 发送者 ID，忽略正文中的数字。"""
-        # 从格式化历史或原始历史的消息头收集 QQ ID，供候选角色白名单校验；
-        # 不再扫描正文，避免引用内容或普通文本里的数字被当成发送者。
-        ids: list[str] = []
-        for line in lines:
-            text = str(line)
-            if "]**: " in text:
-                # 格式化行：只看消息头，避免正文里的数字被当成发送者。
-                header = text.split("]**: ", 1)[0]
-                match = re.search(r"\|\s*ID:\s*(\d{4,12})\s*\|", header)
-            else:
-                # 原始历史行：消息头在 #msg 之前。
-                header = text.split(" #msg", 1)[0]
-                match = re.match(r"^\[Bot/(\d{4,12})/", header)
-                if match is None:
-                    match = re.match(r"^\[[^/\]]+/(\d{4,12})/", header)
-            if match is None:
-                continue
-            value = match.group(1)
-            if value not in ids:
-                ids.append(value)
-        return ids
-
-    async def _extract_memories(
-        self,
-        origin: str,
-        lines: list[str],
-        cfg: PluginConfig,
-        *,
-        memory_type_override: str | None = None,
-        scope_override: str | None = None,
-        sender_id_override: str = "",
-        sender_role_override: str = "member",
-        collected: list[dict[str, Any]] | None = None,
-        enforce_min_confidence: bool = True,
-    ) -> None:
-        """从聊天片段抽取记忆：先筛消息，再校验证据与类型，最后去重写入。
-
-        /总结记忆 是管理员显式操作，传入 enforce_min_confidence=False 后
-        不再被自动抽取的最低置信度门槛丢弃；自动抽取仍按配置过滤。
-        """
-        ready, reason = self._memory_ready(cfg)
-        if not ready or self.memory_store is None:
-            logger.info("[ActiveReply] 记忆抽取跳过：%s", reason)
-            return
-        raw_source_messages = self._format_extract_lines(
-            list(lines), 6000, model_input=False
-        )[-30:]
-        filtered = self._filter_extract_window(list(lines))
-        self._journal(
-            origin,
-            f"记忆抽取开始 | 原文 {len(lines)} 条 → 有效 {len(filtered)} 条",
-        )
-        if len(filtered) < 3:
-            self._journal(origin, "记忆抽取跳过：有效消息不足")
-            logger.info(
-                "[ActiveReply] 记忆抽取跳过：有效消息不足 | lines=%s", len(filtered)
-            )
-            return
-        provider = self._extract_provider(origin, cfg)
-        if provider is None:
-            logger.info("[ActiveReply] 记忆抽取跳过：没有可用的对话模型")
-            return
-        prompt_lines = self._format_extract_lines(
-            filtered, cfg.memory_rag.extract_max_chars
-        )
-        self._journal(
-            origin,
-            f"输入格式化 | {len(filtered)} 条 → {len(prompt_lines)} 行 / "
-            f"{sum(len(line) for line in prompt_lines)} 字",
-        )
-        if not prompt_lines:
-            self._journal(origin, "记忆抽取跳过：格式化后没有有效消息")
-            return
-        now_dt = datetime.datetime.now(self._tzinfo())
-        timezone_name = self._resolve_timezone_name()
-        time_context = (
-            "## 当前时间\n"
-            f"现在是 {now_dt.strftime('%Y-%m-%d %H:%M:%S')}（{timezone_name}）。"
-            "聊天片段每行的时间都是该时区的真实发送时间；总结里的日期和时间"
-            "必须以这些时间为准，示例日期只是格式示意，不要照抄。\n\n"
-        )
-        if memory_type_override == "private":
-            template = cfg.memory_rag.private_prompt or DEFAULT_PRIVATE_SUMMARY_PROMPT
-        else:
-            template = cfg.memory_rag.group_prompt or DEFAULT_GROUP_SUMMARY_PROMPT
-        # 旧配置里可能保存着高分示例的旧提示词；补齐缺失规则，
-        # 并把规则插在聊天片段之前，避免模型继续沿用旧的 0.90 评分。
-        template = ensure_memory_prompt_rules(template)
-        if "{messages}" not in template:
-            template = template + "\n\n聊天片段：\n{messages}"
-        prompt = template.replace("{messages}", time_context + "\n".join(prompt_lines))
-        try:
-            response = await asyncio.wait_for(
-                provider.text_chat(
-                    prompt=prompt,
-                    session_id=uuid.uuid4().hex,
-                    persist=False,
-                ),
-                timeout=60,
-            )
-        except Exception as exc:
-            logger.warning(f"[ActiveReply] 记忆抽取模型调用失败: {exc}")
-            return
-        candidate = self._parse_summary_output(str(response.completion_text or ""))
-        if candidate is None:
-            self._journal(origin, "记忆抽取：模型未返回有效摘要")
-            logger.info("[ActiveReply] 记忆抽取 | origin=%s summary=0", origin)
-            return
-        min_conf = float(cfg.memory_rag.auto_extract_min_confidence)
-        known_ids = self._sender_ids_from_history(prompt_lines)
-        # 重要群体决策档要求至少 3 名成员实质参与；人数不足时保守降档，
-        # 避免把两人临时对话评成 0.90 以上。
-        if (
-            candidate["confidence"] >= 0.90
-            and memory_type_override != "private"
-            and len(known_ids) < 3
-        ):
-            candidate["confidence"] = 0.80
-            candidate["confidence_tier"] = "discussion"
-            candidate["importance"] = min(
-                candidate["importance"], candidate["confidence"]
-            )
-            self._journal(
-                origin,
-                "置信度校准：重要档需至少 3 名成员参与，"
-                f"当前 {len(known_ids)} 名，下调到 0.80",
-            )
-        platform_id = self._platform_id_from_origin(origin)
-        group_id = self._group_id_from_origin(origin)
-        default_type = memory_type_override or (
-            "group" if len(known_ids) >= 2 else "personal"
-        )
-        last_msg_id = ""
-        for line in reversed(filtered):
-            match = re.search(r"#msg([^:]+):", line)
-            if match:
-                last_msg_id = match.group(1)
-                break
-        source_time = time.time()
-        for line in reversed(filtered):
-            stamp = self._history_timestamp(line)
-            parsed_time = self._parse_timestamp(stamp) if stamp else None
-            if parsed_time:
-                source_time = parsed_time
-                break
-        sender_id = sender_id_override or (known_ids[0] if known_ids else "")
-        sender_role = sender_role_override or self._cached_member_role(
-            group_id, sender_id
-        )
-        record = {
-            "content": candidate["content"],
-            "type": "摘要",
-            "topics": candidate["topics"],
-            "participants": candidate["participants"],
-            "confidence_tier": candidate["confidence_tier"],
-            "confidence": candidate["confidence"],
-            "importance": candidate["importance"],
-            "scope": candidate["scope"],
-            "evidence": candidate["evidence"],
-            "status": "",
-        }
-        if enforce_min_confidence and candidate["confidence"] < min_conf:
-            record["status"] = "dropped"
-            self._journal(
-                origin,
-                f"置信度不足丢弃 | {candidate['confidence']:.2f} < {min_conf:.2f}",
-            )
-            if collected is not None:
-                collected.append(record)
-            return
-        valid_quotes = [
-            quote
-            for quote in candidate["quotes"]
-            if self._evidence_supported(quote, filtered)
-        ]
-        if not valid_quotes:
-            record["status"] = "dropped"
-            self._journal(origin, "证据不足丢弃 | 摘要中的引文不在原文中")
-            if collected is not None:
-                collected.append(record)
-            return
-        role_ids = [role for role in candidate["role_ids"] if role in known_ids]
-        if not role_ids:
-            role_ids = known_ids[:3]
-        if not role_ids and sender_id:
-            role_ids = [sender_id]
-        if not role_ids:
-            record["status"] = "skipped"
-            self._journal(origin, "摘要缺少可关联的用户，跳过写入")
-            if collected is not None:
-                collected.append(record)
-            return
-        memory_type = default_type
-        if memory_type_override:
-            scope = scope_override or ""
-            final_group, final_platform = group_id, platform_id
-        elif cfg.memory_rag.auto_extract_scope == "global" or (
-            cfg.memory_rag.auto_extract_scope == "group_first"
-            and candidate["scope"] == "global"
-        ):
-            scope, final_group, final_platform = "", "", ""
-        else:
-            scope = self._canonical_scope(platform_id, group_id)
-            final_group, final_platform = group_id, platform_id
-        cached_roles = self._group_role_cache.get(group_id)
-        known_roles = cached_roles[1] if cached_roles else {}
-        role_identities = {role: known_roles.get(role, "member") for role in role_ids}
-        if sender_id:
-            role_identities[sender_id] = sender_role
-        memory_id, dup = await self._store_memory(
-            content=candidate["content"],
-            role_ids=role_ids,
-            scope=scope,
-            group_id=final_group,
-            platform_id=final_platform,
-            source="model",
-            origin=origin,
-            confidence=candidate["confidence"],
-            memory_type=memory_type,
-            sender_id=role_ids[0],
-            sender_role=sender_role,
-            source_msg_id=last_msg_id,
-            source_time=source_time,
-            importance=candidate["importance"],
-            extra={
-                "evidence": " | ".join(valid_quotes),
-                "quotes": valid_quotes,
-                "topics": candidate["topics"],
-                "participants": candidate["participants"],
-                "source_messages": raw_source_messages,
-                "confidence_tier": candidate["confidence_tier"],
-                "confidence": candidate["confidence"],
-                "role_identities": role_identities,
-            },
-            cfg=cfg,
-        )
-        if memory_id:
-            record["status"] = "saved"
-            record["memory_id"] = memory_id
-            self._journal(
-                origin,
-                f"写入记忆 ID={memory_id} | type={memory_type} | "
-                f"scope={scope or '(global)'} | {candidate['content'][:30]}",
-            )
-        elif dup:
-            record["status"] = "duplicate"
-            record["memory_id"] = dup
-            self._journal(origin, f"摘要重复，跳过 | 已有 ID={dup}")
-        else:
-            record["status"] = "skipped"
-        if collected is not None:
-            collected.append(record)
-        self._journal(
-            origin,
-            f"记忆抽取完成 | 候选=1 写入={1 if memory_id else 0} "
-            f"重复={1 if dup else 0} 丢弃=0",
-        )
-        logger.info(
-            "[ActiveReply] 记忆抽取 | origin=%s type=%s summary=1 saved=%s dup=%s",
-            origin,
-            memory_type_override or "auto",
-            1 if memory_id else 0,
-            1 if dup else 0,
-        )
-
-    # ------------------------------------------------------------------ #
-    # 记忆生命周期：归档与定期巩固
-    # ------------------------------------------------------------------ #
-    def _install_log_buffer(self) -> None:
-        """（重新）挂载插件日志缓冲；插件注册后调用可确保取到插件 logger。"""
-        old_handler = getattr(self, "_log_handler", None)
-        if old_handler is not None:
-            with contextlib.suppress(Exception):
-                logger.removeHandler(old_handler)
-        handler = _PluginLogHandler(self._log_buffer)
-        try:
-            logger.addHandler(handler)
-            self._log_handler = handler
-        except Exception as exc:
-            logger.debug(f"[ActiveReply] 安装插件日志缓冲失败: {exc}")
-
-    def _start_maintenance(self) -> None:
-        """启动后台维护循环（归档 + 定期巩固）。"""
-        if self._maintenance_task is not None and not self._maintenance_task.done():
-            return
-        try:
-            self._maintenance_task = asyncio.create_task(self._maintenance_loop())
-        except Exception as exc:
-            logger.debug(f"[ActiveReply] 启动记忆维护失败: {exc}")
-
-    async def _maintenance_loop(self) -> None:
-        """每小时检查一次归档；巩固按配置间隔执行。"""
-        await asyncio.sleep(15)
-        while True:
-            try:
-                cfg = self._global_cfg()
-                if self.memory_store is not None and cfg.memory_rag.enable:
-                    if cfg.memory_rag.archive_enable:
-                        archived = self.memory_store.archive_stale(
-                            days=cfg.memory_rag.archive_days,
-                            max_importance=cfg.memory_rag.archive_importance,
-                        )
-                        if archived:
-                            logger.info(
-                                "[ActiveReply] 记忆归档 | count=%s days=%s",
-                                archived,
-                                cfg.memory_rag.archive_days,
-                            )
-                    if cfg.memory_rag.consolidation_enable:
-                        interval = cfg.memory_rag.consolidation_interval_days * 86400
-                        if time.time() - self._last_consolidation_at >= interval:
-                            await self._run_consolidation(cfg)
-                            self._last_consolidation_at = time.time()
-            except Exception as exc:
-                logger.warning(f"[ActiveReply] 记忆维护失败: {exc}")
-            await asyncio.sleep(3600)
-
-    async def _run_consolidation(self, cfg: PluginConfig) -> None:
-        """把同作用域、同主题的多条旧记忆合并成一条摘要。"""
-        if self.memory_store is None:
-            return
-        provider = self._extract_provider("", cfg)
-        if provider is None:
-            return
-        merged_total = 0
-        for scope in self.memory_store.list_group_scopes()[:5]:
-            try:
-                items = self.memory_store.consolidation_candidates(
-                    older_than_days=cfg.memory_rag.consolidation_interval_days,
-                    group_scope=scope,
-                    limit=60,
-                )
-            except Exception:
-                continue
-            used: set[int] = set()
-            for base in items:
-                base_id = int(base.get("memory_id") or 0)
-                if base_id in used or not base.get("embedding"):
-                    continue
-                cluster = [base]
-                for other in items:
-                    other_id = int(other.get("memory_id") or 0)
-                    if other_id == base_id or other_id in used:
-                        continue
-                    vector = other.get("embedding") or []
-                    if len(vector) != len(base["embedding"]):
-                        continue
-                    sim = self.memory_store._cosine_similarity(
-                        base["embedding"], vector
-                    )
-                    if sim >= 0.8:
-                        cluster.append(other)
-                    if len(cluster) >= 3:
-                        break
-                if len(cluster) < 2:
-                    continue
-                text = "\n".join(f"- {item.get('content')}" for item in cluster)
-                prompt = (
-                    "把下面几条同主题的长期记忆合并成一段话，保留关键事实、"
-                    "去重、不要编造：\n" + text
-                )
-                try:
-                    response = await asyncio.wait_for(
-                        provider.text_chat(
-                            prompt=prompt,
-                            session_id=uuid.uuid4().hex,
-                            persist=False,
-                        ),
-                        timeout=45,
-                    )
-                except Exception:
-                    continue
-                content = str(response.completion_text or "").strip()
-                if not (2 <= len(content) <= 240):
-                    continue
-                role_ids: list[str] = []
-                for item in cluster:
-                    for role in item.get("related_role_ids") or []:
-                        if role not in role_ids:
-                            role_ids.append(str(role))
-                importance = max(
-                    float(item.get("importance") or 0.5) for item in cluster
-                )
-                new_id, _ = await self._store_memory(
-                    content=content,
-                    role_ids=role_ids or ["0"],
-                    scope=scope,
-                    group_id=cluster[0].get("group_id") or "",
-                    platform_id=cluster[0].get("platform_id") or "",
-                    source="consolidation",
-                    origin=scope,
-                    memory_type=cluster[0].get("memory_type") or "group",
-                    sender_id=cluster[0].get("sender_id") or "",
-                    sender_role=cluster[0].get("sender_role") or "member",
-                    importance=importance,
-                )
-                if not new_id:
-                    continue
-                for item in cluster:
-                    try:
-                        self.memory_store.delete_memory(int(item["memory_id"]))
-                        used.add(int(item["memory_id"]))
-                    except Exception:
-                        pass
-                merged_total += 1
-        if merged_total:
-            logger.info("[ActiveReply] 记忆巩固完成 | merged=%s", merged_total)
-
-    def _memory_ready(self, cfg: PluginConfig | None = None) -> tuple[bool, str]:
-        """检查记忆功能及存储是否可用，返回状态和可读原因。"""
-        # 检查长期记忆总开关和 SQLite 存储可用性，返回可读失败原因。
-        cfg = cfg or self._global_cfg()
-        if not cfg.memory_rag.enable:
-            return False, "记忆 RAG 已在插件配置中关闭。"
-        if self.memory_store is None:
-            return False, "记忆库未初始化。"
-        return True, ""
-
-    @staticmethod
-    def _provider_meta_label(provider: Any) -> tuple[str, str]:
-        """返回 (provider_id, model)，字段缺失时回退到 provider_config。"""
-        provider_cfg = getattr(provider, "provider_config", {}) or {}
-        provider_id = ""
-        model = ""
-        try:
-            meta = provider.meta()
-            provider_id = str(getattr(meta, "id", "") or "")
-            model = str(getattr(meta, "model", "") or "")
-        except Exception:
-            pass
-        if not provider_id:
-            provider_id = str(provider_cfg.get("id") or "")
-        if not model:
-            model = str(provider_cfg.get("model") or "")
-        return provider_id, model
-
-    def _embedding_provider(self) -> EmbeddingProvider | None:
-        """查找 embedding 提供商。
-
-        配置里既可以直接填 provider ID，也可以填模型名（例如 `BAAI/bge-m3`），
-        两者都能匹配；都不匹配时回退到第一个可用的 embedding provider。
-        """
-        cfg = self._global_cfg()
-        provider_id = str(cfg.memory_rag.embedding_provider_id or "").strip()
-        try:
-            providers = list(self.context.get_all_embedding_providers() or [])
-        except Exception:
-            providers = []
-
-        if provider_id:
-            try:
-                provider = self.context.get_provider_by_id(provider_id)
-            except Exception:
-                provider = None
-            if isinstance(provider, EmbeddingProvider):
-                return provider
-            for candidate in providers:
-                candidate_id, candidate_model = self._provider_meta_label(candidate)
-                if provider_id in {candidate_id, candidate_model} or (
-                    candidate_model and candidate_model.endswith(provider_id)
-                ):
-                    logger.info(
-                        "[ActiveReply] embedding 配置按模型名/ID 匹配成功: %s -> %s",
-                        provider_id,
-                        candidate_model or candidate_id,
-                    )
-                    return candidate
-            logger.warning(
-                "[ActiveReply] embedding_provider_id 未匹配到提供商: %s（将回退到第一个可用 embedding provider）",
-                provider_id,
-            )
-        return providers[0] if providers else None
-
-    @staticmethod
-    def _parse_role_ids(raw: str) -> list[str]:
-        """解析 JSON 数组或分隔字符串，并返回去重后的角色 ID 列表。"""
-        # 接受 JSON 数组、逗号/空格分隔字符串，并返回去重后的角色 ID。
-        text = str(raw or "").strip()
-        if not text:
-            return []
-        parsed: list[str] = []
-        if text.startswith("["):
-            try:
-                payload = json.loads(text)
-                if isinstance(payload, list):
-                    parsed = [str(item).strip() for item in payload]
-            except json.JSONDecodeError:
-                parsed = []
-        if not parsed:
-            normalized = text.replace("\n", ",").replace(";", ",").replace(" ", ",")
-            parsed = [token.strip() for token in normalized.split(",")]
-        result: list[str] = []
-        for item in parsed:
-            if item and item not in result:
-                result.append(item)
-        return result
-
-    def _parse_timestamp(self, raw: str) -> float | None:
-        """解析秒/毫秒时间戳、常见日期或 ISO 时间并返回 Unix 秒数。"""
-        # 解析秒/毫秒时间戳、常见日期格式及 ISO 时间，并应用插件展示时区。
-        text = str(raw or "").strip()
-        if not text:
-            return None
-        try:
-            numeric = float(text)
-            return numeric / 1000.0 if numeric > 1e12 else numeric
-        except (TypeError, ValueError):
-            pass
-        tzinfo = self._tzinfo()
-        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
-            try:
-                return (
-                    datetime.datetime.strptime(text, fmt)
-                    .replace(tzinfo=tzinfo)
-                    .timestamp()
-                )
-            except ValueError:
-                continue
-        try:
-            parsed = datetime.datetime.fromisoformat(text.replace("Z", "+00:00"))
-        except ValueError:
-            return None
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=tzinfo)
-        return parsed.timestamp()
-
-    @staticmethod
-    def _canonical_scope(platform_id: str, group_id: str) -> str:
-        """统一的群范围格式：``platform:group_id``（不包含 GroupMessage 之类的消息类型段）。"""
-        platform_id = str(platform_id or "").strip()
-        group_id = str(group_id or "").strip()
-        if not group_id:
-            return ""
-        return f"{platform_id}:{group_id}" if platform_id else group_id
-
-    @staticmethod
-    def _recall_scopes(cfg: PluginConfig, scope: str) -> list[str]:
-        """按配置决定检索顺序：本群优先 + 全局兜底 / 全部全局 / 仅本群。"""
-        mode = cfg.memory_rag.auto_extract_scope
-        if mode == "global":
-            return [""]
-        if mode == "group":
-            return [scope] if scope else [""]
-        return [scope, ""] if scope else [""]
-
-    @staticmethod
-    def _platform_id_from_origin(origin: str) -> str:
-        """从 AstrBot 统一消息来源标识中提取平台字段。"""
-        # 从 AstrBot unified_msg_origin 中拆出平台段。
-        parts = str(origin or "").split(":")
-        return parts[0] if len(parts) >= 3 else ""
-
-    @staticmethod
-    def _group_id_from_origin(origin: str) -> str:
-        """从 AstrBot 统一消息来源标识中提取末尾群号字段。"""
-        # 从 AstrBot unified_msg_origin 的末段提取群号。
-        parts = str(origin or "").split(":")
-        return parts[-1] if len(parts) >= 3 else ""
-
-    @classmethod
-    def _normalize_scope_text(cls, scope: str) -> str:
-        """把 ``napcat:GroupMessage:123`` 之类的旧格式归一成 ``napcat:123``。"""
-        text = str(scope or "").strip()
-        if not text:
-            return ""
-        parts = text.split(":")
-        if len(parts) >= 3 and parts[1].lower() in {
-            "group",
-            "groupmessage",
-            "friend",
-            "friendmessage",
-            "private",
-        }:
-            return cls._canonical_scope(parts[0], parts[-1])
-        return text
-
-    def _resolve_memory_scope(
-        self, event: AstrMessageEvent, group_scope: str, group_id: str, platform_id: str
-    ) -> tuple[str, str, str]:
-        """优先使用显式作用域，否则结合事件信息生成规范群作用域。"""
-        # 显式 scope 优先且独立使用；否则从事件补足群号和平台后生成规范 scope。
-        explicit_scope = str(group_scope or "").strip()
-        explicit_group = str(group_id or "").strip()
-        explicit_platform = str(platform_id or "").strip()
-        event_group = self._group_id(event)
-        event_platform = self._platform_id(event)
-
-        if explicit_scope:
-            # 显式 scope 时不再混入当前群，避免 scope 与 group_id 冲突导致空结果
-            normalized = self._normalize_scope_text(explicit_scope)
-            return normalized, explicit_group, explicit_platform
-
-        final_group = explicit_group or event_group
-        final_platform = explicit_platform or event_platform
-        return (
-            self._canonical_scope(final_platform, final_group),
-            final_group,
-            final_platform,
-        )
-
     @llm_tool(name="enhance_memory_rag_write")
     async def enhance_memory_rag_write(
         self,
@@ -4448,78 +3539,15 @@ class ActiveReplyPlugin(star.Star):
             描述新记录 ID、时间和作用域的 JSON 字符串；校验或存储失败时返回
             可读的错误文本。此工具不做语义去重，调用方若需去重应使用自动写入流程。
         """
-        ready, reason = self._memory_ready()
-        if not ready or self.memory_store is None:
-            return reason
-        clean_content = str(content or "").strip()
-        if not clean_content:
-            return "content 不能为空。"
-        role_ids = self._parse_role_ids(related_role_ids)
-        if not role_ids:
-            sender = str(event.get_sender_id() or "").strip()
-            role_ids = [sender] if sender else []
-        if not role_ids:
-            return "related_role_ids 至少需要一个角色 ID（或直接使用当前发送者）。"
-
-        timestamp = self._parse_timestamp(memory_time)
-        if memory_time and timestamp is None:
-            return "memory_time 格式无法解析，请使用 Unix 时间戳或 ISO 时间。"
-        memory_ts = timestamp if timestamp is not None else time.time()
-        scope, final_group, final_platform = self._resolve_memory_scope(
-            event, group_scope, group_id, platform_id
-        )
-
-        provider = self._embedding_provider()
-        if provider is None:
-            return "没有可用的 embedding provider，请先在 AstrBot 中配置。"
-        try:
-            embedding = await provider.get_embedding(clean_content)
-        except Exception as exc:
-            logger.error(f"[ActiveReply] 记忆向量化失败: {exc}", exc_info=True)
-            return f"生成 embedding 失败：{exc}"
-
-        metadata: dict[str, Any] = {}
-        raw_metadata = str(extra_metadata_json or "").strip()
-        if raw_metadata:
-            try:
-                parsed = json.loads(raw_metadata)
-                metadata = parsed if isinstance(parsed, dict) else {"raw": parsed}
-            except json.JSONDecodeError:
-                metadata = {"raw": raw_metadata}
-
-        try:
-            memory_id = self.memory_store.add_memory(
-                content=clean_content,
-                embedding=embedding,
-                role_ids=role_ids,
-                memory_time=memory_ts,
-                group_scope=scope,
-                group_id=final_group,
-                platform_id=final_platform,
-                extra_metadata=metadata,
-            )
-        except Exception as exc:
-            logger.error(f"[ActiveReply] 写入记忆失败: {exc}", exc_info=True)
-            return f"写入记忆失败：{exc}"
-
-        logger.info(
-            "[ActiveReply] 记忆写入 | id=%s roles=%s scope=%s",
-            memory_id,
-            len(role_ids),
-            scope,
-        )
-        return json.dumps(
-            {
-                "status": "ok",
-                "memory_id": memory_id,
-                "memory_time": memory_ts,
-                "memory_time_iso": self.memory_store.format_timestamp_iso(memory_ts),
-                "group_scope": scope,
-                "group_id": final_group,
-                "platform_id": final_platform,
-                "related_role_ids": role_ids,
-            },
-            ensure_ascii=False,
+        return await self._memory_tool_write_impl(
+            event,
+            content=content,
+            related_role_ids=related_role_ids,
+            memory_time=memory_time,
+            group_scope=group_scope,
+            group_id=group_id,
+            platform_id=platform_id,
+            extra_metadata_json=extra_metadata_json,
         )
 
     @llm_tool(name="enhance_memory_rag_read")
@@ -4567,125 +3595,491 @@ class ActiveReplyPlugin(star.Star):
             不可用时返回可读错误文本。
 
         """
-        ready, reason = self._memory_ready()
-        if not ready or self.memory_store is None:
-            return reason
-
-        start_ts = self._parse_timestamp(start_time)
-        end_ts = self._parse_timestamp(end_time)
-        if start_time and start_ts is None:
-            return "start_time 格式无法解析。"
-        if end_time and end_ts is None:
-            return "end_time 格式无法解析。"
-        if start_ts is not None and end_ts is not None and start_ts > end_ts:
-            return "start_time 不能大于 end_time。"
-
-        ignore = (
-            ignore_group_id
-            if isinstance(ignore_group_id, bool)
-            else str(ignore_group_id).strip().lower() in {"1", "true", "yes", "on"}
+        return await self._memory_tool_read_impl(
+            event,
+            query=query,
+            related_role_ids=related_role_ids,
+            role_match_mode=role_match_mode,
+            start_time=start_time,
+            end_time=end_time,
+            group_scope=group_scope,
+            group_id=group_id,
+            platform_id=platform_id,
+            sort_by=sort_by,
+            sort_order=sort_order,
+            max_results=max_results,
+            embedding_recall_k=embedding_recall_k,
+            ignore_group_id=ignore_group_id,
         )
-        if ignore:
-            # 跨群读取：只使用显式传入的范围，绝不自动套用当前群
-            scope = str(group_scope or "").strip()
-            final_group = str(group_id or "").strip()
-            final_platform = str(platform_id or "").strip()
-            if not scope and final_group:
-                scope = (
-                    f"{final_platform}:{final_group}" if final_platform else final_group
-                )
+
+    @llm_tool(name="read_memory")
+    async def read_memory(
+        self,
+        event: AstrMessageEvent,
+        memory_id: int = 0,
+    ) -> str:
+        """按编号深读一条长期记忆的完整正文与证据。
+
+        自动回忆注入的是截断卡片（``- #12 [日期] 摘要``）。需要确切细节时再用
+        本工具读取全文；每次读取都会重新校验作用域，别的群或别人的私聊记忆
+        一律按「不存在」处理。
+
+        Args:
+            memory_id(number): 卡片里的编号，或 ``enhance_memory_rag_read`` 返回的 memory_id。
+
+        Returns:
+            包含正文、时间、作用域与证据摘录的 JSON 字符串；无效或不越权时返回错误文本。
+        """
+        return await self._memory_tool_detail_impl(
+            event,
+            memory_id=memory_id,
+        )
+
+    @staticmethod
+    def _text_result(text: str) -> mcp_types.CallToolResult:
+        """将字符串包装为 MCP 工具标准的文本结果对象。"""
+        # 将普通文本包装为 MCP 工具标准的文本内容结构。
+        return mcp_types.CallToolResult(
+            content=[mcp_types.TextContent(type="text", text=str(text or ""))]
+        )
+
+    async def _caption_image(
+        self, image_ref: str, provider_id: str, prompt: str, timeout: float
+    ) -> str:
+        """调用指定或当前会话模型描述图片，并限制调用超时。
+
+        Raises:
+            RuntimeError: 没有可用的文本模型提供商。
+            asyncio.TimeoutError: 图片描述请求超过指定时限。
+        """
+        # 调用指定或当前会话模型描述图片，使用独立会话且不写入聊天记录。
+        if provider_id:
+            provider = self.context.get_provider_by_id(provider_id)
         else:
-            scope, final_group, final_platform = self._resolve_memory_scope(
-                event, group_scope, group_id, platform_id
+            provider = self.context.get_using_provider()
+        if not isinstance(provider, Provider):
+            raise RuntimeError("没有可用的图片转述提供商")
+        response = await asyncio.wait_for(
+            provider.text_chat(
+                prompt=prompt,
+                session_id=uuid.uuid4().hex,
+                image_urls=[image_ref],
+                persist=False,
+            ),
+            timeout=timeout,
+        )
+        return str(response.completion_text or "")
+
+    @staticmethod
+    def _prune_image_cache(
+        cache_dir: Path, keep: int = 32, max_age_sec: int = 24 * 3600
+    ) -> None:
+        """清理过旧/过多的图片下载缓存，避免下载路径无限占盘（F29 配套）。"""
+        try:
+            entries = sorted(
+                cache_dir.glob("image_*.bin"),
+                key=lambda path: path.stat().st_mtime,
+                reverse=True,
             )
-
-        roles = self._parse_role_ids(related_role_ids)
-        mode = "all" if str(role_match_mode).strip().lower() == "all" else "any"
-        cfg = self._global_cfg()
-        try:
-            requested = int(max_results)
-        except (TypeError, ValueError):
-            requested = 10
-        limit = cfg.memory_rag.max_return_results
-        final_max = limit if requested <= 0 else min(requested, limit)
-        try:
-            recall = int(embedding_recall_k)
-        except (TypeError, ValueError):
-            recall = 0
-        if recall <= 0:
-            recall = cfg.memory_rag.recall_k
-
-        query_embedding: list[float] | None = None
-        clean_query = str(query or "").strip()
-        if clean_query:
-            provider = self._embedding_provider()
-            if provider is None:
-                return "没有可用的 embedding provider，请先在 AstrBot 中配置。"
+        except OSError:
+            return
+        now = time.time()
+        for index, path in enumerate(entries):
             try:
-                query_embedding = await provider.get_embedding(clean_query)
-            except Exception as exc:
-                logger.error(f"[ActiveReply] 查询向量化失败: {exc}", exc_info=True)
-                return f"生成查询 embedding 失败：{exc}"
+                stale = now - path.stat().st_mtime > max_age_sec
+                if index >= keep or stale:
+                    path.unlink(missing_ok=True)
+            except OSError:
+                continue
 
-        # 群范围和全局回退使用完全相同的角色、时间、排序与数量条件。
-        # 下方的 **search_kwargs 会把这些键值作为同名关键字参数传给检索方法，
-        # 避免两次查询各自维护一份筛选参数而产生不一致。
-        search_kwargs: dict[str, Any] = dict(
-            query_embedding=query_embedding,
-            recall_k=recall,
-            role_ids=roles,
-            role_match_mode=mode,
-            start_time=start_ts,
-            end_time=end_ts,
-            sort_by="time" if str(sort_by).lower().strip() == "time" else "relevance",
-            sort_order="asc" if str(sort_order).lower().strip() == "asc" else "desc",
-            max_results=final_max,
-        )
-        fallback_used = ""
-        try:
-            records = self.memory_store.search_memories(
-                group_scope=scope,
-                group_id=final_group if not ignore else "",
-                platform_id=final_platform if not ignore else "",
-                **search_kwargs,
+    async def _resolve_image_ref(
+        self, image_ref: str, timeout: float | None = None
+    ) -> str:
+        """把图片引用解析为本地文件路径，并做 SSRF/本地文件校验（F29）。
+
+        只接受公网 http(s) 图片地址，或插件数据目录内的本地文件；``file://``、
+        其它协议、回环/私网地址与任意本地路径一律拒绝。远程图片在这里自行流式
+        下载到插件目录并限制大小（``MAX_IMAGE_DOWNLOAD_BYTES``），不再经过没有
+        大小上限的核心下载 helper。
+        """
+        reference = str(image_ref or "").strip()
+        if not reference:
+            return ""
+        local = self._allowed_local_image(reference)
+        if local is not None:
+            return str(local)
+        reason = media_url_rejection(reference)
+        if reason:
+            logger.warning(
+                "[ActiveReply] 拒绝图片引用 | ref=%s | %s", reference[:200], reason
             )
-            cfg_mem = self._global_cfg()
-            if (
-                not records
-                and not ignore
-                and cfg_mem.memory_rag.auto_extract_scope != "group"
-                and scope != ""
-            ):
-                # 本群没有结果时，回退查全局记忆（跨群偏好等）
-                records = self.memory_store.search_memories(
-                    group_scope="",
-                    **search_kwargs,
-                )
-                if records:
-                    fallback_used = "global"
-        except Exception as exc:
-            logger.error(f"[ActiveReply] 检索记忆失败: {exc}", exc_info=True)
-            return f"检索记忆失败：{exc}"
+            return ""
+        return await self._download_image_limited(reference, timeout)
 
-        return json.dumps(
-            {
-                "status": "ok",
-                "count": len(records),
-                "filters": {
-                    "related_role_ids": roles,
-                    "role_match_mode": mode,
-                    "group_scope": scope,
-                    "group_id": final_group,
-                    "platform_id": final_platform,
-                    "start_time": start_ts,
-                    "end_time": end_ts,
-                    "ignore_group_id": ignore,
-                    "fallback": fallback_used,
-                },
-                "records": records,
-            },
-            ensure_ascii=False,
+    def _allowed_local_image(self, reference: str) -> Path | None:
+        """仅允许插件数据目录内的本地图片，阻止任意文件读取（F29）。"""
+        if "://" in reference:
+            return None
+        path = Path(reference)
+        if not path.is_absolute():
+            return None
+        root = getattr(self, "data_dir", None)
+        if not isinstance(root, Path):
+            return None
+        try:
+            resolved = path.resolve()
+            resolved.relative_to(root.resolve())
+        except (OSError, ValueError):
+            return None
+        return resolved if resolved.is_file() else None
+
+    async def _download_image_limited(
+        self, url: str, timeout: float | None = None
+    ) -> str:
+        """流式下载图片到插件目录；超过大小上限、非 200 或超时则放弃（F29）。"""
+        root = getattr(self, "data_dir", None)
+        if not isinstance(root, Path):
+            return ""
+        cache_dir = root / "image_cache"
+        try:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            logger.warning(f"[ActiveReply] 创建图片缓存目录失败: {exc}")
+            return ""
+        total_timeout = (
+            IMAGE_DOWNLOAD_TIMEOUT_SEC if timeout is None else float(timeout)
         )
+        target = cache_dir / f"image_{uuid.uuid4().hex}.bin"
+        self._prune_image_cache(cache_dir)
+        client_timeout = aiohttp.ClientTimeout(total=total_timeout)
+        data = bytearray()
+        try:
+            async with aiohttp.ClientSession(timeout=client_timeout) as session:
+                # 不跟随重定向：避免 3xx 跳到内网/本机地址绕过主机校验。
+                async with session.get(url, allow_redirects=False) as response:
+                    if response.status != 200:
+                        logger.warning(
+                            "[ActiveReply] 图片下载被拒绝 | url=%s status=%s",
+                            url[:200],
+                            response.status,
+                        )
+                        return ""
+                    content = getattr(response, "content", None)
+                    if content is None:
+                        raw = bytes(await response.read() or b"")
+                        if len(raw) > MAX_IMAGE_DOWNLOAD_BYTES:
+                            logger.warning(
+                                "[ActiveReply] 图片超过 %sMB 上限，已拒绝",
+                                MAX_IMAGE_DOWNLOAD_BYTES // (1024 * 1024),
+                            )
+                            return ""
+                        data.extend(raw)
+                    else:
+                        async for chunk in content.iter_chunked(64 * 1024):
+                            data.extend(chunk)
+                            if len(data) > MAX_IMAGE_DOWNLOAD_BYTES:
+                                logger.warning(
+                                    "[ActiveReply] 图片超过 %sMB 上限，已拒绝",
+                                    MAX_IMAGE_DOWNLOAD_BYTES // (1024 * 1024),
+                                )
+                                return ""
+            if not data:
+                return ""
+            target.write_bytes(bytes(data))
+            return str(target)
+        except asyncio.TimeoutError:
+            logger.warning("[ActiveReply] 图片下载超时 | url=%s", url[:200])
+            return ""
+        except Exception as exc:
+            logger.warning(f"[ActiveReply] 图片下载失败: {exc}")
+            return ""
+
+    @staticmethod
+    def _encode_image(image_path: str) -> tuple[str, str]:
+        """读取并编码图片，返回 Base64 内容与 MIME 类型。
+
+        Raises:
+            FileNotFoundError: 图片文件不存在。
+            ValueError: 图片为空或超过允许的大小上限。
+        """
+        # 检查图片存在、非空且不超过 12 MiB，再编码为 Base64 与 MIME 类型。
+        path = Path(image_path)
+        if not path.exists() or not path.is_file():
+            raise FileNotFoundError(f"图片不存在: {image_path}")
+        raw = path.read_bytes()
+        if not raw:
+            raise ValueError(f"图片内容为空: {image_path}")
+        if len(raw) > 12 * 1024 * 1024:
+            raise ValueError("图片超过 12MB，已拒绝附加")
+        mime = mimetypes.guess_type(str(path))[0] or "image/jpeg"
+        if not mime.startswith("image/"):
+            mime = "image/jpeg"
+        return base64.b64encode(raw).decode("ascii"), mime
+
+    def _write_caption_to_history(
+        self, origin: str, msg_id: str, image_index: int, caption: str
+    ) -> bool:
+        """替换指定历史消息中的图片占位符，并返回是否成功修改。"""
+        # 精确替换指定消息中对应序号的 [Image] 标记，并保留其他历史内容。
+        # 描述来自模型/图片内容，同样要单行化，避免换行伪造历史行（F11 同源风险）。
+        marker = f"#msg{msg_id}:"
+        safe = sanitize_inline(caption, MAX_INLINE_HISTORY_CHARS)
+        updated = False
+        for chats in (
+            self.state.session_chats.get(origin),
+            self.state.memory_chats.get(origin),
+        ):
+            if not chats:
+                continue
+            for line_index, line in enumerate(chats):
+                if marker not in line:
+                    continue
+                matches = list(IMAGE_MARKER_PATTERN.finditer(line))
+                if image_index >= len(matches):
+                    continue
+                target = matches[image_index]
+                chats[line_index] = (
+                    line[: target.start()] + f"[Image: {safe}]" + line[target.end() :]
+                )
+                updated = True
+                break
+        return updated
+
+    # ------------------------------------------------------------------ #
+    # LLM 工具：记忆 RAG
+    # ------------------------------------------------------------------ #
+    # ------------------------------------------------------------------ #
+    # 长期记忆：自动兜底写入
+    # ------------------------------------------------------------------ #
+    def _cached_member_role(self, group_id: str, user_id: str) -> str:
+        """从缓存读取群成员身份；未缓存时按普通成员处理。"""
+        cache = self._group_role_cache.get(str(group_id or ""))
+        if cache and time.time() - cache[0] < 600:
+            return cache[1].get(str(user_id or ""), "member")
+        return "member"
+
+    def _remember_group_roles(self, group_id: str, roles: dict[str, str]) -> None:
+        """写入群成员角色缓存，并按最后写入时间做容量淘汰（F48）。"""
+        if not group_id or not isinstance(roles, dict):
+            return
+        cache = self._group_role_cache
+        cache[group_id] = (time.time(), roles)
+        overflow = len(cache) - MAX_GROUP_ROLE_CACHE
+        if overflow <= 0:
+            return
+        # 按时间戳从旧到新删除多余条目，保证长期运行不会无界增长。
+        for key, _ in sorted(cache.items(), key=lambda item: item[1][0])[:overflow]:
+            cache.pop(key, None)
+
+    def _platform_clients(self) -> list[Any]:
+        """返回可调用平台 action 的客户端列表（用于查询群成员身份）。"""
+        manager = getattr(self.context, "platform_manager", None)
+        clients: list[Any] = []
+        for instance in getattr(manager, "platform_insts", None) or []:
+            client = getattr(instance, "bot", None) or getattr(instance, "client", None)
+            if client is not None and hasattr(client, "call_action"):
+                clients.append(client)
+        return clients
+
+    async def _group_roles_from_member_info(
+        self, group_id: str, user_id: str
+    ) -> str:
+        """通过平台 API 查询单个群成员身份；失败返回空串。"""
+        gid = str(group_id or "").strip()
+        uid = str(user_id or "").strip()
+        if not gid or not uid:
+            return ""
+        try:
+            group_param: Any = int(gid)
+        except (TypeError, ValueError):
+            group_param = gid
+        for client in self._platform_clients():
+            try:
+                payload = await asyncio.wait_for(
+                    client.call_action(
+                        "get_group_member_info",
+                        group_id=group_param,
+                        user_id=uid,
+                        no_cache=True,
+                    ),
+                    timeout=3,
+                )
+            except Exception:
+                continue
+            info = payload.get("data", payload) if isinstance(payload, dict) else {}
+            if not isinstance(info, dict):
+                continue
+            role = str(info.get("role") or info.get("member_role") or "").strip().lower()
+            if role in {"owner", "admin"}:
+                return f"group_{role}"
+            if role == "member":
+                return "member"
+        return ""
+
+    async def _group_roles_from_member_list(self, group_id: str) -> dict[str, str]:
+        """从群成员列表提取群主/群管身份；失败返回空字典。"""
+        gid = str(group_id or "").strip()
+        if not gid:
+            return {}
+        try:
+            group_param: Any = int(gid)
+        except (TypeError, ValueError):
+            group_param = gid
+        for client in self._platform_clients():
+            try:
+                payload = await asyncio.wait_for(
+                    client.call_action("get_group_member_list", group_id=group_param),
+                    timeout=5,
+                )
+            except Exception:
+                continue
+            if isinstance(payload, dict):
+                members = payload.get("data", [])
+            else:
+                members = payload
+            if not isinstance(members, list):
+                continue
+            roles: dict[str, str] = {}
+            for member in members:
+                if not isinstance(member, dict):
+                    continue
+                uid = str(member.get("user_id") or "").strip()
+                role = str(member.get("role") or "").strip().lower()
+                if not uid:
+                    continue
+                if role == "owner":
+                    roles[uid] = "group_owner"
+                elif role == "admin":
+                    roles[uid] = "group_admin"
+            return roles
+        return {}
+
+    async def _load_group_roles(
+        self, event: AstrMessageEvent, group_id: str, user_id: str = ""
+    ) -> dict[str, str]:
+        """读取群主/群管名单；平台群对象缺失时退回 OneBot 成员接口。"""
+        gid = str(group_id or "").strip()
+        roles: dict[str, str] = {}
+        if not gid:
+            return roles
+        try:
+            group = await asyncio.wait_for(event.get_group(), timeout=5)
+        except Exception as exc:
+            group = None
+            logger.debug(f"[ActiveReply] 获取群成员身份失败: {exc}")
+        if group is not None:
+            owner = str(getattr(group, "group_owner", "") or "").strip()
+            if owner:
+                roles[owner] = "group_owner"
+            for admin in getattr(group, "group_admins", None) or []:
+                admin_id = str(admin or "").strip()
+                if admin_id:
+                    roles[admin_id] = "group_admin"
+        if not roles:
+            roles.update(await self._group_roles_from_member_list(gid))
+        uid = str(user_id or "").strip()
+        if uid and uid not in roles:
+            role = await self._group_roles_from_member_info(gid, uid)
+            if role:
+                roles[uid] = role
+        return roles
+
+    async def _member_role(
+        self, event: AstrMessageEvent, group_id: str, user_id: str
+    ) -> str:
+        """解析身份：AstrBot 管理员=所有者，群主/群管/成员来自平台 API。"""
+        gid = str(group_id or "")
+        uid = str(user_id or "")
+        cache = self._group_role_cache.get(gid) if gid else None
+        if cache and time.time() - cache[0] < 600:
+            roles = cache[1]
+        else:
+            roles = await self._load_group_roles(event, gid, uid)
+            if gid:
+                self._remember_group_roles(gid, roles)
+        if event.is_admin():
+            if gid:
+                roles[uid] = "owner"
+                self._remember_group_roles(gid, roles)
+            return "owner"
+        return roles.get(uid, "member")
+
+    def _prime_group_roles(self, event: AstrMessageEvent) -> None:
+        """后台预热当前群的群主/群管名单，供历史与记忆角色徽标使用。"""
+        gid = self._group_id(event)
+        if not gid:
+            return
+        cache = self._group_role_cache.get(gid)
+        if cache and time.time() - cache[0] < 600:
+            return
+        inflight = getattr(self, "_role_prime_inflight", None)
+        if inflight is None:
+            inflight = set()
+            self._role_prime_inflight = inflight
+        if gid in inflight:
+            return
+        inflight.add(gid)
+        sender = str(event.get_sender_id() or "")
+
+        async def _run() -> None:
+            try:
+                roles = await self._load_group_roles(event, gid, sender)
+                if roles:
+                    self._remember_group_roles(gid, roles)
+            except Exception as exc:
+                logger.debug(f"[ActiveReply] 预热群成员身份失败: {exc}")
+            finally:
+                inflight.discard(gid)
+
+        self._spawn(_run(), name="areply-group-roles")
+
+    # ------------------------------------------------------------------ #
+    # 自动记忆：后台模型抽取
+    # ------------------------------------------------------------------ #
+
+    def _resolve_self_id(self, event: AstrMessageEvent) -> str:
+        """取机器人自身 ID；取不到时只告警一次并返回 ``"0"``。"""
+        self_id = resolve_self_id(event)
+        if self_id == "0" and not getattr(self, "_self_id_warned", False):
+            self._self_id_warned = True
+            logger.warning(
+                "[ActiveReply] 无法读取机器人自身 ID，记忆身份标记会退化为 0"
+            )
+        return self_id
+
+    # ------------------------------------------------------------------ #
+    # 记忆生命周期：归档与定期巩固
+    # ------------------------------------------------------------------ #
+    def _install_log_buffer(self) -> None:
+        """（重新）挂载插件日志缓冲；插件注册后调用可确保取到插件 logger。"""
+        old_handler = getattr(self, "_log_handler", None)
+        if old_handler is not None:
+            with contextlib.suppress(Exception):
+                logger.removeHandler(old_handler)
+        handler = _PluginLogHandler(self._log_buffer)
+        try:
+            logger.addHandler(handler)
+            self._log_handler = handler
+        except Exception as exc:
+            logger.debug(f"[ActiveReply] 安装插件日志缓冲失败: {exc}")
+
+    @staticmethod
+    def _provider_meta_label(provider: Any) -> tuple[str, str]:
+        """返回 (provider_id, model)，字段缺失时回退到 provider_config。"""
+        provider_cfg = getattr(provider, "provider_config", {}) or {}
+        provider_id = ""
+        model = ""
+        try:
+            meta = provider.meta()
+            provider_id = str(getattr(meta, "id", "") or "")
+            model = str(getattr(meta, "model", "") or "")
+        except Exception:
+            pass
+        if not provider_id:
+            provider_id = str(provider_cfg.get("id") or "")
+        if not model:
+            model = str(provider_cfg.get("model") or "")
+        return provider_id, model
 
     # ------------------------------------------------------------------ #
     # 供页面使用的辅助

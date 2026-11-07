@@ -3,9 +3,9 @@
   <!-- 控制台由静态 DOM 骨架与 app.js 渲染层组成，通过 AstrBot iframe bridge 请求插件 API。 -->
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
     <title>主动回复 · 控制台</title>
-    <link rel="stylesheet" href="./styles.css?v=33" />
+    <link rel="stylesheet" href="./styles.css?v=30" />
   </head>
   <body>
     <!-- 图标库（内联 SVG，避免依赖外部图标字体/emoji） -->
@@ -20,6 +20,7 @@
       <symbol id="i-users" viewBox="0 0 24 24"><g><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2M16 3.128a4 4 0 0 1 0 7.744M22 21v-2a4 4 0 0 0-3-3.87"/><circle cx="9" cy="7" r="4"/></g></symbol>
       <symbol id="i-refresh" viewBox="0 0 24 24"><g><path d="M3 12a9 9 0 0 1 9-9a9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5m5 4a9 9 0 0 1-9 9a9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M8 16H3v5"/></g></symbol>
       <symbol id="i-check" viewBox="0 0 24 24"><path d="M20 6L9 17l-5-5"/></symbol>
+      <symbol id="i-select" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="4"/><path d="m8 12 3 3 5-7"/></symbol>
       <symbol id="i-reset" viewBox="0 0 24 24"><g><path d="M3 7v6h6"/><path d="M21 17a9 9 0 0 0-9-9a9 9 0 0 0-6 2.3L3 13"/></g></symbol>
       <symbol id="i-search" viewBox="0 0 24 24"><g><path d="m21 21l-4.34-4.34"/><circle cx="11" cy="11" r="8"/></g></symbol>
       <symbol id="i-trash" viewBox="0 0 24 24"><path d="M10 11v6m4-6v6m5-11v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></symbol>
@@ -33,62 +34,52 @@
       <symbol id="i-sparkles" viewBox="0 0 24 24"><g><path d="M11.017 2.814a1 1 0 0 1 1.966 0l1.051 5.558a2 2 0 0 0 1.594 1.594l5.558 1.051a1 1 0 0 1 0 1.966l-5.558 1.051a2 2 0 0 0-1.594 1.594l-1.051 5.558a1 1 0 0 1-1.966 0l-1.051-5.558a2 2 0 0 0-1.594-1.594l-5.558-1.051a1 1 0 0 1 0-1.966l5.558-1.051a2 2 0 0 0 1.594-1.594zM20 2v4m2-2h-4"/><circle cx="4" cy="20" r="2"/></g></symbol>
       <symbol id="i-sliders" viewBox="0 0 24 24"><path d="M10 5H3m9 14H3M14 3v4m2 10v4m5-9h-9m9 7h-5m5-14h-7m-6 5v4m0-2H3"/></symbol>
       <symbol id="i-inbox" viewBox="0 0 24 24"><g><path d="M22 12h-6l-2 3h-4l-2-3H2"/><path d="M5.45 5.11L2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11"/></g></symbol>
+      <symbol id="i-funnel" viewBox="0 0 24 24"><path d="M22 3H2l8 9.46V19l4 2v-8.54L22 3z"/></symbol>
+      <symbol id="i-wrench" viewBox="0 0 24 24"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/></symbol>
+      <symbol id="i-archive" viewBox="0 0 24 24"><g><rect width="20" height="5" x="2" y="3" rx="1"/><path d="M4 8v11a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8"/><path d="M10 12h4"/></g></symbol>
     </svg>
     <!-- 主应用外壳：顶部栏、侧边导航与按需显示的四个业务视图。 -->
-    <div class="app-shell">
-      <!-- 顶栏 -->
-      <header class="topbar">
-        <button id="menu-btn" class="icon-btn" aria-label="打开菜单" aria-expanded="false"><svg class="icon" aria-hidden="true"><path id="menu-path" d="M4 5h16M4 12h16M4 19h16"/></svg></button>
-        <div class="brand">
-          <img class="brand-logo" src="./logo.png" alt="ActiveReply" onerror="this.style.display='none'" />
-          <div class="brand-text">
-            <strong>主动回复</strong>
-            <span id="brand-sub">ActiveReply Console</span>
-          </div>
-        </div>
-        <div class="topbar-right">
-          <button id="theme-btn" class="theme-btn" type="button" title="主题：跟随系统" aria-label="切换主题">
-            <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
-              <path id="theme-path" d="M4 3h16a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2ZM8 21h8M12 17v4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"></path>
-            </svg>
-          </button>
-          <span id="theme-chip" class="chip">跟随面板</span>
-        </div>
-      </header>
+    <!-- 汉堡菜单:抽屉固定在底层,主内容区(.main-pane)被推开成卡片 -->
+    <!-- 汉堡菜单 -->
+    <div id="scrim" class="scrim"></div>
+    <aside id="drawer" class="drawer" aria-hidden="true">
+      <div class="drawer-controls">
+        <span class="drawer-title">功能配置</span>
+      </div>
 
-      <!-- 汉堡菜单 -->
-      <div id="scrim" class="scrim"></div>
-      <aside id="drawer" class="drawer" aria-hidden="true">
-        <div class="drawer-head">
-          <span>功能配置</span>
-          <button id="drawer-close" class="icon-btn" aria-label="关闭菜单"><svg class="icon" aria-hidden="true"><use href="#i-close"></use></svg></button>
+      <nav class="nav">
+        <button class="nav-item active" data-view="overview"><svg class="icon" aria-hidden="true"><use href="#i-activity"></use></svg>状态</button>
+        <button class="nav-item" data-view="rag"><svg class="icon" aria-hidden="true"><use href="#i-database"></use></svg>记忆 RAG</button>
+      </nav>
+
+      <div class="drawer-section">
+        <button id="drawer-manage-groups" class="drawer-manage drawer-manage-merged" title="打开群配置页，可手动输入群号">
+          <span class="drawer-manage-icon"><svg class="icon" aria-hidden="true"><use href="#i-users"></use></svg></span>
+          <span class="drawer-manage-text">
+            <span class="drawer-manage-title">群配置</span>
+            <span class="drawer-manage-sub">管理全部群 / 手动输入群号</span>
+          </span>
+          <span id="drawer-group-count" class="drawer-count">0</span>
+          <svg class="icon drawer-manage-arrow" aria-hidden="true"><use href="#i-arrow-right"></use></svg>
+        </button>
+        <div id="drawer-groups" class="drawer-groups">
+          <p class="muted small pad">暂无群</p>
         </div>
+      </div>
 
-        <nav class="nav">
-          <button class="nav-item active" data-view="overview"><svg class="icon" aria-hidden="true"><use href="#i-activity"></use></svg>状态</button>
-          <button class="nav-item" data-view="rag"><svg class="icon" aria-hidden="true"><use href="#i-database"></use></svg>记忆 RAG</button>
-        </nav>
-
-        <div class="drawer-section">
-          <div class="drawer-label">
-            <span>群配置</span>
-            <span id="drawer-group-count" class="muted small">0</span>
-          </div>
-          <button id="drawer-manage-groups" class="drawer-manage" title="打开群配置页，可手动输入群号"><svg class="icon" aria-hidden="true"><use href="#i-users"></use></svg>管理全部群 / 手动输入群号</button>
-          <div id="drawer-groups" class="drawer-groups">
-            <p class="muted small pad">暂无群</p>
-          </div>
+      <div class="drawer-foot">
+        <div class="drawer-foot-actions">
+          <button id="drawer-settings" class="drawer-settings" title="直接修改插件全局配置"><svg class="icon" aria-hidden="true"><use href="#i-settings"></use></svg>全局设置</button>
+          <button id="drawer-blocks" class="drawer-settings" title="管理用户屏蔽记录"><svg class="icon" aria-hidden="true"><use href="#i-shield"></use></svg>屏蔽设置</button>
+          <button id="drawer-dev" class="drawer-dev" type="button" title="开发者模式" aria-label="开发者模式"><svg class="icon" aria-hidden="true"><use href="#i-wrench"></use></svg></button>
         </div>
+        <p class="muted small" id="drawer-version">v-</p>
+      </div>
+    </aside>
 
-        <div class="drawer-foot">
-          <div class="drawer-foot-actions">
-            <button id="drawer-settings" class="drawer-settings" title="直接修改插件全局配置"><svg class="icon" aria-hidden="true"><use href="#i-settings"></use></svg>全局设置</button>
-            <button id="drawer-blocks" class="drawer-settings" title="管理用户屏蔽记录"><svg class="icon" aria-hidden="true"><use href="#i-shield"></use></svg>屏蔽设置</button>
-          </div>
-          <p class="muted small" id="drawer-version">v-</p>
-        </div>
-      </aside>
-
+    <div id="main-pane" class="app-shell main-pane">
+      <!-- 左边缘透明触发区:只在这里接收横向拖拽,避免抢走列表滚动与点击 -->
+      <div id="pane-edge" class="pane-edge" aria-hidden="true"></div>
       <!-- 内容区 -->
       <main class="content">
         <!-- 状态 -->
@@ -97,30 +88,67 @@
             <h2>状态</h2>
             <p class="muted">当前插件状态与记忆库概况</p>
           </div>
-          <div id="status-grid" class="status-grid"></div>
+          <!-- 分组卡(参考图 B):状态指标变成一张卡内的多行 -->
+          <div class="group-card status-group">
+            <div id="status-grid" class="status-grid rows"></div>
+          </div>
+
+          <!-- 本轮记忆读数:由 renderOverview 从 /overview 的 metrics 字段填充 -->
+          <section class="group-block">
+            <div class="group-title">
+              <h3>本轮记忆</h3>
+              <span class="muted small">最近一轮对话</span>
+            </div>
+            <div class="group-card">
+              <div id="overview-metrics" class="status-grid rows"></div>
+            </div>
+          </section>
+
           <div class="grid two">
-            <div class="card">
-              <div class="card-head">
+            <section class="group-block">
+              <div class="group-title">
                 <h3>记忆库</h3>
                 <span class="muted small">按群统计</span>
               </div>
-              <div id="overview-stats" class="stat-row"></div>
-            </div>
-            <div class="card">
-              <div class="card-head">
+              <div class="group-card">
+                <div id="overview-stats" class="stat-row rows"></div>
+                <!-- 空状态(参考图 A):由 JS 只切换 hidden,不再生成第二套 -->
+                <div id="overview-stats-empty" class="empty-state hidden">
+                  <div class="empty-icon"><svg class="icon" aria-hidden="true"><use href="#i-database"></use></svg></div>
+                  <h3>暂无记忆</h3>
+                  <p class="muted">收到群消息并写入记忆后，统计会显示在这里</p>
+                  <button type="button" class="primary pill-btn" id="overview-stats-refresh" aria-label="刷新状态"><svg class="icon" aria-hidden="true"><use href="#i-refresh"></use></svg>刷新</button>
+                </div>
+              </div>
+            </section>
+            <section class="group-block">
+              <div class="group-title">
                 <h3>全局开关</h3>
                 <span class="muted small">来自插件配置</span>
               </div>
-              <ul id="overview-switches" class="kv"></ul>
-            </div>
+              <div class="group-card">
+                <ul id="overview-switches" class="kv rows"></ul>
+              </div>
+            </section>
           </div>
-          <div class="card">
-            <div class="card-head">
+
+          <section class="group-block">
+            <div class="group-title">
               <h3>最近有消息的群</h3>
-              <button class="ghost" id="overview-refresh"><svg class="icon" aria-hidden="true"><use href="#i-refresh"></use></svg>刷新</button>
+              <button class="ghost small-btn" id="overview-refresh" aria-label="刷新最近活跃群"><svg class="icon" aria-hidden="true"><use href="#i-refresh"></use></svg>刷新</button>
             </div>
-            <div id="overview-groups" class="group-strip"></div>
-          </div>
+            <div class="group-card strip-card">
+              <div class="strip-scroll">
+                <div id="overview-groups" class="group-strip"></div>
+              </div>
+              <div id="overview-groups-empty" class="empty-state hidden">
+                <div class="empty-icon"><svg class="icon" aria-hidden="true"><use href="#i-users"></use></svg></div>
+                <h3>暂无活跃群</h3>
+                <p class="muted">还没有收到过任何群消息，也可以直接去群配置手动输入群号</p>
+                <button type="button" class="primary pill-btn" id="overview-groups-go" aria-label="前往群配置"><svg class="icon" aria-hidden="true"><use href="#i-arrow-right"></use></svg>前往群配置</button>
+              </div>
+            </div>
+          </section>
         </section>
 
         <!-- 群配置 -->
@@ -132,28 +160,35 @@
           <div class="groups-layout">
             <aside class="group-list card">
               <div class="group-list-head">
-                <input id="group-search" class="input" type="search" placeholder="搜索群号 / 群名" />
-                <button id="groups-refresh" class="ghost small-btn"><svg class="icon" aria-hidden="true"><use href="#i-refresh"></use></svg>刷新</button>
+                <!-- 胶囊搜索框(参考图 A):放大镜 + input,右侧图标刷新钮 -->
+                <label class="search-pill">
+                  <svg class="icon" aria-hidden="true"><use href="#i-search"></use></svg>
+                  <input id="group-search" class="input" type="search" placeholder="搜索群号 / 群名" aria-label="搜索群号或群名" />
+                </label>
+                <button id="groups-refresh" class="icon-btn" type="button" title="刷新群列表" aria-label="刷新群列表"><svg class="icon" aria-hidden="true"><use href="#i-refresh"></use></svg></button>
               </div>
-              <div id="group-items" class="group-items">
-                <p class="muted small pad">正在加载…</p>
+              <div class="group-items-scroll">
+                <div id="group-items" class="group-items">
+                  <p class="muted small pad">正在加载…</p>
+                </div>
               </div>
             </aside>
 
             <div class="group-editor">
-              <div id="group-empty" class="empty">
+              <div id="group-empty" class="empty empty-state">
                 <div class="empty-icon"><svg class="icon" aria-hidden="true"><use href="#i-inbox"></use></svg></div>
                 <h3>选择一个群</h3>
                 <p class="muted">左侧列表会显示 AstrBot 已知的群；也可以直接输入群号手动添加</p>
                 <form id="manual-group-form" class="inline-form">
-                  <input id="manual-group-id" class="input mono" placeholder="填写群号，例如 123456789" />
-                  <button type="submit" class="primary small-btn"><svg class="icon" aria-hidden="true"><use href="#i-arrow-right"></use></svg>打开</button>
+                  <input id="manual-group-id" class="input mono" placeholder="填写群号，例如 123456789" aria-label="群号" />
+                  <button type="submit" class="primary pill-btn" aria-label="打开该群配置"><svg class="icon" aria-hidden="true"><use href="#i-arrow-right"></use></svg>打开</button>
                 </form>
               </div>
 
               <div id="group-panel" class="hidden">
-                <div class="sticky-head">
-                <div class="group-panel-head">
+                <div class="head-card">
+                  <div class="group-panel-head">
+                  <!-- 三段式:头像 / 标题块 / 操作区 -->
                   <img id="group-avatar" class="group-avatar" alt="" />
                   <div class="group-title-block">
                     <h3 id="group-name">未命名群</h3>
@@ -167,22 +202,25 @@
                       </span>
                       <span>独立配置</span>
                     </label>
-                    <button id="save-group" class="primary small-btn" title="保存本群的独立配置"><svg class="icon" aria-hidden="true"><use href="#i-check"></use></svg>保存</button>
-                    <button id="reset-group" class="ghost small-btn" title="把本群配置填回插件默认值（需要先保存）"><svg class="icon" aria-hidden="true"><use href="#i-reset"></use></svg>恢复默认</button>
+                    <button id="save-group" class="primary small-btn pill-btn" title="保存本群的独立配置" aria-label="保存"><svg class="icon" aria-hidden="true"><use href="#i-check"></use></svg></button>
+                    <button id="reset-group" class="ghost small-btn pill-btn" title="把本群配置填回插件默认值（需要先保存）" aria-label="恢复默认"><svg class="icon" aria-hidden="true"><use href="#i-reset"></use></svg></button>
                   </div>
+                  </div>
+                  <p id="save-hint" class="muted small group-hint"></p>
                 </div>
-                <p id="save-hint" class="muted small group-hint"></p>
-
-                <div class="tabs" id="group-tabs" role="tablist">
+                <div class="sticky-head">
+                  <div class="seg-wrap">
+                    <div class="tabs seg" id="group-tabs" role="tablist" aria-label="群配置分区">
                   <button class="tab active" data-tab="active_reply" role="tab" title="概率 / 模型判定、触发积累、黑白名单"><svg class="icon" aria-hidden="true"><use href="#i-message"></use></svg>消息主动回复</button>
                   <button class="tab" data-tab="group_context_enhancement" role="tab" title="群聊历史记录与注入、图片转述"><svg class="icon" aria-hidden="true"><use href="#i-layers"></use></svg>群聊上下文增强</button>
                   <button class="tab" data-tab="group_reply_enhancement" role="tab" title="React Pattern、角色显示、智能 @ 与引用"><svg class="icon" aria-hidden="true"><use href="#i-sparkles"></use></svg>群聊回复增强</button>
                   <button class="tab" data-tab="memory_rag" role="tab" title="本群记忆 RAG 独立设置"><svg class="icon" aria-hidden="true"><use href="#i-database"></use></svg>记忆 RAG</button>
                   <button class="tab" data-tab="user_block" role="tab" title="本群单独屏蔽用户"><svg class="icon" aria-hidden="true"><use href="#i-shield"></use></svg>用户屏蔽</button>
-                </div>
+                    </div>
+                  </div>
                 </div>
 
-                <div id="group-form" class="form-body"></div>
+<div id="group-form" class="form-body"></div>
               </div>
             </div>
           </div>
@@ -206,7 +244,11 @@
               </div>
             </div>
             <div id="auto-memory-body" class="auto-memory-body">
-              <p class="muted small pad">加载中…</p>
+              <div class="skeleton-auto-row" aria-hidden="true">
+                <span class="skeleton skeleton-line skeleton-line-id"></span>
+                <span class="skeleton skeleton-line skeleton-line-time"></span>
+                <span class="skeleton skeleton-line skeleton-line-scope"></span>
+              </div>
             </div>
             <div class="auto-memory-foot">
               <button id="auto-memory-settings" class="link-btn" type="button">
@@ -215,16 +257,21 @@
             </div>
           </div>
 
-          <div id="rag-stats-card" class="source-card" data-expanded="0"></div>
-          <div id="rag-source-card" class="source-card"></div>
+          <div id="rag-stats-card" class="source-card" data-expanded="0">
+            <div class="skeleton-panel-head" aria-hidden="true">
+              <span class="skeleton skeleton-title"></span>
+              <span class="skeleton skeleton-meta"></span>
+            </div>
+          </div>
+          <div id="rag-source-card" class="source-card">
+            <div class="skeleton-panel-head" aria-hidden="true">
+              <span class="skeleton skeleton-title"></span>
+              <span class="skeleton skeleton-meta"></span>
+            </div>
+          </div>
+          <div id="rag-rules" class="rag-rules muted small"></div>
 
           <div class="card">
-            <div class="filter-actions rag-actions">
-              <button id="rag-search" class="primary small-btn"><svg class="icon" aria-hidden="true"><use href="#i-search"></use></svg>筛选</button>
-              <button id="rag-reset" class="ghost small-btn"><svg class="icon" aria-hidden="true"><use href="#i-reset"></use></svg>重置</button>
-              <button id="rag-cleanup" class="ghost small-btn" title="规范化旧记录的时间元数据"><svg class="icon" aria-hidden="true"><use href="#i-trash"></use></svg>清理</button>
-              <button id="rag-selftest" class="ghost small-btn" title="写入→读回→检索→删除 一条测试记忆"><svg class="icon" aria-hidden="true"><use href="#i-shield"></use></svg>自检</button>
-            </div>
             <div class="filters rag-filters">
               <label class="field">
                 <span>关键词 / ID</span>
@@ -234,10 +281,23 @@
                 <span>角色 ID</span>
                 <input id="rag-role" class="input mono" placeholder="可选" />
               </label>
+              <button id="rag-quick-search" class="icon-btn rag-quick-search" type="button" aria-label="按关键词和角色搜索"><svg class="icon" aria-hidden="true"><use href="#i-search"></use></svg></button>
+            </div>
+            <div class="filter-actions rag-actions">
+              <button id="rag-search" class="primary small-btn rag-filter-main" type="button" title="筛选记忆"><svg class="icon" aria-hidden="true"><use href="#i-funnel"></use></svg><span id="rag-filter-label" class="rag-filter-label">筛选</span></button>
+              <button id="rag-select-btn" class="icon-btn rag-select-toggle" type="button" title="批量选择" aria-label="批量选择" aria-pressed="false"><svg class="icon" aria-hidden="true"><use href="#i-select"></use></svg></button>
+              <button id="rag-archived-btn" class="icon-btn rag-archived-toggle" type="button" title="已归档" aria-label="已归档" aria-pressed="false"><svg class="icon" aria-hidden="true"><use href="#i-archive"></use></svg></button>
             </div>
 
-            <div class="table-wrap">
-              <table class="table">
+            <div id="rag-bulk-bar" class="rag-bulk-bar" hidden>
+              <span id="rag-bulk-count" class="rag-bulk-count">已选 0 条</span>
+              <button id="rag-bulk-archive" class="ghost small-btn" type="button">归档</button>
+              <button id="rag-bulk-delete" class="ghost small-btn danger" type="button">删除</button>
+              <button id="rag-bulk-cancel" class="link-btn" type="button">取消</button>
+            </div>
+
+            <div class="table-wrap rag-table-wrap">
+              <table class="table rag-table">
                 <thead>
                   <tr>
                     <th class="w-id">ID</th>
@@ -331,38 +391,108 @@
             <p class="muted">直接修改插件的全局配置，保存后立即生效</p>
           </div>
           <div class="group-editor">
-            <div class="sticky-head">
-            <div class="group-panel-head">
-              <img class="group-avatar" src="./logo.png" alt="" />
+            <div class="head-card">
+              <div class="group-panel-head">
+              <img class="group-avatar logo-48" src="./logo.png" alt="" />
               <div class="group-title-block">
                 <h3>插件全局配置</h3>
                 <p class="muted small">群独立配置会覆盖这里的对应项</p>
               </div>
               <div class="panel-actions">
-                <button id="save-global" class="primary small-btn" title="按 schema 校验并写入 AstrBot 插件配置"><svg class="icon" aria-hidden="true"><use href="#i-check"></use></svg>保存</button>
-                <button id="reset-global" class="ghost small-btn" title="把全局配置填回插件默认值（需要先保存）"><svg class="icon" aria-hidden="true"><use href="#i-reset"></use></svg>恢复默认配置</button>
+                <button id="save-global" class="primary small-btn pill-btn" title="按 schema 校验并写入 AstrBot 插件配置" aria-label="保存"><svg class="icon" aria-hidden="true"><use href="#i-check"></use></svg></button>
+                <button id="reset-global" class="ghost small-btn pill-btn" title="把全局配置填回插件默认值（需要先保存）" aria-label="恢复默认配置"><svg class="icon" aria-hidden="true"><use href="#i-reset"></use></svg></button>
+              </div>
+              </div>
+              <p id="global-hint" class="muted small group-hint"></p>
+            </div>
+            <div class="sticky-head">
+              <div class="seg-wrap">
+                <div class="tabs seg" id="global-tabs" role="tablist" aria-label="全局设置分区"></div>
               </div>
             </div>
-            <p id="global-hint" class="muted small group-hint"></p>
 
-            <div class="tabs" id="global-tabs" role="tablist"></div>
-            </div>
-
-            <div id="global-form" class="form-body">
+<div id="global-form" class="form-body">
               <p class="muted small pad">正在加载配置…</p>
             </div>
           </div>
         </section>
+
+        <!-- 开发者模式：每次进入都要重新输入密钥，令牌仅在当前页面会话内有效 -->
+        <section id="view-dev" class="view">
+          <div class="section-head">
+            <h2>开发者模式</h2>
+            <p class="muted">提示词预览与自检等调试工具，仅对知道开发者密钥的人开放</p>
+          </div>
+          <div id="dev-gate" class="card dev-gate">
+            <label class="field">
+              <span>开发者密钥</span>
+              <input id="dev-key" class="input" type="password" placeholder="请输入开发者密钥" autocomplete="off" autocapitalize="off" spellcheck="false" />
+            </label>
+            <div class="dev-actions">
+              <button id="dev-login" class="primary" type="button"><svg class="icon" aria-hidden="true"><use href="#i-wrench"></use></svg>进入开发者模式</button>
+            </div>
+            <p id="dev-hint" class="muted small dev-hint"></p>
+          </div>
+          <div id="dev-tools" class="card dev-tools" hidden>
+            <h3>开发者工具</h3>
+            <div class="dev-actions">
+              <button id="dev-prompt" class="ghost" type="button"><svg class="icon" aria-hidden="true"><use href="#i-eye"></use></svg>提示词</button>
+              <button id="dev-selftest" class="ghost" type="button"><svg class="icon" aria-hidden="true"><use href="#i-shield"></use></svg>自检</button>
+              <button id="dev-diag" class="ghost" type="button"><svg class="icon" aria-hidden="true"><use href="#i-eye"></use></svg>界面诊断</button>
+              <button id="dev-logout" class="ghost" type="button"><svg class="icon" aria-hidden="true"><use href="#i-close"></use></svg>退出开发者模式</button>
+            </div>
+            <div class="dev-prompts">
+              <h4>抽取提示词补充层</h4>
+              <p class="muted small">已从「记忆 RAG」全局设置移到开发者模式；留空表示使用默认补充层。</p>
+              <label class="field">
+                <span>群聊抽取提示词</span>
+                <textarea id="dev-prompt-group" class="input dev-textarea" rows="6" spellcheck="false" placeholder="留空使用默认补充层"></textarea>
+              </label>
+              <label class="field">
+                <span>私聊抽取提示词</span>
+                <textarea id="dev-prompt-private" class="input dev-textarea" rows="6" spellcheck="false" placeholder="留空使用默认补充层"></textarea>
+              </label>
+              <div class="dev-actions">
+                <button id="dev-prompt-save" class="primary" type="button"><svg class="icon" aria-hidden="true"><use href="#i-check"></use></svg>保存提示词</button>
+              </div>
+            </div>
+            <p class="muted small dev-hint">每次进入都需重新输入密钥；令牌 30 分钟有效</p>
+          </div>
+        </section>
       </main>
+
+      <!-- 推开时覆盖在主面板上的白色柔化层：随位移渐显，模拟被压在抽屉后面的淡化/模糊观感。
+           r3.3w：保留在 #main-pane 内——移出后 z-index:90 会盖住抽屉/详情/胶囊；
+           在面板打开时跟随 .main-pane 的 transform 反而能正确覆盖被推开的卡片。 -->
+      <div class="top-fade" aria-hidden="true"></div>
+      <div class="pane-veil" aria-hidden="true"></div>
+    </div>
+
+    <!-- r3.4n：延长页面底部的空白滚动范围，键盘遮挡输入框时可手动把内容滑到键盘上方。 -->
+    <div id="scroll-spacer" class="scroll-spacer" aria-hidden="true"></div>
+
+    <!-- 浮层按钮独立于主面板：滚动/挤压时不再跟着卡片切换定位上下文 -->
+    <div class="floating-controls">
+      <button id="menu-btn" class="menu-capsule" aria-label="打开菜单" aria-expanded="false">
+        <span class="menu-capsule-icon" aria-hidden="true"><svg class="icon" viewBox="0 0 24 24"><path id="menu-path" d="M4 5h16M4 12h16M4 19h16"/></svg></span>
+        <span id="brand-sub" class="menu-capsule-label">Active Reply</span>
+      </button>
+      <div class="topbar-right">
+        <button id="theme-btn" class="theme-btn" type="button" title="主题：跟随系统" aria-label="切换主题">
+          <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
+            <path id="theme-path" d="M4 3h16a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2ZM8 21h8M12 17v4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"></path>
+          </svg>
+        </button>
+        <span id="theme-chip" class="chip">跟随面板</span>
+      </div>
     </div>
 
     <!-- 详情抽屉承载记忆 JSON 与 RAG 自检结果，由前端统一控制开合。 -->
     <aside id="detail" class="detail" aria-hidden="true">
-      <div class="detail-head">
-        <h3 id="detail-title">记忆详情</h3>
-        <button id="detail-close" class="icon-btn" aria-label="关闭"><svg class="icon" aria-hidden="true"><use href="#i-close"></use></svg></button>
+      <div class="detail-controls">
+        <span class="detail-title" id="detail-title">记忆详情</span>
       </div>
-      <pre id="detail-body" class="detail-body mono"></pre>
+      <div id="detail-body" class="detail-body"></div>
     </aside>
 
     <div id="filter-modal" class="modal" aria-hidden="true">
@@ -381,19 +511,42 @@
           <label>群范围
             <select id="filter-scope" class="input"></select>
           </label>
-          <label>身份
+          <label>参与者身份
             <select id="filter-identity" class="input">
-              <option value="">全部身份</option>
+              <option value="">全部参与者身份</option>
               <option value="owner">所有者</option>
               <option value="group_owner">群主</option>
               <option value="group_admin">群管理</option>
               <option value="member">群成员</option>
             </select>
           </label>
+          <label>生命周期
+            <select id="filter-lifecycle" class="input">
+              <option value="">全部生命周期</option>
+              <option value="expiring">即将过期（7 天内）</option>
+              <option value="expired">已过期未归档</option>
+              <option value="stale">低价值将归档</option>
+              <option value="cold">长期未访问</option>
+            </select>
+          </label>
         </div>
         <div class="modal-actions">
           <button id="filter-cancel" class="ghost">取消</button>
+          <button id="filter-clear" class="ghost">清空</button>
           <button id="filter-apply" class="primary">应用</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- r3.3x：现场诊断面板（长按左上角胶囊打开），用于定位 iframe 键盘视口/命中区错位。 -->
+    <div id="ui-diag" class="modal ui-diag" aria-hidden="true">
+      <div class="modal-card ui-diag-card">
+        <h3>界面诊断</h3>
+        <p class="muted small">复现「点不动/点击偏移」后截图本面板。重新打开：开发者模式 →「界面诊断」。</p>
+        <pre id="ui-diag-text" class="ui-diag-text mono"></pre>
+        <div class="modal-actions">
+          <button id="ui-diag-close" class="ghost" type="button">关闭</button>
+          <button id="ui-diag-recover" class="primary" type="button">强制恢复界面</button>
         </div>
       </div>
     </div>
@@ -415,6 +568,6 @@
     </div>
 
     <div id="toast" class="toast"></div>
-    <script type="module" src="./app.js?v=33"></script>
+    <script type="module" src="./app.js?v=30"></script>
   </body>
 </html>

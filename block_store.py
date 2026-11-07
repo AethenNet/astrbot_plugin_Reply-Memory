@@ -7,11 +7,15 @@
 from __future__ import annotations
 
 import json
+import logging
+import math
 import re
 import threading
 import time
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 STORE_VERSION = 1
 USER_ID_RE = re.compile(r"^[A-Za-z0-9]+$")
@@ -51,7 +55,10 @@ def format_remaining(until: float) -> str:
     """把到期时间格式化为「永久 / 剩余 X」的易读文本。"""
     if not until:
         return "永久"
-    remaining = float(until) - time.time()
+    try:
+        remaining = float(until) - time.time()
+    except (TypeError, ValueError):
+        return "永久"
     if remaining <= 0:
         return "已过期"
     total = int(remaining)
@@ -70,6 +77,31 @@ def format_remaining(until: float) -> str:
     return "剩余" + "".join(parts)
 
 
+def _coerce_float(value: Any, default: float = 0.0) -> tuple[float, bool]:
+    """返回 ``(有限浮点数, 是否合法)``；非法/非有限值回退默认值（F19）。"""
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return default, False
+    if not math.isfinite(number):
+        return default, False
+    return number, True
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    """把任意 JSON 值转成有限浮点数；非法值回退默认值（F19）。"""
+    return _coerce_float(value, default)[0]
+
+
+def _as_text(value: Any) -> str:
+    """把 JSON 标量转成清理后的文本；对象/数组等结构返回空串。"""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return str(value)
+    return ""
+
+
 class BlockStore:
     """用户屏蔽记录的读写与查询。"""
 
@@ -84,50 +116,89 @@ class BlockStore:
     # 持久化
     # ------------------------------------------------------------------ #
     def _load(self) -> None:
+        """从 JSON 文件恢复屏蔽记录；任何坏数据只告警、不阻塞插件加载。"""
+        self._global = []
+        self._groups = {}
         if not self.path.exists():
             return
         try:
             data = json.loads(self.path.read_text(encoding="utf-8"))
-        except Exception:
+        except Exception as exc:
+            logger.warning("[ActiveReply] 屏蔽记录文件读取失败，按空配置启动: %s", exc)
             return
         if not isinstance(data, dict):
+            logger.warning("[ActiveReply] 屏蔽记录文件顶层不是对象，按空配置启动")
             return
-        raw_global = data.get("global")
-        if isinstance(raw_global, list):
-            self._global = [item for item in map(self._normalize, raw_global) if item]
-        raw_groups = data.get("groups")
-        if isinstance(raw_groups, dict):
-            for group_id, entries in raw_groups.items():
-                if not isinstance(entries, list):
-                    continue
-                cleaned = [item for item in map(self._normalize, entries) if item]
-                if cleaned:
-                    self._groups[str(group_id)] = cleaned
+        try:
+            raw_global = data.get("global")
+            if isinstance(raw_global, list):
+                self._global = [
+                    item for item in map(self._normalize, raw_global) if item
+                ]
+            raw_groups = data.get("groups")
+            if isinstance(raw_groups, dict):
+                for group_id, entries in raw_groups.items():
+                    if not isinstance(entries, list):
+                        logger.warning(
+                            "[ActiveReply] 屏蔽记录群 %s 的条目不是数组，已跳过",
+                            str(group_id)[:64],
+                        )
+                        continue
+                    # 注意：这里不把外层 key 注入条目的 group_id。既有测试
+                    # ``test_bad_records_are_filtered`` 约定「scope=group 但缺
+                    # group_id 的条目」视为坏数据丢弃，保持旧行为兼容。
+                    cleaned = [item for item in map(self._normalize, entries) if item]
+                    if cleaned:
+                        self._groups[str(group_id)] = cleaned
+        except Exception as exc:  # 兜底：坏文件结构也不能让插件加载失败
+            logger.warning("[ActiveReply] 屏蔽记录载入异常，按空配置启动: %s", exc)
+            self._global = []
+            self._groups = {}
 
     @staticmethod
     def _normalize(item: Any) -> dict[str, Any] | None:
+        """清洗单条屏蔽记录；结构或字段非法的条目返回 None（F19）。"""
         if not isinstance(item, dict):
+            logger.warning("[ActiveReply] 屏蔽记录不是对象，已跳过")
             return None
-        user_id = str(item.get("user_id") or "").strip()
+        user_id = _as_text(item.get("user_id"))
         if not USER_ID_RE.fullmatch(user_id):
+            logger.warning("[ActiveReply] 屏蔽记录用户 ID 非法，已跳过")
             return None
-        scope = str(item.get("scope") or "all").strip().lower()
+        scope = _as_text(item.get("scope")).lower() or "all"
         if scope not in {"all", "group"}:
             scope = "all"
-        if scope == "group" and not str(item.get("group_id") or "").strip():
+        group_id = _as_text(item.get("group_id"))
+        if scope == "group" and not group_id:
+            logger.warning(
+                "[ActiveReply] 群级屏蔽记录缺少群号，已跳过 | user=%s", user_id
+            )
             return None
-        try:
-            until = float(item.get("until") or 0)
-        except (TypeError, ValueError):
-            until = 0.0
+        # created_at/until 必须容错：手改或旧版本的坏 JSON 曾让 float() 直接
+        # 抛错，进而在插件 __init__ 里把整个插件加载带崩。
+        raw_until = item.get("until")
+        until, until_ok = _coerce_float(raw_until, 0.0)
+        if not until_ok and raw_until not in (None, ""):
+            logger.warning(
+                "[ActiveReply] 屏蔽记录 until 非法，按永久处理 | user=%s", user_id
+            )
+        raw_created = item.get("created_at")
+        created_at, created_ok = _coerce_float(raw_created, 0.0)
+        if not created_ok and raw_created not in (None, ""):
+            logger.warning(
+                "[ActiveReply] 屏蔽记录 created_at 非法，按当前时间处理 | user=%s",
+                user_id,
+            )
+        if created_at <= 0:
+            created_at = time.time()
         return {
             "user_id": user_id,
-            "reason": str(item.get("reason") or "").strip() or default_reason(user_id),
+            "reason": _as_text(item.get("reason")) or default_reason(user_id),
             "scope": scope,
-            "group_id": str(item.get("group_id") or "").strip(),
+            "group_id": group_id,
             "until": until,
-            "created_at": float(item.get("created_at") or time.time()),
-            "source": str(item.get("source") or "page"),
+            "created_at": created_at,
+            "source": _as_text(item.get("source")) or "page",
         }
 
     def _save(self) -> None:
@@ -145,17 +216,21 @@ class BlockStore:
 
     @staticmethod
     def _active(entry: dict[str, Any]) -> bool:
-        until = float(entry.get("until") or 0)
+        until = _safe_float(entry.get("until"), 0.0)
         return until == 0 or until > time.time()
 
     # ------------------------------------------------------------------ #
     # 配置同步
     # ------------------------------------------------------------------ #
     def sync_from_config(self, user_ids: tuple[str, ...] | list[str]) -> None:
-        """让全局记录与插件配置的黑名单列表保持一致。"""
+        """把配置里的黑名单补录为全局屏蔽记录（只增不删）。
+
+        配置列表只是历史兼容入口，页面与指令添加的记录带原因、时长和来源，
+        不能因为配置里没有对应 ID 就被删掉。移除屏蔽请走页面或指令。
+        """
         wanted = [str(uid).strip() for uid in user_ids if str(uid).strip()]
         with self._lock:
-            existing = {entry["user_id"]: entry for entry in self._global}
+            existing = {entry["user_id"] for entry in self._global}
             changed = False
             for user_id in wanted:
                 if user_id not in existing:
@@ -171,11 +246,6 @@ class BlockStore:
                         }
                     )
                     changed = True
-            keep = set(wanted)
-            new_global = [e for e in self._global if e["user_id"] in keep]
-            if len(new_global) != len(self._global):
-                changed = True
-                self._global = new_global
             if changed:
                 self._save()
 
@@ -233,9 +303,9 @@ class BlockStore:
             "reason": str(reason or "").strip() or default_reason(user_id),
             "scope": scope,
             "group_id": group_id if scope == "group" else "",
-            "until": float(until or 0),
+            "until": _safe_float(until, 0.0),
             "created_at": time.time(),
-            "source": source,
+            "source": str(source or "page"),
         }
         with self._lock:
             if scope == "all":
@@ -292,15 +362,3 @@ class BlockStore:
             if removed:
                 self._save()
         return removed
-
-    def flat_entries(self) -> list[dict[str, Any]]:
-        """返回全部有效记录（供页面展示）。"""
-        with self._lock:
-            items = [dict(e) for e in self._global if self._active(e)]
-            for group_id, entries in self._groups.items():
-                for entry in entries:
-                    if self._active(entry):
-                        item = dict(entry)
-                        item["group_id"] = group_id
-                        items.append(item)
-            return items
