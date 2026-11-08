@@ -18,7 +18,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from .config_model import GROUP_OVERRIDE_FIELDS, get_by_path
+from .config_model import GROUP_OVERRIDE_FIELDS, get_by_path, set_by_path
 
 
 STORE_VERSION = 1
@@ -42,6 +42,17 @@ def _as_text(value: Any) -> str:
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         return str(value)
     return ""
+
+
+def _nested_config(config: dict[str, Any]) -> dict[str, Any]:
+    """把扁平点号键（page_api 的提交格式）归一成嵌套结构。"""
+    nested: dict[str, Any] = {}
+    for key, value in (config or {}).items():
+        if isinstance(key, str) and "." in key:
+            set_by_path(nested, key, value)
+        else:
+            nested[key] = value
+    return nested
 
 
 class GroupStore:
@@ -112,6 +123,8 @@ class GroupStore:
                 "[ActiveReply] 群 %s 的 config 不是对象，已按空覆盖处理", group_id[:64]
             )
             config = {}
+        # 旧版/页面提交可能使用扁平点号键，载入时统一成嵌套结构。
+        config = _nested_config(config)
         # 保留未知顶层键，避免升级/降级时静默丢失未来字段。
         normalized = dict(entry)
         normalized["independent"] = bool(entry.get("independent"))
@@ -142,30 +155,32 @@ class GroupStore:
     # ------------------------------------------------------------------ #
     def get_overrides(self, group_id: str) -> dict[str, Any]:
         """返回该群生效的覆盖值（嵌套 dict），坏值一律按空 dict 处理（F20）。"""
-        entry = self._data.get(str(group_id))
-        if not entry or not entry.get("independent"):
-            return {}
-        overrides = entry.get("config")
-        if not isinstance(overrides, dict):
-            if overrides is not None:
-                logger.warning(
-                    "[ActiveReply] 群 %s 的覆盖值不是对象，已按空处理",
-                    str(group_id)[:64],
-                )
-            return {}
-        return overrides
+        with self._lock:
+            entry = self._data.get(str(group_id))
+            if not entry or not entry.get("independent"):
+                return {}
+            overrides = entry.get("config")
+            if not isinstance(overrides, dict):
+                if overrides is not None:
+                    logger.warning(
+                        "[ActiveReply] 群 %s 的覆盖值不是对象，已按空处理",
+                        str(group_id)[:64],
+                    )
+                return {}
+            return copy.deepcopy(overrides)
 
     def get_meta(self, group_id: str) -> dict[str, Any]:
         """获取面板展示所需的群状态、更新时间和备注。"""
         # 返回面板需要的状态、最近更新时间与可读备注，不暴露内部配置对象。
-        entry = self._data.get(str(group_id)) or {}
-        if not isinstance(entry, dict):
-            return {"independent": False, "updated_at": 0.0, "note": ""}
-        return {
-            "independent": bool(entry.get("independent")),
-            "updated_at": _safe_float(entry.get("updated_at"), 0.0),
-            "note": _as_text(entry.get("note")),
-        }
+        with self._lock:
+            entry = self._data.get(str(group_id)) or {}
+            if not isinstance(entry, dict):
+                return {"independent": False, "updated_at": 0.0, "note": ""}
+            return {
+                "independent": bool(entry.get("independent")),
+                "updated_at": _safe_float(entry.get("updated_at"), 0.0),
+                "note": _as_text(entry.get("note")),
+            }
 
     def known_groups(self) -> list[str]:
         """列出本地存储中出现过的全部群号。"""
@@ -193,7 +208,7 @@ class GroupStore:
                 if independent:
                     self._data[group_id] = {
                         "independent": True,
-                        "config": dict(values or {}),
+                        "config": _nested_config(values or {}),
                         "note": str(note or "").strip(),
                         "updated_at": time.time(),
                     }
@@ -203,21 +218,27 @@ class GroupStore:
                     if note:
                         entry["note"] = str(note).strip()
                     entry["updated_at"] = time.time()
-                    if not entry.get("config"):
+                    # 跟随全局也可能只是保存群备注；有 note 时不能删记录。
+                    if not entry.get("config") and not entry.get("note"):
                         self._data.pop(group_id, None)
                 self._save()
             except Exception:
                 self._data = previous
                 raise
-        return dict(values or {}) if independent else {}
+        return _nested_config(values or {}) if independent else {}
 
     def remove(self, group_id: str) -> bool:
         """删除指定群的记录，并返回是否实际删除了数据。"""
-        # 删除群的全部保存数据；返回是否确实存在并移除了记录。
+        # 删除群的全部保存数据；写盘失败时恢复内存快照，避免本次运行丢配置。
         with self._lock:
+            previous = copy.deepcopy(self._data)
             removed = self._data.pop(str(group_id), None) is not None
             if removed:
-                self._save()
+                try:
+                    self._save()
+                except Exception:
+                    self._data = previous
+                    raise
             return removed
 
     # ------------------------------------------------------------------ #
@@ -235,13 +256,18 @@ class GroupStore:
         Returns:
             ``(字段路径到有效值的映射, 是否处于独立配置模式)``。
         """
-        overrides = self.get_overrides(group_id)
-        if not overrides:
-            return dict(global_values), False
-        values: dict[str, Any] = {}
-        for spec in GROUP_OVERRIDE_FIELDS:
-            value = get_by_path(overrides, spec.path)
-            values[spec.path] = (
-                value if value is not None else global_values.get(spec.path)
+        with self._lock:
+            entry = self._data.get(str(group_id)) or {}
+            independent = (
+                bool(entry.get("independent")) if isinstance(entry, dict) else False
             )
-        return values, True
+            if not independent:
+                return dict(global_values), False
+            overrides = self.get_overrides(group_id)
+            values: dict[str, Any] = {}
+            for spec in GROUP_OVERRIDE_FIELDS:
+                value = get_by_path(overrides, spec.path)
+                values[spec.path] = (
+                    value if value is not None else global_values.get(spec.path)
+                )
+            return values, True

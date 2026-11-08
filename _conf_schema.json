@@ -29,9 +29,9 @@
         "hint": "当回复方式选择为 probability 时显示。每条消息按该概率触发一次主动回复",
         "type": "float",
         "slider": {
-          "min": 0,
+          "min": 0.05,
           "max": 1,
-          "step": 0.1
+          "step": 0.01
         },
         "condition": {
           "mode": "probability"
@@ -394,7 +394,7 @@
           },
           "auto_extract_min_confidence": {
             "description": "最低置信度",
-            "hint": "低于该值的候选记忆会被丢弃；按五档标准，日常讨论通常为 0.50-0.60，简单闲聊为 0.30-0.40。默认 0.50 可保留日常讨论，只过滤闲聊以下；注意：chatter/spam 档另受下方「丢弃闲聊/灌水档」开关控制，把本项设为 0 不会绕过该开关",
+            "hint": "低于该值的候选记忆会被丢弃；按五档标准，日常讨论通常为 0.50-0.60，简单闲聊为 0.30-0.40。默认 0.50 可保留日常讨论，只过滤闲聊以下",
             "type": "float",
             "slider": {
               "min": 0,
@@ -441,22 +441,16 @@
             },
             "default": 8
           },
-          "memory_extract_skip_chatter": {
-            "description": "丢弃闲聊/灌水档",
-            "hint": "开启后，模型评为简单闲聊（chatter，约 0.30-0.40）或灌水（spam，≤0.20）的候选一律丢弃，自动抽取与手动 /总结记忆 都生效；即使「最低置信度」设为 0 也仍然丢弃，关闭本开关后按数值门槛判断。",
-            "type": "bool",
-            "default": true
-          },
           "memory_max_participants": {
             "description": "单条记忆参与者上限",
             "hint": "一条记忆最多关联多少名窗口内的真实发言者；多人窗口会依次按模型结论、昵称、证据与发言顺序补齐参与者",
             "type": "int",
             "slider": {
               "min": 1,
-              "max": 20,
+              "max": 30,
               "step": 1
             },
-            "default": 8
+            "default": 10
           },
           "memory_multi_atom": {
             "description": "多条原子记忆",
@@ -474,12 +468,6 @@
               "step": 1
             },
             "default": 3
-          },
-          "memory_prompt_contract": {
-            "description": "多条原子记忆",
-            "hint": "开启时要求模型输出 {\"memories\":[...]} 多条原子记忆；关闭时退回单条摘要格式",
-            "type": "bool",
-            "default": true
           }
         }
       },
@@ -490,14 +478,14 @@
         "items": {
           "memory_inject_max_chars": {
             "description": "注入字数上限",
-            "hint": "自动回忆注入给模型的总字数上限（记忆优先默认放宽到 600 字）",
+            "hint": "自动回忆注入给模型的总字数上限（默认 1500 字）",
             "type": "int",
             "slider": {
-              "min": 100,
-              "max": 1200,
-              "step": 50
+              "min": 500,
+              "max": 5000,
+              "step": 100
             },
-            "default": 600
+            "default": 1500
           },
           "memory_inject_max_items": {
             "description": "注入条数上限",
@@ -577,7 +565,7 @@
               "max": 10.0,
               "step": 0.5
             },
-            "default": 3.0
+            "default": 3.5
           },
           "memory_ttl_adaptive": {
             "description": "自适应有效期",
@@ -594,51 +582,56 @@
                 "description": "计划·基础天数",
                 "type": "int",
                 "slider": {
-                  "min": 1,
+                  "min": 0,
                   "max": 365,
                   "step": 1
                 },
-                "default": 2
+                "default": 2,
+                "hint": "0 表示该类型永不过期；其余数值为基础天数，范围 0–365，重要性和访问次数会在此基础上延长。"
               },
               "episode_days": {
                 "description": "事件·基础天数",
                 "type": "int",
                 "slider": {
-                  "min": 1,
+                  "min": 0,
                   "max": 365,
                   "step": 1
                 },
-                "default": 7
+                "default": 7,
+                "hint": "0 表示该类型永不过期；其余数值为基础天数，范围 0–365，重要性和访问次数会在此基础上延长。"
               },
               "preference_days": {
                 "description": "偏好·基础天数",
                 "type": "int",
                 "slider": {
-                  "min": 1,
+                  "min": 0,
                   "max": 365,
                   "step": 1
                 },
-                "default": 60
+                "default": 60,
+                "hint": "0 表示该类型永不过期；其余数值为基础天数，范围 0–365，重要性和访问次数会在此基础上延长。"
               },
               "relation_days": {
                 "description": "关系·基础天数",
                 "type": "int",
                 "slider": {
-                  "min": 1,
+                  "min": 0,
                   "max": 365,
                   "step": 1
                 },
-                "default": 90
+                "default": 90,
+                "hint": "0 表示该类型永不过期；其余数值为基础天数，范围 0–365，重要性和访问次数会在此基础上延长。"
               },
               "fact_days": {
                 "description": "事实·基础天数",
                 "type": "int",
                 "slider": {
-                  "min": 1,
+                  "min": 0,
                   "max": 365,
                   "step": 1
                 },
-                "default": 180
+                "default": 180,
+                "hint": "0 表示该类型永不过期；其余数值为基础天数，范围 0–365，重要性和访问次数会在此基础上延长。"
               }
             }
           },

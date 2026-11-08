@@ -89,7 +89,7 @@ def _to_str(value: Any, default: str = "") -> str:
 def _to_probability(value: Any, default: float) -> float:
     """解析概率值，保证返回结果位于 0 到 1 之间。"""
     # 概率配置限定在 [0, 1]，复用浮点数的统一校验逻辑。
-    return _to_float(value, default, 0.0, 1.0)
+    return _to_float(value, default, 0.05, 1.0)
 
 
 def _parse_str_list(value: Any) -> tuple[str, ...]:
@@ -507,7 +507,7 @@ class MemoryRagConfig:
     cross_group_personal: bool = True
     cross_group_private: bool = False
     # 读取与生命周期
-    inject_max_chars: int = 600
+    inject_max_chars: int = 1500
     inject_max_items: int = 5
     multi_atom: bool = True
     atom_max_items: int = 3
@@ -528,7 +528,7 @@ class MemoryRagConfig:
     consolidation_archive_only: bool = True
     archive_enable: bool = True
     archive_days: int = 30
-    archive_importance: float = 3.0
+    archive_importance: float = 3.5
     trash_retention_days: int = 30
     # 遗忘机制（r3.3）：自适应 TTL、重要性随时间演化与归档区清理
     ttl_adaptive_enable: bool = True
@@ -546,8 +546,7 @@ class MemoryRagConfig:
     archive_retention_days: int = 0
     # 抽取质量（r3.3）
     extract_min_substance_chars: int = 8
-    extract_skip_chatter: bool = True
-    max_participants: int = 8
+    max_participants: int = 10
 
 
 @dataclass(frozen=True)
@@ -667,7 +666,9 @@ def parse_plugin_config(raw: dict[str, Any] | None) -> PluginConfig:
     blacklist = tuple(
         str(item).strip()
         for item in block_ids
-        if str(item).strip().isdigit() and len(str(item).strip()) <= 20
+        if str(item).strip().isalnum()
+        and str(item).strip().isascii()
+        and len(str(item).strip()) <= 64
     )
     user_block = UserBlockConfig(
         enable=_to_bool(block_raw.get("enable"), True),
@@ -723,7 +724,7 @@ def parse_plugin_config(raw: dict[str, Any] | None) -> PluginConfig:
     if not isinstance(kind_decay_raw, dict):
         kind_decay_raw = {}
     # r3.3：自适应 TTL 基准也是嵌套对象，同样先收敛成 dict 再读。
-    ttl_base_raw = eval_raw.get("memory_ttl_base")
+    ttl_base_raw = eval_raw.get("memory_ttl_base") or mem_raw.get("memory_ttl_base")
     if not isinstance(ttl_base_raw, dict):
         ttl_base_raw = {}
     memory_rag = MemoryRagConfig(
@@ -825,9 +826,9 @@ def parse_plugin_config(raw: dict[str, Any] | None) -> PluginConfig:
             inj_raw.get(
                 "memory_inject_max_chars", mem_raw.get("memory_inject_max_chars")
             ),
-            600,
-            100,
-            1200,
+            1500,
+            500,
+            5000,
         ),
         inject_max_items=_to_int(
             inj_raw.get(
@@ -839,7 +840,9 @@ def parse_plugin_config(raw: dict[str, Any] | None) -> PluginConfig:
         ),
         multi_atom=_to_bool(gen_raw.get("memory_multi_atom"), True),
         atom_max_items=_to_int(gen_raw.get("memory_atom_max_items"), 3, 1, 5),
-        prompt_contract=_to_bool(gen_raw.get("memory_prompt_contract"), True),
+        # 旧版 memory_prompt_contract 已从 schema 移除；契约固定启用，
+        # 避免预览与实际抽取行为不一致。
+        prompt_contract=True,
         kind_decay=KindDecayConfig(
             plan=_to_int(
                 kind_decay_raw.get("plan_half_life_days"),
@@ -935,7 +938,7 @@ def parse_plugin_config(raw: dict[str, Any] | None) -> PluginConfig:
             eval_raw.get(
                 "memory_archive_importance", mem_raw.get("memory_archive_importance")
             ),
-            3.0,
+            3.5,
             0.0,
             10.0,
         ),
@@ -949,13 +952,16 @@ def parse_plugin_config(raw: dict[str, Any] | None) -> PluginConfig:
             365,
         ),
         # r3.3 遗忘机制：自适应 TTL（写入侧）与重要性演化（查询侧）。
-        ttl_adaptive_enable=_to_bool(eval_raw.get("memory_ttl_adaptive"), True),
+        ttl_adaptive_enable=_to_bool(
+            eval_raw.get("memory_ttl_adaptive", mem_raw.get("memory_ttl_adaptive")),
+            True,
+        ),
         ttl_base=KindTtlConfig(
-            plan=_to_int(ttl_base_raw.get("plan_days"), 2, 1, 365),
-            episode=_to_int(ttl_base_raw.get("episode_days"), 7, 1, 365),
-            preference=_to_int(ttl_base_raw.get("preference_days"), 60, 1, 365),
-            relation=_to_int(ttl_base_raw.get("relation_days"), 90, 1, 365),
-            fact=_to_int(ttl_base_raw.get("fact_days"), 180, 1, 365),
+            plan=_to_int(ttl_base_raw.get("plan_days"), 2, 0, 365),
+            episode=_to_int(ttl_base_raw.get("episode_days"), 7, 0, 365),
+            preference=_to_int(ttl_base_raw.get("preference_days"), 60, 0, 365),
+            relation=_to_int(ttl_base_raw.get("relation_days"), 90, 0, 365),
+            fact=_to_int(ttl_base_raw.get("fact_days"), 180, 0, 365),
         ),
         ttl_reinforce_step=_to_float(
             eval_raw.get("memory_ttl_reinforce_step"), 0.1, 0.0, 0.5
@@ -996,7 +1002,7 @@ def parse_plugin_config(raw: dict[str, Any] | None) -> PluginConfig:
         archive_retention_days=_to_int(
             _tuned("memory_archive_retention_days", eval_raw, mem_raw), 0, 0, 3650
         ),
-        # r3.3 抽取质量：无实质内容过滤、低价值档丢弃、参与者上限。
+        # r3.3 抽取质量：无实质内容过滤、参与者上限。
         extract_min_substance_chars=_to_int(
             gen_raw.get(
                 "memory_extract_min_substance_chars",
@@ -1006,20 +1012,13 @@ def parse_plugin_config(raw: dict[str, Any] | None) -> PluginConfig:
             0,
             100,
         ),
-        extract_skip_chatter=_to_bool(
-            gen_raw.get(
-                "memory_extract_skip_chatter",
-                mem_raw.get("memory_extract_skip_chatter"),
-            ),
-            True,
-        ),
         max_participants=_to_int(
             gen_raw.get(
                 "memory_max_participants", mem_raw.get("memory_max_participants")
             ),
-            8,
+            10,
             1,
-            20,
+            30,
         ),
     )
 
@@ -1102,7 +1101,8 @@ def _group_spec(path: str) -> GroupFieldSpec:
     node = _schema_node(path) or {}
     raw_type = str(node.get("type") or "str")
     options = tuple(str(item) for item in (node.get("options") or ()))
-    kind = "enum" if options or raw_type == "string" else raw_type
+    # 普通 string 不强制转 enum：provider ID 等字段没有 options，必须保留 str。
+    kind = "enum" if options else raw_type
     if kind not in {"bool", "enum", "int", "float", "str", "text"}:
         kind = "str"
     slider = node.get("slider") if isinstance(node.get("slider"), dict) else {}

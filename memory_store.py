@@ -169,8 +169,22 @@ class MemoryStore:
         self.store_compatible = True
         self.store_version = 0
         self.set_display_timezone(display_timezone)
+        # 版本检查必须早于任何 DDL/DML：高版本库只允许只读，不能先建表/补列。
+        declared_version = self._declared_store_version()
+        if declared_version > STORE_VERSION:
+            self.store_version = declared_version
+            self.store_compatible = False
+            logger.error(
+                "[ActiveReply] 记忆库版本高于插件 | db=%s plugin=%s；"
+                "已在建表/迁移前切换只读，请升级插件",
+                declared_version,
+                STORE_VERSION,
+            )
+            # 只读备份仍然安全且必要；build 只读连接由 _connect 的 query_only 保证。
+            self._daily_backup()
+            return
         self._init_schema()
-        # 先做每日快照，再执行任何版本检查/迁移；备份失败不阻塞启动。
+        # 先做每日快照，再执行版本检查/迁移；备份失败不阻塞启动。
         self._daily_backup()
         self._ensure_store_version()
         # L-09：只有数据版本落后时才做全表 backfill；正常启动不再扫描整表。
@@ -685,8 +699,28 @@ class MemoryStore:
         except (TypeError, ValueError):
             return 0
 
+    def _declared_store_version(self) -> int:
+        """在初始化 schema 前读取已声明版本；无库/无表按 0 处理。"""
+        if not self.db_path.exists():
+            return 0
+        try:
+            with closing(sqlite3.connect(str(self.db_path), timeout=3.0)) as conn:
+                row = conn.execute(
+                    "SELECT value FROM plugin_meta WHERE key = 'store_version'"
+                ).fetchone()
+        except sqlite3.Error:
+            return 0
+        if not row:
+            return 0
+        try:
+            return int(row[0])
+        except (TypeError, ValueError):
+            return 0
+
     def _ensure_store_version(self) -> None:
         """记录/检查数据库存储版本；高于插件版本时跳过迁移。"""
+        if not self.store_compatible:
+            return
         try:
             stored = int(self.get_meta(_STORE_VERSION_KEY) or 0)
         except (TypeError, ValueError):
@@ -1331,6 +1365,31 @@ class MemoryStore:
             )
             return memory_id
 
+    def filter_recallable_ids(
+        self, memory_ids: list[int], now: float | None = None
+    ) -> set[int]:
+        """返回仍然可召回的 ID（未归档、未失效、TTL 未过期）。"""
+        ids: list[int] = []
+        for raw in memory_ids or []:
+            try:
+                value = int(raw)
+            except (TypeError, ValueError):
+                continue
+            if value > 0:
+                ids.append(value)
+        if not ids:
+            return set()
+        current = time.time() if now is None else float(now)
+        placeholders = ",".join("?" for _ in ids)
+        with self._lock, closing(self._connect()) as conn:
+            rows = conn.execute(
+                f"SELECT id FROM memories WHERE id IN ({placeholders}) "
+                "AND archived = 0 AND superseded_by IS NULL "
+                "AND (valid_until IS NULL OR valid_until >= ?)",
+                [*ids, current],
+            ).fetchall()
+        return {int(row["id"]) for row in rows}
+
     def get_memory(self, memory_id: int) -> dict[str, Any] | None:
         """按主键读取完整记忆；无效 ID 或记录不存在时返回 None。"""
         # 按主键取一条完整记忆；无效 ID 或不存在时返回 None。
@@ -1377,8 +1436,7 @@ class MemoryStore:
             rows = conn.execute(
                 "SELECT id, importance, confidence, created_at, last_access, "
                 "access_count, decay_reset_at FROM memories "
-                "WHERE archived = 0 AND importance <= ? ORDER BY id LIMIT 2000",
-                (min(IMPORTANCE_MAX, threshold + 2.0),),
+                "WHERE archived = 0 ORDER BY id LIMIT 2000",
             ).fetchall()
         ids: list[int] = []
         for row in rows:
@@ -1411,6 +1469,31 @@ class MemoryStore:
                 continue
             ids.append(int(row["id"]))
         return ids
+
+    def find_atoms_by_episode(
+        self, episode_id: int, limit: int = 500
+    ) -> list[dict[str, Any]]:
+        """按 episode_id 定向查询原子记忆，避免只扫全库最近 200 条。"""
+        try:
+            linked = int(episode_id)
+        except (TypeError, ValueError):
+            return []
+        if linked <= 0:
+            return []
+        with self._lock, closing(self._connect()) as conn:
+            rows = conn.execute(
+                "SELECT m.* FROM memories m "
+                "WHERE json_valid(m.extra_metadata) "
+                "AND CAST(json_extract(m.extra_metadata, '$.episode_id') AS INTEGER) = ? "
+                "ORDER BY m.id LIMIT ?",
+                (linked, max(1, min(500, int(limit)))),
+            ).fetchall()
+            ids = [int(row["id"]) for row in rows]
+        roles_map = self._roles_map(ids)
+        return [
+            self._row_to_item(row, roles_map.get(int(row["id"]), []))
+            for row in rows
+        ]
 
     def list_memories(
         self,
@@ -1720,14 +1803,28 @@ class MemoryStore:
             content = str(payload.get("content", ""))
             # F54：新载荷是 base64(float32) 编码；旧载荷是 JSON 文本，二者都兼容。
             vector = self._decode_trash_vector(payload.get("embedding"))
-            embedding_dim = (
-                len(vector)
-                if vector
-                else self._safe_int(payload.get("embedding_dim"), 0)
-            )
+            # 向量为空时不能沿用旧 embedding_dim：否则会出现「维度>0 但无向量」
+            # 的活跃记录，永久失去语义召回能力。
+            embedding_dim = len(vector) if vector else 0
             # r3.3：恢复后重新计时——衰减基准与最近访问都记为现在，
             # created_at 仍保留载荷里的旧值（修复 r3.2 的 D01）。
             restored_at = time.time()
+            archived = bool(self._safe_int(payload.get("archived"), 0))
+            archive_reason = str(payload.get("archive_reason") or "")[:32]
+            archived_at = self._safe_float(payload.get("archived_at"), 0.0)
+            if archived and archived_at <= 0:
+                archived_at = restored_at
+            valid_until = payload.get("valid_until")
+            try:
+                valid_until = (
+                    float(valid_until) if valid_until is not None else None
+                )
+            except (TypeError, ValueError):
+                valid_until = None
+            # 恢复的是「活跃」记忆时，过期 TTL 会立即再次不可召回/被归档；
+            # 撤销删除应当让它重新可用，因此清掉已过期的有效期。
+            if not archived and valid_until is not None and valid_until <= restored_at:
+                valid_until = None
             conn.execute(
                 """
                 INSERT INTO memories (
@@ -1737,8 +1834,8 @@ class MemoryStore:
                     source_msg_id, source_time, importance,
                     embedding_blob, embedding_norm, grams,
                     kind, entities, valid_until, confidence, source_batch,
-                    last_access, decay_reset_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    last_access, decay_reset_at, archived, archive_reason, archived_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     content,
@@ -1768,11 +1865,14 @@ class MemoryStore:
                     ),
                     payload.get("kind", "fact"),
                     payload.get("entities", "[]"),
-                    payload.get("valid_until"),
+                    valid_until,
                     payload.get("confidence", 0.5),
                     payload.get("source_batch", ""),
                     restored_at,
                     restored_at,
+                    int(archived),
+                    archive_reason,
+                    archived_at,
                 ),
             )
             new_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
@@ -1812,18 +1912,25 @@ class MemoryStore:
             )
             return int(cursor.rowcount or 0)
 
-    def bump_access(self, memory_ids: list[int]) -> None:
-        """命中记忆时更新最后访问时间与访问次数。"""
+    def bump_access(
+        self, memory_ids: list[int], counts: dict[int, int] | None = None
+    ) -> None:
+        """命中记忆时更新最后访问时间与访问次数（可选每次计数）。"""
+        if not self.store_compatible:
+            return
         ids = [int(item) for item in memory_ids if int(item) > 0]
         if not ids:
             return
         now = time.time()
+        increments = counts or {}
         with self._lock, closing(self._connect()) as conn, conn:
-            placeholders = ",".join("?" for _ in ids)
-            conn.execute(
-                f"UPDATE memories SET last_access = ?, access_count = access_count + 1 "
-                f"WHERE id IN ({placeholders})",
-                [now, *ids],
+            conn.executemany(
+                "UPDATE memories SET last_access = ?, "
+                "access_count = access_count + ? WHERE id = ?",
+                [
+                    (now, max(1, int(increments.get(memory_id, 1))), memory_id)
+                    for memory_id in ids
+                ],
             )
 
     @staticmethod
@@ -1853,6 +1960,32 @@ class MemoryStore:
         for key, value in new.items():
             if key not in merged:
                 merged[key] = value
+            elif key == "participant_identities":
+                previous = merged.get(key)
+                old_list = previous if isinstance(previous, list) else []
+                new_list = value if isinstance(value, list) else []
+                by_id: dict[str, dict[str, Any]] = {}
+                for entry in old_list + new_list:
+                    if not isinstance(entry, dict):
+                        continue
+                    sender_id = str(entry.get("sender_id") or "").strip()
+                    if not sender_id:
+                        continue
+                    current = by_id.get(sender_id, {})
+                    name = str(entry.get("display_name") or "").strip()
+                    if name and name != sender_id:
+                        current["display_name"] = name
+                    elif "display_name" not in current:
+                        current["display_name"] = name
+                    current["sender_id"] = sender_id
+                    current["is_bot"] = bool(entry.get("is_bot", current.get("is_bot", False)))
+                    aliases = entry.get("aliases")
+                    if isinstance(aliases, list):
+                        current["aliases"] = list(dict.fromkeys(
+                            [str(item) for item in current.get("aliases", []) + aliases]
+                        ))
+                    by_id[sender_id] = current
+                merged[key] = list(by_id.values())[:16]
             elif key in {"quotes", "sources"}:
                 limit = 5 if key == "quotes" else 8
                 current = as_list(merged.get(key))
@@ -1973,11 +2106,16 @@ class MemoryStore:
             keep_old_content = new_confidence is not None and new_confidence < (
                 self._safe_float(row["confidence"], 0.0)
             )
+            old_content = str(row["content"] or "").strip()
             if keep_old_content:
-                # 低置信度合并：不动正文 / 向量，只吸收更完整的结构化信息。
+                # 低置信度合并：不动正文 / 向量，但实体变化后必须重算 grams，
+                # 否则 FTS 永远搜不到新实体。
                 merged_metadata_json = json.dumps(merged_metadata, ensure_ascii=False)
+                grams = self._build_grams(
+                    " ".join([old_content, *merged_entities])
+                )
                 conn.execute(
-                    "UPDATE memories SET " + shared_fields + "WHERE id = ?",
+                    "UPDATE memories SET " + shared_fields + ", grams = ? WHERE id = ?",
                     (
                         importance_delta,
                         expiry,
@@ -1986,11 +2124,11 @@ class MemoryStore:
                         merged_entities_json,
                         time.time(),
                         merged_metadata_json,
+                        grams,
                         target,
                     ),
                 )
             else:
-                old_content = str(row["content"] or "").strip()
                 new_content = str(content or row["content"]).strip() or old_content
                 vector = [
                     float(value) for value in (embedding or self._row_embedding(row))
@@ -2001,6 +2139,13 @@ class MemoryStore:
                     else max(0.0, min(1.0, new_confidence))
                 )
                 if new_content != old_content:
+                    # brief 必须跟随被覆盖的正文；重复合并只并参与者、
+                    # 不改正文时不能用新 brief 覆盖旧摘要。
+                    new_brief = str(
+                        (extra_metadata or {}).get("brief") or ""
+                    ).strip()
+                    if new_brief:
+                        merged_metadata["brief"] = new_brief[:60]
                     # F05：覆盖前快照旧正文/旧证据，旧细节不再静默丢失。
                     source = (
                         str(old_metadata.get("source") or "").strip()

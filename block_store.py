@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from astrbot.api import logger
 
+import copy
 import json
 import math
 import re
@@ -223,17 +224,48 @@ class BlockStore:
     # 配置同步
     # ------------------------------------------------------------------ #
     def sync_from_config(self, user_ids: tuple[str, ...] | list[str]) -> None:
-        """把配置里的黑名单补录为全局屏蔽记录（只增不删）。
+        """把配置里的黑名单同步为全局屏蔽记录。
 
-        配置列表只是历史兼容入口，页面与指令添加的记录带原因、时长和来源，
-        不能因为配置里没有对应 ID 就被删掉。移除屏蔽请走页面或指令。
+        只回收 ``source=config`` 的旧配置条目；页面与指令记录带原因、时长
+        和来源，不因配置缺失而被删除。写盘失败时恢复内存并抛出。
         """
-        wanted = [str(uid).strip() for uid in user_ids if str(uid).strip()]
+        # 配置里的重复 ID 只处理一次；只把“仍有效”的记录当作已存在，
+        # 避免过期页面临时屏蔽占位导致配置永久条目补不进来。
+        wanted = list(
+            dict.fromkeys(str(uid).strip() for uid in user_ids if str(uid).strip())
+        )
+        wanted_set = set(wanted)
         with self._lock:
-            existing = {entry["user_id"] for entry in self._global}
+            previous = copy.deepcopy((self._global, self._groups))
+            existing = {
+                entry["user_id"] for entry in self._global if self._active(entry)
+            }
             changed = False
+            # 配置镜像只增不删会让 /remove-all 或全局设置清空无效：
+            # 只回收 source=config 的条目，页面/指令记录保留。
+            kept = [
+                entry
+                for entry in self._global
+                if not (
+                    entry.get("source") == "config"
+                    and entry.get("user_id") not in wanted_set
+                )
+            ]
+            if len(kept) != len(self._global):
+                self._global = kept
+                existing = {entry["user_id"] for entry in self._global}
+                changed = True
             for user_id in wanted:
                 if user_id not in existing:
+                    # 同一 ID 的过期临时记录让位给配置源永久记录。
+                    self._global = [
+                        entry
+                        for entry in self._global
+                        if not (
+                            entry.get("user_id") == user_id
+                            and not self._active(entry)
+                        )
+                    ]
                     self._global.append(
                         {
                             "user_id": user_id,
@@ -247,7 +279,11 @@ class BlockStore:
                     )
                     changed = True
             if changed:
-                self._save()
+                try:
+                    self._save()
+                except Exception:
+                    self._global, self._groups = previous
+                    raise
 
     # ------------------------------------------------------------------ #
     # 查询
@@ -308,16 +344,22 @@ class BlockStore:
             "source": str(source or "page"),
         }
         with self._lock:
-            if scope == "all":
-                self._global = [e for e in self._global if e["user_id"] != user_id]
-                self._global.append(entry)
-            else:
-                entries = [
-                    e for e in self._groups.get(group_id, []) if e["user_id"] != user_id
-                ]
-                entries.append(entry)
-                self._groups[group_id] = entries
-            self._save()
+            previous = copy.deepcopy((self._global, self._groups))
+            try:
+                if scope == "all":
+                    self._global = [e for e in self._global if e["user_id"] != user_id]
+                    self._global.append(entry)
+                else:
+                    entries = [
+                        e for e in self._groups.get(group_id, [])
+                        if e["user_id"] != user_id
+                    ]
+                    entries.append(entry)
+                    self._groups[group_id] = entries
+                self._save()
+            except Exception:
+                self._global, self._groups = previous
+                raise
         return dict(entry)
 
     def remove(self, user_id: str, *, scope: str = "all", group_id: str = "") -> bool:
@@ -326,20 +368,25 @@ class BlockStore:
         group_id = str(group_id or "").strip()
         removed = False
         with self._lock:
-            if scope == "all":
-                before = len(self._global)
-                self._global = [e for e in self._global if e["user_id"] != user_id]
-                removed = len(self._global) != before
-            else:
-                entries = self._groups.get(group_id, [])
-                new_entries = [e for e in entries if e["user_id"] != user_id]
-                removed = len(new_entries) != len(entries)
-                if new_entries:
-                    self._groups[group_id] = new_entries
+            previous = copy.deepcopy((self._global, self._groups))
+            try:
+                if scope == "all":
+                    before = len(self._global)
+                    self._global = [e for e in self._global if e["user_id"] != user_id]
+                    removed = len(self._global) != before
                 else:
-                    self._groups.pop(group_id, None)
-            if removed:
-                self._save()
+                    entries = self._groups.get(group_id, [])
+                    new_entries = [e for e in entries if e["user_id"] != user_id]
+                    removed = len(new_entries) != len(entries)
+                    if new_entries:
+                        self._groups[group_id] = new_entries
+                    else:
+                        self._groups.pop(group_id, None)
+                if removed:
+                    self._save()
+            except Exception:
+                self._global, self._groups = previous
+                raise
         return removed
 
     def remove_all_for_user(self, user_id: str) -> int:
@@ -347,18 +394,23 @@ class BlockStore:
         user_id = str(user_id or "").strip()
         removed = 0
         with self._lock:
-            before = len(self._global)
-            self._global = [e for e in self._global if e["user_id"] != user_id]
-            removed += before - len(self._global)
-            for group_id in list(self._groups):
-                entries = self._groups[group_id]
-                new_entries = [e for e in entries if e["user_id"] != user_id]
-                if len(new_entries) != len(entries):
-                    removed += len(entries) - len(new_entries)
-                    if new_entries:
-                        self._groups[group_id] = new_entries
-                    else:
-                        self._groups.pop(group_id, None)
-            if removed:
-                self._save()
+            previous = copy.deepcopy((self._global, self._groups))
+            try:
+                before = len(self._global)
+                self._global = [e for e in self._global if e["user_id"] != user_id]
+                removed += before - len(self._global)
+                for group_id in list(self._groups):
+                    entries = self._groups[group_id]
+                    new_entries = [e for e in entries if e["user_id"] != user_id]
+                    if len(new_entries) != len(entries):
+                        removed += len(entries) - len(new_entries)
+                        if new_entries:
+                            self._groups[group_id] = new_entries
+                        else:
+                            self._groups.pop(group_id, None)
+                if removed:
+                    self._save()
+            except Exception:
+                self._global, self._groups = previous
+                raise
         return removed

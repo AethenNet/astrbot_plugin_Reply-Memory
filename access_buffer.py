@@ -31,24 +31,24 @@ class AccessBuffer:
     def __init__(self, store: Any, *, max_pending: int = 4096) -> None:
         self._store = store
         self._max_pending = max(1, int(max_pending))
-        self._pending: set[int] = set()
+        self._pending: dict[int, int] = {}
         self._closed = False
 
     def add(self, memory_ids: Sequence[int]) -> None:
         """累积记忆 ID（去重、忽略非正数），不阻塞、不写库。"""
-        if self._closed:
+        if self._closed or not getattr(self._store, "store_compatible", True):
             return
         for raw in memory_ids or ():
             try:
                 memory_id = int(raw)
             except (TypeError, ValueError):
                 continue
-            if memory_id <= 0 or memory_id in self._pending:
+            if memory_id <= 0:
                 continue
-            if len(self._pending) >= self._max_pending:
+            if memory_id not in self._pending and len(self._pending) >= self._max_pending:
                 # 缓冲区满：宁可少记一次访问，也不无限吃内存。
                 continue
-            self._pending.add(memory_id)
+            self._pending[memory_id] = self._pending.get(memory_id, 0) + 1
 
     async def flush(self) -> int:
         """把缓冲的 ID 排序后一次性写库，返回成功写入的条数。
@@ -60,21 +60,26 @@ class AccessBuffer:
         """
         if not self._pending:
             return 0
-        memory_ids = sorted(self._pending)
+        if not getattr(self._store, "store_compatible", True):
+            self._pending.clear()
+            return 0
+        pending = dict(self._pending)
+        memory_ids = sorted(pending)
         # 先摘掉快照；flush 期间 add() 进来的新 ID 不会被这次写入影响。
-        self._pending.difference_update(memory_ids)
+        self._pending = {}
         try:
-            await asyncio.to_thread(self._store.bump_access, memory_ids)
+            await asyncio.to_thread(
+                self._store.bump_access, memory_ids, counts=pending
+            )
         except Exception as exc:
             # 把这批 ID 并回缓冲重试；仍受 max_pending 上限约束，避免无限吃内存。
-            restored = set(memory_ids)
-            restored.update(self._pending)
-            if len(restored) > self._max_pending:
-                restored = set(sorted(restored)[: self._max_pending])
-            self._pending = restored
+            for memory_id, count in pending.items():
+                if memory_id not in self._pending and len(self._pending) >= self._max_pending:
+                    break
+                self._pending[memory_id] = self._pending.get(memory_id, 0) + count
             logger.warning("[ActiveReply] 访问计数批量写入失败: %s", exc)
             return 0
-        return len(memory_ids)
+        return sum(pending.values())
 
     async def aclose(self) -> None:
         """停止接收新 ID 并做最后一次 flush（幂等，可重复调用）。"""

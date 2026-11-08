@@ -167,6 +167,23 @@ class PageApi:
             if isinstance(value, (str, int, float, bool)) or value is None:
                 if len(str(value)) <= _RAG_LIST_SCALAR_MAX_CHARS:
                     trimmed[key] = value
+        # 列表展开详情直接用这份元数据渲染角色昵称；不能因为总字节超限
+        # 就把 participant_identities 丢掉，否则界面全部退化成“用户#后四位”。
+        identities = compact.get("participant_identities")
+        if isinstance(identities, list):
+            compact_identities = []
+            for entry in identities[:8]:
+                if not isinstance(entry, dict):
+                    continue
+                compact_identities.append(
+                    {
+                        key: entry.get(key)
+                        for key in ("sender_id", "display_name", "is_bot")
+                        if key in entry
+                    }
+                )
+            if compact_identities:
+                trimmed["participant_identities"] = compact_identities
         return trimmed
 
     @staticmethod
@@ -657,7 +674,7 @@ class PageApi:
                 saved = plugin.group_store.save_group_config(
                     group_id,
                     overrides,
-                    independent=bool(overrides),
+                    independent=True,
                     note=note,
                 )
             else:
@@ -669,8 +686,8 @@ class PageApi:
             return fail(f"保存失败：{exc}")
 
         plugin.invalidate_config_cache()
-        # 提交值全部等于全局值时会退化为「跟随全局」，返回值必须以实际存储为准，
-        # 否则前端会显示「已独立配置」而后台其实已跟随全局。
+        # 显式开启独立配置后即使所有值暂时等于全局，也保留独立状态；
+        # 返回值仍以实际存储为准，避免前端显示与落盘不一致。
         actual_independent = bool(
             plugin.group_store.get_meta(group_id).get("independent")
         )
@@ -693,8 +710,12 @@ class PageApi:
         group_id = str(group_id or "").strip()
         if not group_id:
             return fail("group_id 不能为空")
-        removed = self.plugin.group_store.remove(group_id)
-        self.plugin.invalidate_config_cache()
+        try:
+            removed = self.plugin.group_store.remove(group_id)
+            self.plugin.invalidate_config_cache()
+        except Exception as exc:
+            logger.error(f"[ActiveReply] 重置群配置失败: {exc}", exc_info=True)
+            return fail(f"重置失败：{exc}")
         return ok({"group_id": group_id, "removed": removed})
 
     # ------------------------------------------------------------------ #
@@ -1191,23 +1212,9 @@ class PageApi:
         store = self.plugin.memory_store
         if store is None:
             return []
-        data = await asyncio.to_thread(
-            store.list_memories,
-            page=1,
-            page_size=200,
-            include_archived=True,
+        atoms = await asyncio.to_thread(
+            store.find_atoms_by_episode, int(episode_id)
         )
-        atoms: list[dict[str, Any]] = []
-        for item in data.get("items", []):
-            meta = item.get("extra_metadata")
-            if not isinstance(meta, dict):
-                continue
-            try:
-                linked = int(meta.get("episode_id") or 0)
-            except (TypeError, ValueError):
-                linked = 0
-            if linked == int(episode_id):
-                atoms.append(item)
         atoms.sort(key=lambda entry: int(entry.get("memory_id") or 0))
         return atoms
 
@@ -1258,14 +1265,28 @@ class PageApi:
         except Exception as exc:
             logger.warning(f"[ActiveReply] 失效召回缓存失败: {exc}")
 
+    def _memory_readonly_error(self) -> str:
+        """高版本记忆库只读时返回统一错误，页面写操作不得继续。"""
+        store = self.plugin.memory_store
+        if store is not None and not getattr(store, "store_compatible", True):
+            return "记忆库版本高于插件，当前为只读模式。"
+        return ""
+
     async def rag_delete(self, memory_id: str) -> dict[str, Any]:
         """删除指定记忆，并记录页面操作日志。"""
+        readonly = self._memory_readonly_error()
+        if readonly:
+            return fail(readonly)
         # 删除指定记忆并记录页面操作日志。
         store = self.plugin.memory_store
         if store is None:
             return fail("记忆库未初始化")
-        removed = await asyncio.to_thread(store.delete_memory, memory_id)
-        if not removed:
+        # 同事务返回本次删除的 trash_id；不能删除后再查全局 latest，
+        # 并发删除时会把别人的回收站 ID 返回给 Snackbar。
+        trash_id = await asyncio.to_thread(
+            store.delete_memory_with_trash_id, memory_id
+        )
+        if trash_id is None:
             return fail("记忆不存在或已删除")
         self._invalidate_recall_cache_hook("page_api")
         logger.info("[ActiveReply] 页面删除记忆 | id=%s", memory_id)
@@ -1273,12 +1294,15 @@ class PageApi:
             {
                 "memory_id": memory_id,
                 "deleted": True,
-                "trash_id": await asyncio.to_thread(store.latest_trash_id),
+                "trash_id": trash_id,
             }
         )
 
     async def rag_archive(self, memory_id: str) -> dict[str, Any]:
         """归档指定记忆：保留数据但不再参与召回。"""
+        readonly = self._memory_readonly_error()
+        if readonly:
+            return fail(readonly)
         # r3.3：归档是遗忘链路的手动入口，只改 archived 标记。
         store = self.plugin.memory_store
         if store is None:
@@ -1322,6 +1346,9 @@ class PageApi:
 
     async def rag_unarchive(self, memory_id: str) -> dict[str, Any]:
         """取消归档：重置衰减基准并按 TTL 自适应恢复有效期。"""
+        readonly = self._memory_readonly_error()
+        if readonly:
+            return fail(readonly)
         store = self.plugin.memory_store
         if store is None:
             return fail("记忆库未初始化")
@@ -1355,6 +1382,9 @@ class PageApi:
 
     async def rag_purge(self, memory_id: str) -> dict[str, Any]:
         """彻底删除指定记忆：不写回收站且不可撤销，必须显式确认。"""
+        readonly = self._memory_readonly_error()
+        if readonly:
+            return fail(readonly)
         store = self.plugin.memory_store
         if store is None:
             return fail("记忆库未初始化")
@@ -1372,6 +1402,9 @@ class PageApi:
 
     async def rag_restore(self) -> dict[str, Any]:
         """撤销删除：从回收站恢复一条记忆。"""
+        readonly = self._memory_readonly_error()
+        if readonly:
+            return fail(readonly)
         store = self.plugin.memory_store
         if store is None:
             return fail("记忆库未初始化")
@@ -1393,6 +1426,9 @@ class PageApi:
 
     async def rag_cleanup(self) -> dict[str, Any]:
         """在线程池执行旧格式记忆数据清理，避免阻塞事件循环。"""
+        readonly = self._memory_readonly_error()
+        if readonly:
+            return fail(readonly)
         # 在线程池执行旧数据规范化，避免同步 SQLite 操作阻塞事件循环。
         store = self.plugin.memory_store
         if store is None:
@@ -1434,6 +1470,9 @@ class PageApi:
         并运行一次提示词抽取自检（F23）。``steps`` 里不回传服务器绝对路径
         （F43）。
         """
+        readonly = self._memory_readonly_error()
+        if readonly:
+            return fail(readonly)
         plugin = self.plugin
         steps: list[dict[str, Any]] = []
 
@@ -1622,9 +1661,14 @@ class PageApi:
         if error:
             return fail(error)
         user_id = str(payload.get("user_id") or "").strip()
-        if not user_id or not user_id.isalnum() or not user_id.isascii():
-            return fail("用户 ID 只能包含英文字母和数字")
-        reason = str(payload.get("reason") or "").strip()
+        if (
+            not user_id
+            or len(user_id) > 64
+            or not user_id.isalnum()
+            or not user_id.isascii()
+        ):
+            return fail("用户 ID 只能包含 1-64 位英文字母和数字")
+        reason = str(payload.get("reason") or "").strip()[:200]
         scope = "group" if str(payload.get("scope") or "").lower() == "group" else "all"
         group_id = self._valid_group_id(payload.get("group_id"))
         if scope == "group" and not group_id:
@@ -1643,8 +1687,6 @@ class PageApi:
             )
         except Exception as exc:
             return fail(f"添加屏蔽失败：{exc}")
-        if scope == "all":
-            self.plugin._sync_blacklist_config()
         return ok({"entry": self._block_view(entry)})
 
     async def blocks_remove(self) -> dict[str, Any]:
@@ -1652,19 +1694,28 @@ class PageApi:
         if error:
             return fail(error)
         user_id = str(payload.get("user_id") or "").strip()
-        if not user_id or not user_id.isalnum() or not user_id.isascii():
-            return fail("用户 ID 只能包含英文字母和数字")
+        if (
+            not user_id
+            or len(user_id) > 64
+            or not user_id.isalnum()
+            or not user_id.isascii()
+        ):
+            return fail("用户 ID 只能包含 1-64 位英文字母和数字")
         scope = "group" if str(payload.get("scope") or "").lower() == "group" else "all"
         group_id = self._valid_group_id(payload.get("group_id"))
         if scope == "group" and not group_id:
             return fail("群号无效：只允许纯数字群号或「平台:群号」形式")
         if scope == "all":
-            removed = self.plugin.block_store.remove_all_for_user(user_id)
-            self.plugin._sync_blacklist_config()
+            removed, error = self.plugin._remove_global_block(user_id)
+            if error:
+                return fail(f"解除失败：{error}")
         else:
-            removed = self.plugin.block_store.remove(
-                user_id, scope="group", group_id=group_id
-            )
+            try:
+                removed = self.plugin.block_store.remove(
+                    user_id, scope="group", group_id=group_id
+                )
+            except Exception as exc:
+                return fail(f"解除失败：{exc}")
         if not removed:
             return fail("未找到对应的屏蔽记录")
         return ok({"removed": True, "user_id": user_id})

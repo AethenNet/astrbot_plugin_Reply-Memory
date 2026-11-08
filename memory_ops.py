@@ -460,19 +460,28 @@ class MemoryOpsMixin:
         cached = self._recall_cache.get(cache_key)
         if cached is not None:
             block, memory_ids = cached
-            event.set_extra("_areply_memory_recalled", True)
-            injection_mode = self._inject_memory_block(req, block)
-            # 命中缓存也不能在请求路径写库（L-02）：访问计数交给批量缓冲。
-            self._buffer_access(list(memory_ids))
-            self.state.bump_metric(origin, "memory_hits", len(memory_ids))
-            self.state.bump_metric(origin, "recall_cache_hit", 1)
-            logger.info(
-                "[ActiveReply] 记忆自动回忆（命中缓存） | origin=%s hits=%s mode=%s",
-                origin,
-                len(memory_ids),
-                injection_mode,
-            )
-            return
+            # 缓存命中也要重新校验 archived/valid_until：计划刚到期但维护
+            # 还没归档时，不能继续把旧卡片注入本轮上下文。
+            try:
+                valid_ids = await asyncio.to_thread(
+                    self.memory_store.filter_recallable_ids, list(memory_ids)
+                )
+            except Exception:
+                valid_ids = set()
+            if set(int(item) for item in memory_ids) <= valid_ids:
+                event.set_extra("_areply_memory_recalled", True)
+                injection_mode = self._inject_memory_block(req, block)
+                # 命中缓存也不能在请求路径写库（L-02）：访问计数交给批量缓冲。
+                self._buffer_access(list(memory_ids))
+                self.state.bump_metric(origin, "memory_hits", len(memory_ids))
+                self.state.bump_metric(origin, "recall_cache_hit", 1)
+                logger.info(
+                    "[ActiveReply] 记忆自动回忆（命中缓存） | origin=%s hits=%s mode=%s",
+                    origin,
+                    len(memory_ids),
+                    injection_mode,
+                )
+                return
         # 记录进入计算时的缓存代际：写回前若代际变化（期间发生写/删/配置
         # 重载导致失效），说明这轮结果可能已过期，不再写回（N-11 竞态）。
         cache_generation = self._recall_cache.generation
@@ -564,6 +573,7 @@ class MemoryOpsMixin:
                     remaining,
                 )
             except Exception as exc:
+                degraded = True
                 _recall_warning("embedding", "[ActiveReply] 记忆向量化失败: %s", exc)
                 vector = []
             self.state.bump_metric(
@@ -886,6 +896,14 @@ class MemoryOpsMixin:
         if not ready or self.memory_store is None:
             logger.info("[ActiveReply] 记忆自动写入跳过：%s", reason)
             return
+        # 未显式全局时沿用消息所属群作用域；个人事实再按 group_first
+        # 提升为全局，避免群隔离模式下关键词记忆永远召回不到。
+        if (
+            not scope
+            and cfg.memory_rag.auto_extract_scope != "global"
+            and group_id
+        ):
+            scope = f"{platform_id}:{group_id}" if platform_id else group_id
         # 个人事实优先存成全局记忆，跨群也能回忆
         if (
             cfg.memory_rag.auto_extract_scope == "group_first"
@@ -943,12 +961,14 @@ class MemoryOpsMixin:
         if self.memory_store is None or not memory_id:
             return
         try:
-            await asyncio.to_thread(
+            merged = await asyncio.to_thread(
                 self.memory_store.merge_memory,
                 memory_id,
                 role_ids=role_ids,
                 extra_metadata=extra,
             )
+            if merged:
+                self._invalidate_recall_cache("store-exact-merge")
         except Exception as exc:
             logger.warning(
                 "[ActiveReply] 精确去重合并失败 | id=%s: %s", memory_id, exc
@@ -1133,12 +1153,14 @@ class MemoryOpsMixin:
                         return None, similar_id
                     if action == "duplicate":
                         # 丢弃新正文/向量/置信度，但无条件合并参与者；元数据可为空（P2-1）。
-                        await asyncio.to_thread(
+                        merged = await asyncio.to_thread(
                             self.memory_store.merge_memory,
                             similar_id,
                             role_ids=role_ids,
                             extra_metadata=extra or {},
                         )
+                        if merged:
+                            self._invalidate_recall_cache("store-duplicate-merge")
                         return None, similar_id
                     logger.debug(
                         "[ActiveReply] 记忆相似但保留两条 | old=%s sim=%s "
@@ -1969,7 +1991,7 @@ class MemoryOpsMixin:
         同样表示这一窗没有可记内容，应判 ``empty`` 而不是 ``failed``，否则
         游标不前进、退避重试会反复烧同一窗口的 token（F51）。
         """
-        payload = self._try_parse_json_object(text)
+        payload = self._json_loads_lenient(text)
         if not isinstance(payload, dict):
             return False
         memories = payload.get("memories")
@@ -2017,6 +2039,10 @@ class MemoryOpsMixin:
         raw_output = str(response.completion_text or "")
         items = self._parse_memory_items(raw_output, max_items=max_items)
         repair_output = ""
+        # 模型已明确返回空数组时不要进入“修复”重试：空数组不是解析失败，
+        # 强制修复会诱导模型把窗口原文编成记忆并多烧一次 LLM。
+        if not items and self._payload_declares_empty(raw_output):
+            return [], raw_output, "", None
         if not items:
             repair_prompt = (
                 "你上一条输出不是可解析的 JSON，或缺少 memories 数组。请只输出一个 "
@@ -2335,18 +2361,6 @@ class MemoryOpsMixin:
                     "置信度校准：重要档需至少 3 名成员参与，"
                     f"当前 {len(human_ids)} 名真人，下调到 0.80",
                 )
-            # r3.3：chatter/spam 低价值档直接丢弃。该开关对自动抽取与手动
-            # /总结记忆 都生效（手动只绕过数值门槛，不绕过档位开关）。
-            tier = str(item.get("confidence_tier") or "").strip().lower()
-            if cfg.memory_rag.extract_skip_chatter and tier in {"chatter", "spam"}:
-                dropped += 1
-                record["status"] = "dropped"
-                self._journal(origin, f"低价值档丢弃 | tier={tier or 'unknown'}")
-                record["reason"] = "tier_chatter"
-                record["tier"] = tier
-                if collected is not None:
-                    collected.append(record)
-                continue
             if enforce_min_confidence and item["confidence"] < min_conf:
                 dropped += 1
                 record["status"] = "dropped"
@@ -2523,6 +2537,9 @@ class MemoryOpsMixin:
         """
         last = 0.0
         store = self.memory_store
+        if store is not None and not getattr(store, "store_compatible", True):
+            self._last_consolidation_at = time.time()
+            return
         if store is not None:
             try:
                 raw = store.get_meta("consolidation_last_at")
@@ -2555,7 +2572,11 @@ class MemoryOpsMixin:
         while True:
             try:
                 cfg = self._global_cfg()
-                if self.memory_store is not None and cfg.memory_rag.enable:
+                if (
+                    self.memory_store is not None
+                    and cfg.memory_rag.enable
+                    and getattr(self.memory_store, "store_compatible", True)
+                ):
                     # M-07：回收站长期只增不删会撑大数据库，按保留天数清理。
                     try:
                         purged = await asyncio.to_thread(
@@ -2880,6 +2901,8 @@ class MemoryOpsMixin:
             return False, "记忆 RAG 已在插件配置中关闭。"
         if self.memory_store is None:
             return False, "记忆库未初始化。"
+        if not getattr(self.memory_store, "store_compatible", True):
+            return False, "记忆库版本高于插件，当前为只读模式。"
         return True, ""
 
     def _embedding_provider(self) -> EmbeddingProvider | None:
