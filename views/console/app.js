@@ -1340,8 +1340,9 @@ function buildControl(field, value) {
     const step = field.step || (field.kind === "int" ? 1 : 0.1);
     return `
       <input type="range" data-path="${path}" data-kind="${field.kind}"
-        min="${field.min}" max="${field.max}" step="${step}" value="${value}" />
-      <span class="range-value" data-for="${path}">${value}</span>`;
+        min="${escapeHtml(field.min)}" max="${escapeHtml(field.max)}"
+        step="${escapeHtml(step)}" value="${escapeHtml(value)}" />
+      <span class="range-value" data-for="${path}">${escapeHtml(value)}</span>`;
   }
   if (field.kind === "text") {
     return `<textarea data-path="${path}" data-kind="text">${escapeHtml(value || "")}</textarea>`;
@@ -1689,8 +1690,9 @@ function buildSchemaControl(meta, value, path) {
     const step = Number(slider.step ?? (type === "int" ? 1 : 0.1));
     return `
       <input type="range" data-global-path="${path}" data-global-type="${type}"
-        min="${min}" max="${max}" step="${step}" value="${value ?? min}" />
-      <span class="range-value" data-for-global="${path}">${value ?? min}</span>`;
+        min="${escapeHtml(min)}" max="${escapeHtml(max)}"
+        step="${escapeHtml(step)}" value="${escapeHtml(value ?? min)}" />
+      <span class="range-value" data-for-global="${path}">${escapeHtml(value ?? min)}</span>`;
   }
   if (type === "text") {
     return `<textarea data-global-path="${path}" data-global-type="text">${escapeHtml(
@@ -4543,6 +4545,12 @@ function recoverUiState(reason = "") {
     pane.style.transform = "";
     pane.style.borderRadius = "";
     pane.style.boxShadow = "";
+    // 拖拽会给 drawer 写 inline transform/transition；自愈时一并清掉，
+    // 否则关闭后抽屉仍可能停在半推开位置。
+    drawer.style.transition = "";
+    drawer.style.transform = "";
+    detail.style.transition = "";
+    detail.style.transform = "";
     const veil = document.querySelector(".pane-veil");
     if (veil) {
       veil.style.transition = "";
