@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import copy
 import datetime
 import ipaddress
 import json
@@ -196,15 +197,15 @@ def _optional_hook(name: str):
 class _PluginLogHandler:
     """把本插件经 ``astrbot.api.logger`` 输出的日志收进环形缓冲。
 
-    只使用 logger 对象本身（不导入 logging / loguru），符合插件市场规范。
-    4.15 的 ``astrbot.api.logger`` 是全局 ``logging.getLogger("astrbot")``，
+    只使用 logger 对象本身（不导入标准日志模块或第三方日志库），符合插件市场规范。
+    4.15 的 ``astrbot.api.logger`` 是一个名为 ``astrbot`` 的全局 logger，
     ``addHandler`` 能收到核心与其它插件的日志（report1 P2），因此这里必须自己
     过滤：只接受 ``record.name`` 含插件名、或 ``record.pathname`` 位于本插件
     目录的记录，其余一律丢弃（F13）。4.29 的 logger 是插件上下文代理，通常
     只会收到本插件日志，过滤同样成立。
     """
 
-    level = 20  # logging.INFO，避免导入 logging 模块
+    level = 20  # INFO，避免导入标准日志模块
 
     def __init__(
         self, buffer: deque[tuple[float, str]], plugin_dir: Path | None = None
@@ -229,7 +230,7 @@ class _PluginLogHandler:
         return True
 
     def filter(self, record: Any) -> bool:
-        """兼容 ``logging.Handler.filter`` 语义：返回 False 时丢弃记录。"""
+        """兼容标准 Handler 的 filter 语义：返回 False 时丢弃记录。"""
         return self._is_plugin_record(record)
 
     def handle(self, record: Any) -> None:
@@ -415,7 +416,7 @@ class ActiveReplyPlugin(MemoryOpsMixin, star.Star):
                 "auto_extract_scope": mem.get("auto_extract_scope", "group_first"),
             }
             injection = {
-                "memory_inject_max_chars": mem.get("memory_inject_max_chars", 600),
+                "memory_inject_max_chars": mem.get("memory_inject_max_chars", 1500),
                 "memory_inject_max_items": mem.get("memory_inject_max_items", 5),
                 "recall_k": mem.get("recall_k", 20),
                 "max_return_results": mem.get("max_return_results", 100),
@@ -430,7 +431,7 @@ class ActiveReplyPlugin(MemoryOpsMixin, star.Star):
                 "memory_archive_enable": mem.get("memory_archive_enable", True),
                 "memory_archive_days": mem.get("memory_archive_days", 30),
                 "memory_archive_importance": mem.get(
-                    "memory_archive_importance", 3.0
+                    "memory_archive_importance", 3.5
                 ),
             }
             sections = {
@@ -448,7 +449,6 @@ class ActiveReplyPlugin(MemoryOpsMixin, star.Star):
                     "memory_window_gap_minutes",
                     "memory_multi_atom",
                     "memory_atom_max_items",
-                    "memory_prompt_contract",
                     "memory_group_prompt",
                     "memory_private_prompt",
                 ),
@@ -468,6 +468,8 @@ class ActiveReplyPlugin(MemoryOpsMixin, star.Star):
                     "memory_consolidation_archive",
                     "memory_trash_retention_days",
                     "memory_kind_decay",
+                    "memory_ttl_adaptive",
+                    "memory_ttl_base",
                 ),
             }
             # 以旧块为底：未知旧键（可能来自更新版本）全部保留在顶层。
@@ -549,6 +551,9 @@ class ActiveReplyPlugin(MemoryOpsMixin, star.Star):
         继续用 0.60 会把正常的日常记忆全部过滤掉。只迁移恰好等于旧默认
         的值，用户自行调整过的其他阈值保持不变。
         """
+        marker = self.data_dir / ".migrated_min_confidence"
+        if marker.exists():
+            return
         try:
             mem = self.config.get("memory_rag")
             if not isinstance(mem, dict):
@@ -557,13 +562,11 @@ class ActiveReplyPlugin(MemoryOpsMixin, star.Star):
             if not isinstance(gen, dict):
                 return
             raw = gen.get("auto_extract_min_confidence")
-            if raw is None:
-                return
-            if abs(float(raw) - 0.6) > 1e-9:
-                return
-            gen["auto_extract_min_confidence"] = 0.5
-            self._save_config()
-            logger.info("[ActiveReply] 记忆最低置信度已从旧默认 0.60 迁移到 0.50")
+            if raw is not None and abs(float(raw) - 0.6) <= 1e-9:
+                gen["auto_extract_min_confidence"] = 0.5
+                self._save_config()
+                logger.info("[ActiveReply] 记忆最低置信度已从旧默认 0.60 迁移到 0.50")
+            marker.write_text("1", encoding="utf-8")
         except Exception as exc:
             logger.debug(f"[ActiveReply] 迁移最低置信度失败: {exc}")
 
@@ -705,17 +708,62 @@ class ActiveReplyPlugin(MemoryOpsMixin, star.Star):
         if callable(saver):
             saver()
 
-    def _sync_blacklist_config(self) -> None:
-        """把 store 中的全局屏蔽列表写回插件配置，保持两边一致。"""
+    def _remove_blacklist_config_id(self, user_id: str) -> bool:
+        """解除全局屏蔽时同步删掉配置镜像；写盘失败恢复内存并返回 False。"""
+        target = str(user_id or "").strip()
+        if not target:
+            return True
+        config_snapshot = copy.deepcopy(dict(self.config))
         try:
-            ids = [entry["user_id"] for entry in self.block_store.global_entries()]
             section = self.config.setdefault("group_reply_enhancement", {})
             block = section.setdefault("user_block", {})
-            block["blacklist"] = ids
+            current = block.get("blacklist")
+            if isinstance(current, str):
+                current = [item.strip() for item in current.split(",") if item.strip()]
+            ids = [str(item).strip() for item in (current or []) if str(item).strip()]
+            if target not in ids:
+                return True
+            block["blacklist"] = [item for item in ids if item != target]
             self._save_config()
             self.invalidate_config_cache()
+            return True
         except Exception as exc:
-            logger.warning(f"[ActiveReply] 同步屏蔽列表到配置失败: {exc}")
+            try:
+                self.config.clear()
+                self.config.update(config_snapshot)
+                self._save_config()
+                self.invalidate_config_cache()
+            except Exception as restore_exc:
+                logger.warning(f"[ActiveReply] 恢复屏蔽配置失败: {restore_exc}")
+            logger.warning(f"[ActiveReply] 从配置移除屏蔽失败: {exc}")
+            return False
+
+    def _remove_global_block(self, user_id: str) -> tuple[bool, str]:
+        """原子解除全局屏蔽：配置镜像与 store 任一失败都恢复配置快照。"""
+        target = str(user_id or "").strip()
+        if not target:
+            return False, "用户 ID 为空"
+        config_snapshot = copy.deepcopy(dict(self.config))
+        try:
+            if not self._remove_blacklist_config_id(target):
+                self.config.clear()
+                self.config.update(config_snapshot)
+                return False, "配置无法写回，屏蔽未解除"
+            removed = self.block_store.remove_all_for_user(target)
+            return bool(removed), ""
+        except Exception as exc:
+            # BlockStore 自己会回滚内存；这里把已删的配置镜像恢复并写回。
+            try:
+                self.config.clear()
+                self.config.update(config_snapshot)
+                self._save_config()
+                self.invalidate_config_cache()
+            except Exception as restore_exc:
+                logger.warning(
+                    f"[ActiveReply] 恢复屏蔽配置失败: {restore_exc}"
+                )
+            logger.warning(f"[ActiveReply] 解除全局屏蔽失败: {exc}")
+            return False, str(exc)
 
     async def _enforce_user_block(self, event: AstrMessageEvent) -> bool:
         """命中屏蔽时停止事件；返回 True 表示已拦截。"""
@@ -1313,7 +1361,13 @@ class ActiveReplyPlugin(MemoryOpsMixin, star.Star):
         self._touch(origin, cfg)
 
         removed = ""
-        if cfg.group_context.enable:
+        # 主动回复的模型判定也依赖 session_chats；不能只看群上下文开关。
+        record_chat = cfg.group_context.enable or (
+            cfg.active_reply.enable
+            and cfg.active_reply.mode == "model_choice"
+            and cfg.active_reply.model_history_messages > 0
+        )
+        if record_chat:
             removed = self.state.append_chat(origin, line, ctx_cfg.max_messages)
             if removed:
                 removed_match = MSG_ID_PATTERN.search(removed)
@@ -2486,11 +2540,19 @@ class ActiveReplyPlugin(MemoryOpsMixin, star.Star):
         memory_time_text = now_dt.strftime("%Y-%m-%d %H:%M:%S")
         self_id = self._resolve_self_id(event)
         self._touch(origin, cfg)
-        if cfg.group_context.enable and origin in self.state.session_chats:
-            line = format_self_line(self_id, now_text, body=text)
+        safe_text = sanitize_inline(text, MAX_INLINE_HISTORY_CHARS)
+        record_chat = cfg.group_context.enable or (
+            cfg.active_reply.enable
+            and cfg.active_reply.mode == "model_choice"
+            and cfg.active_reply.model_history_messages > 0
+        )
+        if record_chat and origin in self.state.session_chats:
+            line = format_self_line(self_id, now_text, body=safe_text)
             self.state.append_chat(origin, line, cfg.group_context.max_messages)
         if cfg.memory_rag.enable:
-            memory_line = format_self_line(self_id, memory_time_text, body=text)
+            memory_line = format_self_line(
+                self_id, memory_time_text, body=safe_text
+            )
             limit = max(200, min(1000, int(cfg.memory_rag.batch_messages) * 4))
             self.state.append_memory_chat(origin, memory_line, limit)
 
@@ -2690,13 +2752,7 @@ class ActiveReplyPlugin(MemoryOpsMixin, star.Star):
             tier_text = f"（{tier}）" if tier else ""
             lines.append(f"置信度：{float(item.get('confidence') or 0):.2f}{tier_text}")
             reason = str(item.get("reason") or "")
-            if reason == "tier_chatter":
-                lines.append(
-                    "本次未写入：模型把它评为 chatter/spam 低价值档；受"
-                    "「丢弃闲聊/灌水档」开关控制（全局设置 → 记忆 RAG → 记忆生成）。"
-                    "关闭该开关后，即使最低置信度为 0 也会保留。"
-                )
-            elif reason == "low_confidence":
+            if reason == "low_confidence":
                 lines.append(
                     "本次未写入：置信度 "
                     f"{float(item.get('confidence') or 0):.2f} 低于最低置信度配置。"
@@ -2814,8 +2870,6 @@ class ActiveReplyPlugin(MemoryOpsMixin, star.Star):
         except Exception as exc:
             yield event.plain_result(f"屏蔽失败：{exc}")
             return
-        if scope == "all":
-            self._sync_blacklist_config()
         scope_text = "全部会话（含私聊）" if scope == "all" else f"本群（{gid}）"
         yield event.plain_result(
             f"已屏蔽用户 {user_id}\n范围：{scope_text}\n"
@@ -2850,10 +2904,18 @@ class ActiveReplyPlugin(MemoryOpsMixin, star.Star):
             yield event.plain_result("用法：/remove <用户ID>（或 @ 对方）")
             return
         if scope == "all":
-            removed = self.block_store.remove_all_for_user(user_id)
-            self._sync_blacklist_config()
+            removed, error = self._remove_global_block(user_id)
+            if error:
+                yield event.plain_result(f"解除失败：{error}")
+                return
         else:
-            removed = self.block_store.remove(user_id, scope="group", group_id=gid)
+            try:
+                removed = self.block_store.remove(
+                    user_id, scope="group", group_id=gid
+                )
+            except Exception as exc:
+                yield event.plain_result(f"解除失败：{exc}")
+                return
         if removed:
             scope_text = "全部会话" if scope == "all" else f"本群（{gid}）"
             yield event.plain_result(f"已解除屏蔽用户 {user_id}（范围：{scope_text}）")
@@ -3465,7 +3527,9 @@ class ActiveReplyPlugin(MemoryOpsMixin, star.Star):
                 if not local_path:
                     attach_error = "无法解析图片地址"
                 else:
-                    encoded, mime = self._encode_image(local_path)
+                    encoded, mime = await asyncio.to_thread(
+                        self._encode_image, local_path
+                    )
                     entry.setdefault("resolved", [""] * len(urls))
                     resolved = entry["resolved"]
                     if isinstance(resolved, list) and len(resolved) == len(urls):
@@ -3750,7 +3814,7 @@ class ActiveReplyPlugin(MemoryOpsMixin, star.Star):
             IMAGE_DOWNLOAD_TIMEOUT_SEC if timeout is None else float(timeout)
         )
         target = cache_dir / f"image_{uuid.uuid4().hex}.bin"
-        self._prune_image_cache(cache_dir)
+        await asyncio.to_thread(self._prune_image_cache, cache_dir)
         client_timeout = aiohttp.ClientTimeout(total=total_timeout)
         data = bytearray()
         try:
@@ -3785,7 +3849,7 @@ class ActiveReplyPlugin(MemoryOpsMixin, star.Star):
                                 return ""
             if not data:
                 return ""
-            target.write_bytes(bytes(data))
+            await asyncio.to_thread(target.write_bytes, bytes(data))
             return str(target)
         except asyncio.TimeoutError:
             logger.warning("[ActiveReply] 图片下载超时 | url=%s", url[:200])
@@ -3811,10 +3875,23 @@ class ActiveReplyPlugin(MemoryOpsMixin, star.Star):
             raise ValueError(f"图片内容为空: {image_path}")
         if len(raw) > 12 * 1024 * 1024:
             raise ValueError("图片超过 12MB，已拒绝附加")
-        mime = mimetypes.guess_type(str(path))[0] or "image/jpeg"
-        if not mime.startswith("image/"):
+        mime = self._detect_image_mime(raw) or mimetypes.guess_type(str(path))[0]
+        if not mime or not mime.startswith("image/"):
             mime = "image/jpeg"
         return base64.b64encode(raw).decode("ascii"), mime
+
+    @staticmethod
+    def _detect_image_mime(raw: bytes) -> str:
+        """按文件魔数识别图片 MIME，避免 .bin 缓存被误标为 JPEG。"""
+        if raw.startswith(b"\x89PNG\r\n\x1a\n"):
+            return "image/png"
+        if raw.startswith(b"\xff\xd8\xff"):
+            return "image/jpeg"
+        if raw.startswith(b"GIF87a") or raw.startswith(b"GIF89a"):
+            return "image/gif"
+        if raw.startswith(b"RIFF") and raw[8:12] == b"WEBP":
+            return "image/webp"
+        return ""
 
     def _write_caption_to_history(
         self, origin: str, msg_id: str, image_index: int, caption: str

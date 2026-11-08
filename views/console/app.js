@@ -942,8 +942,11 @@ function renderMemoryMetrics(metrics) {
 
 /** 获取插件概览数据并刷新状态页与侧边栏群列表。 */
 async function loadOverview(force = false) {
+  const requestId = (state.overviewSeq || 0) + 1;
+  state.overviewSeq = requestId;
   try {
     const data = await callApi("GET", "overview", force ? { force: 1 } : {});
+    if (requestId !== state.overviewSeq) return;
     state.overview = data;
     state.groups = data.groups || [];
     state.providers = data.providers || [];
@@ -952,7 +955,9 @@ async function loadOverview(force = false) {
     renderOverview(data);
     renderDrawerGroups();
   } catch (error) {
-    toast(error.message || "加载状态失败", true);
+    if (requestId === state.overviewSeq) {
+      toast(error.message || "加载状态失败", true);
+    }
   }
 }
 
@@ -1225,14 +1230,19 @@ async function loadGroups(force = false) {
     renderGroupList();
     return;
   }
+  const requestId = (state.groupsSeq || 0) + 1;
+  state.groupsSeq = requestId;
   showGroupsSkeleton();
   try {
     const data = await callApi("GET", "groups", force ? { force: 1 } : {});
+    if (requestId !== state.groupsSeq) return;
     state.groups = data.groups || [];
     renderGroupList();
     renderDrawerGroups();
   } catch (error) {
-    toast(error.message || "加载群列表失败", true);
+    if (requestId === state.groupsSeq) {
+      toast(error.message || "加载群列表失败", true);
+    }
   }
 }
 
@@ -1544,6 +1554,8 @@ async function openGroup(groupId) {
   renderDrawerGroups();
   try {
     const data = await callApi("GET", `groups/${encodeURIComponent(groupId)}`);
+    // 快速切换 A→B 时，A 的慢响应不能覆盖 B 的当前状态。
+    if (state.currentGroupId !== String(groupId)) return;
     state.currentGroup = {
       ...data,
       values: { ...(data.values || {}) },
@@ -1554,7 +1566,9 @@ async function openGroup(groupId) {
     }
     renderGroupPanel();
   } catch (error) {
-    toast(error.message || "加载群配置失败", true);
+    if (state.currentGroupId === String(groupId)) {
+      toast(error.message || "加载群配置失败", true);
+    }
   }
 }
 
@@ -1580,7 +1594,9 @@ async function saveGroup() {
     });
     toast("本群配置已保存");
     await loadGroups(true);
-    await openGroup(data.group_id);
+    if (state.currentGroupId === String(data.group_id)) {
+      await openGroup(data.group_id);
+    }
   } catch (error) {
     toast(error.message || "保存失败", true);
   } finally {
@@ -1924,6 +1940,18 @@ function bindGlobalInputs() {
         if (label) label.textContent = input.value;
       });
     }
+    const markDirty = () => {
+      state.globalDirty = true;
+      state.globalEditVersion = (state.globalEditVersion || 0) + 1;
+      if (!(state.globalDirtyPaths instanceof Set)) {
+        state.globalDirtyPaths = new Set();
+      }
+      if (input.dataset.globalPath) {
+        state.globalDirtyPaths.add(input.dataset.globalPath);
+      }
+    };
+    input.addEventListener("input", markDirty);
+    input.addEventListener("change", markDirty);
     const rerun = () => refreshGlobalConditions();
     input.addEventListener("change", rerun);
     if (input.tagName === "SELECT" || input.type === "checkbox") {
@@ -2041,16 +2069,35 @@ function schemaDefaults(schema) {
 
 /** 从后端载入 schema、全局配置和 provider 选项后刷新设置表单。 */
 async function loadGlobal() {
+  const requestId = (state.globalLoadSeq || 0) + 1;
+  state.globalLoadSeq = requestId;
   try {
     const data = await callApi("GET", "config");
+    if (requestId !== state.globalLoadSeq) return;
+    const serverValues = data.values || {};
+    if (state.globalDirty) {
+      // 保留用户编辑过的字段；其余字段仍接受最新服务端值。
+      const dirtyPaths =
+        state.globalDirtyPaths instanceof Set ? state.globalDirtyPaths : new Set();
+      if (!dirtyPaths.size) return;
+      const edited = collectGlobalValues();
+      for (const path of dirtyPaths) {
+        setPath(serverValues, path, getPath(edited, path));
+      }
+    }
     state.schema = data.schema || {};
-    state.globalValues = data.values || {};
+    state.globalValues = serverValues;
     state.providers = data.providers || state.providers;
     state.embeddingProviders =
       data.embedding_providers || state.embeddingProviders;
+    if (!state.globalDirty) {
+      state.globalEditVersion = state.globalEditVersion || 0;
+      state.globalDirtyPaths = new Set();
+    }
     renderGlobalForm();
     $("global-hint").textContent = "";
   } catch (error) {
+    if (requestId !== state.globalLoadSeq || state.globalDirty) return;
     $("global-tabs").innerHTML = "";
     $("global-form").innerHTML = `<p class="muted small pad">加载失败：${escapeHtml(
       error.message || "未知错误"
@@ -2065,6 +2112,9 @@ function resetGlobalDefaults() {
     return;
   }
   state.globalValues = schemaDefaults(state.schema);
+  state.globalDirty = true;
+  state.globalDirtyPaths = new Set();
+  state.globalEditVersion = (state.globalEditVersion || 0) + 1;
   renderGlobalForm();
   $("global-hint").textContent = "已填入默认值，点击「保存」后生效";
   toast("已填入默认值，点击「保存」后生效");
@@ -2101,6 +2151,8 @@ function collectGlobalValues() {
     }
     setPath(values, path, value);
   });
+  // 把当前 DOM 编辑值同步回状态，避免条件字段重绘时用旧值覆盖未保存文本。
+  state.globalValues = values;
   return values;
 }
 
@@ -2110,9 +2162,18 @@ async function saveGlobal() {
   button.disabled = true;
   $("global-hint").textContent = "保存中…";
   try {
+    const saveVersion = state.globalEditVersion || 0;
     const result = await callApi("POST", "config/save", {
       values: collectGlobalValues(),
     });
+    if ((state.globalEditVersion || 0) !== saveVersion) {
+      // 保存期间又有输入：保留当前表单和 dirty 状态，不能重绘覆盖。
+      $("global-hint").textContent = "已保存；保存期间的新修改尚未提交";
+      toast("已保存，但有新修改尚未提交");
+      return;
+    }
+    state.globalDirty = false;
+    state.globalDirtyPaths = new Set();
     $("global-hint").textContent = result.warning
       ? `已保存，但写盘失败：${result.warning}`
       : "已保存，立即生效";
@@ -2854,14 +2915,18 @@ function renderGroupBlocks() {
 }
 
 async function loadBlocks() {
+  const requestId = (state.blocksSeq || 0) + 1;
+  state.blocksSeq = requestId;
   try {
     const data = await callApi("GET", "blocks");
+    if (requestId !== state.blocksSeq) return;
     state.blocks = data;
     const status = $("block-status");
     status.textContent = data.enabled ? "已启用" : "已关闭";
     status.className = `pill ${data.enabled ? "" : "muted-pill"}`;
     renderGlobalBlocks();
   } catch (error) {
+    if (requestId !== state.blocksSeq) return;
     $("block-global-list").innerHTML = `<p class="muted small pad">加载失败：${escapeHtml(
       error.message || "未知错误"
     )}</p>`;
@@ -2871,11 +2936,21 @@ async function loadBlocks() {
 async function loadGroupBlocks() {
   const data = state.currentGroup;
   if (!data) return;
+  const groupId = String(data.group_id);
+  const requestId = (state.groupBlocksSeq || 0) + 1;
+  state.groupBlocksSeq = requestId;
   try {
-    const result = await callApi("GET", "blocks", { group_id: data.group_id });
+    const result = await callApi("GET", "blocks", { group_id: groupId });
+    if (
+      requestId !== state.groupBlocksSeq ||
+      String(state.currentGroup?.group_id || "") !== groupId
+    ) {
+      return;
+    }
     state.groupBlocks = result.group || [];
     renderGroupBlocks();
   } catch (error) {
+    if (requestId !== state.groupBlocksSeq) return;
     const box = $("group-block-list");
     if (box) {
       box.innerHTML = `<p class="muted small pad">加载失败：${escapeHtml(
@@ -3181,6 +3256,8 @@ function showGroupsSkeleton() {
 }
 
 async function loadRagList() {
+  const requestId = (state.rag.requestId || 0) + 1;
+  state.rag.requestId = requestId;
   showRagSkeleton();
   if (state.rag.selectMode) {
     state.rag.selected.clear();
@@ -3204,6 +3281,8 @@ async function loadRagList() {
   if (state.rag.archivedOnly) params.archived_only = 1;
   try {
     const data = await callApi("GET", "rag/list", params);
+    // 慢请求不能覆盖后来的筛选/翻页结果。
+    if (requestId !== state.rag.requestId) return;
     state.rag.total = Number(data.total || 0);
     state.rag.hasMore = Boolean(data.has_more);
     const totalPages = Math.max(1, Math.ceil(state.rag.total / state.rag.pageSize));
@@ -3226,7 +3305,9 @@ async function loadRagList() {
     $("rag-prev").disabled = state.rag.page <= 1;
     $("rag-next").disabled = !state.rag.hasMore;
   } catch (error) {
-    toast(error.message || "加载记忆列表失败", true);
+    if (requestId === state.rag.requestId) {
+      toast(error.message || "加载记忆列表失败", true);
+    }
   }
 }
 
@@ -4012,6 +4093,29 @@ const BUTTON_LOCK_MAX_MS = 6000;
 const lockedButtons = new Map();
 let lockMonitorTimer = 0;
 
+/** 给按钮加加载锁；同一次点击只登记一次，由 unlockButton 释放。 */
+function lockButton(button) {
+  if (!button || lockedButtons.has(button)) return;
+  const entry = {
+    startedAt:
+      typeof performance !== "undefined" && performance.now
+        ? performance.now()
+        : Date.now(),
+    startedAtCount: apiStartedCount,
+    spinner: null,
+  };
+  const spinner = document.createElement("span");
+  spinner.className = "btn-spinner";
+  spinner.setAttribute("aria-hidden", "true");
+  button.appendChild(spinner);
+  entry.spinner = spinner;
+  button.classList.add("btn-loading");
+  button.setAttribute("aria-busy", "true");
+  button.dataset.locking = "1";
+  lockedButtons.set(button, entry);
+  ensureLockMonitor();
+}
+
 /** 解锁单个按钮并清理加载态标记。 */
 function unlockButton(button) {
   const entry = lockedButtons.get(button);
@@ -4502,6 +4606,7 @@ function bindEvents() {
     const opened = $("drawer").classList.contains("open");
     opened ? closeDrawer() : openDrawer();
   });
+  state.menuBound = true;
   // r3.3r：长按左上角胶囊 800ms = 强制恢复界面（遮罩/面板/按钮锁卡死时的逃生口）。
   bindMenuLongPressRecovery();
   bindPushGesture();
@@ -4745,6 +4850,11 @@ function bindEvents() {
   $("dev-prompt-save")?.addEventListener("click", () => void saveDevPrompts());
   // 开发者模式保留「界面诊断」入口；注意它会切页，抓现场请用 Tab 连点 5 次。
   $("dev-diag")?.addEventListener("click", () => showUiDiagnostics());
+  $("ui-diag-close")?.addEventListener("click", hideUiDiagnostics);
+  $("ui-diag-recover")?.addEventListener("click", () => {
+    hideUiDiagnostics();
+    recoverUiState("diagnostics");
+  });
   installButtonFeedback();
 }
 
@@ -4760,10 +4870,13 @@ async function init() {
     // r3.3r：单个绑定失败不能让整页事件全部失效。
     console.error("[ActiveReply] 事件绑定失败，保留已绑定部分", error);
     bindMenuLongPressRecovery();
-    $("menu-btn")?.addEventListener("click", () => {
-      const opened = $("drawer")?.classList.contains("open");
-      opened ? closeDrawer() : openDrawer();
-    });
+    if (!state.menuBound) {
+      state.menuBound = true;
+      $("menu-btn")?.addEventListener("click", () => {
+        const opened = $("drawer")?.classList.contains("open");
+        opened ? closeDrawer() : openDrawer();
+      });
+    }
     $("scrim")?.addEventListener("click", () => {
       if ($("detail")?.classList.contains("open")) closeDetail();
       else closeDrawer();
