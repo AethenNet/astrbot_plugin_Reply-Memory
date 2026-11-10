@@ -21,27 +21,13 @@ except Exception:  # pragma: no cover - 取决于运行环境
 
 
 # F26：维度不一致（通常是换了 embedding 模型）以前静默过滤，语义召回声量
-# 变小却没有任何提示。这里只计数 + 同类只告警一次，返回语义仍是 -1.0。
-_dimension_mismatch_count = 0
+# 变小却没有任何提示。这里同类只告警一次，返回语义仍是 -1.0。
 _dimension_mismatch_warned = False
-
-
-def dimension_mismatch_count() -> int:
-    """返回本次进程内检测到的维度不一致次数（供测试/诊断使用）。"""
-    return _dimension_mismatch_count
-
-
-def reset_dimension_mismatch_stats() -> None:
-    """重置维度不一致计数与告警状态（测试用）。"""
-    global _dimension_mismatch_count, _dimension_mismatch_warned
-    _dimension_mismatch_count = 0
-    _dimension_mismatch_warned = False
 
 
 def _note_dimension_mismatch(expected: int, actual: int) -> None:
     """记录一次维度不一致；同一进程内只告警一次，避免刷屏。"""
-    global _dimension_mismatch_count, _dimension_mismatch_warned
-    _dimension_mismatch_count += 1
+    global _dimension_mismatch_warned
     if _dimension_mismatch_warned:
         return
     _dimension_mismatch_warned = True
@@ -166,7 +152,4 @@ def _python_cosine(query: Sequence[float], value: Any) -> float:
 
 __all__ = [
     "cosine_scores",
-    "dimension_mismatch_count",
-    "numpy_available",
-    "reset_dimension_mismatch_stats",
 ]

@@ -1143,6 +1143,18 @@ class ActiveReplyPlugin(MemoryOpsMixin, star.Star):
                 ["POST"],
                 "重置群配置",
             ),
+            (
+                f"/{PLUGIN_NAME}/tour/state",
+                self.page_api.get_tour_state,
+                ["GET"],
+                "引导状态",
+            ),
+            (
+                f"/{PLUGIN_NAME}/tour/seen",
+                self.page_api.mark_tour_seen,
+                ["POST"],
+                "标记引导已看",
+            ),
             (f"/{PLUGIN_NAME}/rag/stats", self.page_api.rag_stats, ["GET"], "记忆统计"),
             (f"/{PLUGIN_NAME}/rag/list", self.page_api.rag_list, ["GET"], "记忆列表"),
             (
@@ -1186,6 +1198,12 @@ class ActiveReplyPlugin(MemoryOpsMixin, star.Star):
                 self.page_api.prompt_preview,
                 ["POST"],
                 "最终提示词预览",
+            ),
+            (
+                f"/{PLUGIN_NAME}/rag/repair_kinds",
+                self.page_api.rag_repair_kinds,
+                ["POST"],
+                "修复记忆分类",
             ),
             (
                 f"/{PLUGIN_NAME}/rag/cleanup",
@@ -1487,9 +1505,6 @@ class ActiveReplyPlugin(MemoryOpsMixin, star.Star):
         # 被 @ / 引用 / @全体 的消息会走 AstrBot 的正常回复流程，
         # 这里只记录历史，不再额外触发主动回复，避免一条消息回两次。
         if getattr(event, "is_at_or_wake_command", False):
-            return
-
-        if not cfg.group_context.enable and not cfg.active_reply.enable:
             return
 
         if not cfg.active_reply.enable:
@@ -2110,9 +2125,6 @@ class ActiveReplyPlugin(MemoryOpsMixin, star.Star):
                 message = plugin._transform_outgoing(event, message)
             except Exception as exc:  # 兜底失败不能影响正常发送
                 logger.debug(f"[ActiveReply] 发送前标签清理失败: {exc}")
-                message = message
-            if message is None:  # 清理后什么都不剩，直接跳过发送
-                return None
             return await original(message)
 
         try:
@@ -2514,16 +2526,7 @@ class ActiveReplyPlugin(MemoryOpsMixin, star.Star):
                         f"{bool(getattr(resp, 'is_chunk', False))}，"
                         f"raw={type(getattr(resp, 'raw_completion', None)).__name__}）"
                     )
-                self._journal(
-                    origin,
-                    "模型响应完成 | usage=%s"
-                    % ("有" if self._usage_totals(resp) is not None else "无"),
-                )
-                logger.debug(
-                    "[ActiveReply] 模型未返回 token 用量 | origin=%s is_chunk=%s",
-                    origin,
-                    getattr(resp, "is_chunk", False),
-                )
+                self._journal(origin, "模型响应完成 | usage=无")
         except Exception as exc:
             logger.debug(f"[ActiveReply] 记录 token 用量失败: {exc}")
 
@@ -2739,32 +2742,27 @@ class ActiveReplyPlugin(MemoryOpsMixin, star.Star):
             return
         lines = ["【记忆总结】"]
         written = saved or duplicates
-        if written:
-            item = written[0]
+        if written or dropped:
+            item = written[0] if written else dropped[0]
             lines.append(str(item.get("content") or ""))
             tier = str(item.get("confidence_tier") or "").strip()
             tier_text = f"（{tier}）" if tier else ""
             lines.append(f"置信度：{float(item.get('confidence') or 0):.2f}{tier_text}")
-        elif dropped:
-            item = dropped[0]
-            lines.append(str(item.get("content") or ""))
-            tier = str(item.get("confidence_tier") or "").strip()
-            tier_text = f"（{tier}）" if tier else ""
-            lines.append(f"置信度：{float(item.get('confidence') or 0):.2f}{tier_text}")
-            reason = str(item.get("reason") or "")
-            if reason == "low_confidence":
-                lines.append(
-                    "本次未写入：置信度 "
-                    f"{float(item.get('confidence') or 0):.2f} 低于最低置信度配置。"
-                )
-            elif reason == "evidence_missing":
-                lines.append(
-                    "本次未写入：摘要里的引文在原始消息中找不到（证据校验未通过）。"
-                )
-            elif reason == "no_roles":
-                lines.append("本次未写入：找不到可关联的真实参与者。")
-            else:
-                lines.append("本次未写入：置信度不足或证据不足（详见记忆日志）。")
+            if not written:
+                reason = str(item.get("reason") or "")
+                if reason == "low_confidence":
+                    lines.append(
+                        "本次未写入：置信度 "
+                        f"{float(item.get('confidence') or 0):.2f} 低于最低置信度配置。"
+                    )
+                elif reason == "evidence_missing":
+                    lines.append(
+                        "本次未写入：摘要里的引文在原始消息中找不到（证据校验未通过）。"
+                    )
+                elif reason == "no_roles":
+                    lines.append("本次未写入：找不到可关联的真实参与者。")
+                else:
+                    lines.append("本次未写入：置信度不足或证据不足（详见记忆日志）。")
         else:
             reason = str(diag.get("reason") or "")
             reason_text = {
@@ -3858,8 +3856,7 @@ class ActiveReplyPlugin(MemoryOpsMixin, star.Star):
             logger.warning(f"[ActiveReply] 图片下载失败: {exc}")
             return ""
 
-    @staticmethod
-    def _encode_image(image_path: str) -> tuple[str, str]:
+    def _encode_image(self, image_path: str) -> tuple[str, str]:
         """读取并编码图片，返回 Base64 内容与 MIME 类型。
 
         Raises:

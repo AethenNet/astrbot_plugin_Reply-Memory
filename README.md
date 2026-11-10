@@ -8,7 +8,7 @@
 
 [![AstrBot](https://img.shields.io/badge/AstrBot-%3E%3D4.29.0-4b8bf5)](https://docs.astrbot.app/dev/star/plugin-new.html)
 [![Python](https://img.shields.io/badge/Python-%3E%3D3.10-3776ab)](https://www.python.org/)
-[![Version](https://img.shields.io/badge/version-v1.1.0--beta.4-12a37a)](./CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-v1.1.0--beta.5-12a37a)](./CHANGELOG.md)
 [![GitHub](https://img.shields.io/badge/GitHub-astrbot__plugin__Reply--Memory-181717?logo=github)](https://github.com/AethenNet/astrbot_plugin_Reply-Memory)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-blue)](./LICENSE)
 
@@ -32,7 +32,7 @@
 
 ActiveReply 是面向 AstrBot 的群聊增强插件，把主动回复、群聊上下文、长期记忆 RAG、用户屏蔽和可视化控制台组合在一起。
 
-当前版本：**v1.1.0-beta.4**。本版重点：
+当前版本：**v1.1.0-beta.5**。本版重点：
 
 - 记忆采用「事件 + 原子记忆」两层结构；
 - 重要性统一为 0–10，并按类型设置有效期与半衰期；

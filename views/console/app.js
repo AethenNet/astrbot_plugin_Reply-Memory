@@ -12,7 +12,7 @@
  * 已持久化数据。各视图函数只负责当前页面区域，避免一次操作重建无关页面。
  */
 
-const UI_BUILD = 30;
+const UI_BUILD = 35;
 console.info(`[ActiveReply] UI build ${UI_BUILD}`);
 
 const bridge = window.AstrBotPluginView || window.AstrBotPluginPage || null;
@@ -84,6 +84,7 @@ const state = {
   view: "overview",
   overview: null,
   groups: [],
+  groupsLoaded: false,
   groupSearch: "",
   currentGroupId: "",
   currentGroup: null,
@@ -111,6 +112,7 @@ const state = {
     scope: "",
     role: "",
     memoryType: "",
+    kind: "",
     identity: "",
     // r3.3l：生命周期筛选（即将过期/已过期/低价值将归档/长期未访问）。
     lifecycle: "",
@@ -120,11 +122,12 @@ const state = {
     selectMode: false,
     selected: new Set(),
     items: [],
+    loadedOnce: false,
     scopes: [],
     // r3.3l：服务端返回的当前生效遗忘规则（用于顶部摘要与时间线）。
     rules: null,
   },
-  // r3.3：开发者模式鉴权状态；令牌只保存在内存中，进入/离开页面都会清空。
+  // r3.3：开发者选项鉴权状态；令牌只保存在内存中，进入/离开页面都会清空。
   dev: { token: "", authed: false },
 };
 
@@ -144,7 +147,7 @@ const SECTION_ICONS = {
 
 /** 按图标名生成引用 SVG sprite 的标记。 */
 function icon(name) {
-  return `<svg class="icon" aria-hidden="true"><use href="#i-${name}"></use></svg>`;
+  return `<span class="icon icon-${name}" aria-hidden="true"></span>`;
 }
 
 const FIELD_GROUPS = [
@@ -162,7 +165,7 @@ const FIELD_GROUPS = [
   {
     prefix: "memory_rag.",
     tab: "memory_rag",
-    title: "记忆 RAG",
+    title: "记忆",
   },
 ];
 
@@ -177,13 +180,20 @@ const $ = (id) => document.getElementById(id);
  * @param {*} value 任意待展示值。
  * @returns {string} 转义后的文本。
  */
+const HTML_ESCAPE_RE = /[&<>"']/g;
+const HTML_ESCAPE_MAP = {
+  "&": "&amp;",
+  "<": "&lt;",
+  ">": "&gt;",
+  '"': "&quot;",
+  "'": "&#39;",
+};
+
 function escapeHtml(value) {
-  return String(value ?? "")
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#39;");
+  return String(value ?? "").replace(
+    HTML_ESCAPE_RE,
+    (char) => HTML_ESCAPE_MAP[char]
+  );
 }
 
 let toastTimer = null;
@@ -225,6 +235,38 @@ function toast(message, isError = false) {
   node.classList.add("show");
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => node.classList.remove("show"), 2400);
+}
+
+/** 复制文本；Clipboard API 在 iframe/WebView 中可能被拒绝，回退到 execCommand。 */
+async function copyTextToClipboard(text) {
+  const value = String(text ?? "");
+  let clipboardError = null;
+  if (navigator.clipboard && typeof navigator.clipboard.writeText === "function") {
+    try {
+      await navigator.clipboard.writeText(value);
+      return;
+    } catch (error) {
+      clipboardError = error;
+    }
+  }
+  const textarea = document.createElement("textarea");
+  textarea.value = value;
+  textarea.setAttribute("readonly", "");
+  textarea.style.position = "fixed";
+  textarea.style.top = "-9999px";
+  textarea.style.left = "-9999px";
+  textarea.style.opacity = "0";
+  document.body.appendChild(textarea);
+  try {
+    textarea.focus();
+    textarea.select();
+    textarea.setSelectionRange(0, value.length);
+    if (!document.execCommand("copy")) {
+      throw clipboardError || new Error("execCommand copy failed");
+    }
+  } finally {
+    textarea.remove();
+  }
 }
 
 /** 进行中的接口请求数；按钮加载锁据此判断“请求是否真的结束”（F42）。 */
@@ -290,12 +332,6 @@ function cleanHint(text) {
   return String(text || "").trim().replace(/[。.]+$/, "");
 }
 
-/** 将长文本压成单行摘要，超长部分用省略号标识。 */
-function clip(text, max = 110) {
-  const source = String(text || "").replace(/\s+/g, " ").trim();
-  return source.length > max ? `${source.slice(0, max)}…` : source;
-}
-
 /** 按点分隔路径读取 schema 对应的嵌套配置值。 */
 function getPath(obj, path) {
   let current = obj;
@@ -320,8 +356,7 @@ function setPath(obj, path, value) {
 }
 
 /** 固定占位图：任何头像处理失败时的兜底，保证页面渲染不中断。 */
-const SAFE_AVATAR_FALLBACK =
-  "data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='100' height='100'%3E%3Crect width='100' height='100' rx='26' fill='%233b82f6'/%3E%3Ctext x='50' y='64' font-size='46' text-anchor='middle' fill='%23fff' font-family='sans-serif'%3E%23%3C/text%3E%3C/svg%3E";
+const SAFE_AVATAR_FALLBACK = "./assets/avatar-fallback.svg";
 
 /** 生成 QQ 群头像地址；只接受纯数字群号，其它值回退本地占位图。 */
 function avatarUrl(groupId) {
@@ -331,43 +366,9 @@ function avatarUrl(groupId) {
     : "";
 }
 
-/** 把任意字符串修成合法的 UTF-16；孤立代理项会让 encodeURIComponent 抛错。 */
-function wellFormedText(value) {
-  const text = String(value || "");
-  if (typeof text.toWellFormed === "function") return text.toWellFormed();
-  // 兼容旧浏览器：手工配对代理项，避免正则后行断言在旧内核上直接语法报错。
-  let output = "";
-  for (let index = 0; index < text.length; index += 1) {
-    const code = text.charCodeAt(index);
-    if (code >= 0xd800 && code <= 0xdbff) {
-      const next = text.charCodeAt(index + 1);
-      if (next >= 0xdc00 && next <= 0xdfff) {
-        output += text[index] + text[index + 1];
-        index += 1;
-      }
-      continue;
-    }
-    if (code >= 0xdc00 && code <= 0xdfff) continue;
-    output += text[index];
-  }
-  return output;
-}
-
-/** 生成无需远程请求的 SVG 首字占位头像；按完整码点取字，emoji 不会被截断。 */
-function fallbackAvatar(name) {
-  const text = wellFormedText(name).trim() || "#";
-  const letter = Array.from(text)[0] || "#";
-  const svg =
-    '<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100">' +
-    '<rect width="100" height="100" rx="26" fill="#3b82f6"/>' +
-    `<text x="50" y="64" font-size="46" text-anchor="middle" fill="#fff" font-family="sans-serif">${escapeHtml(letter)}</text>` +
-    "</svg>";
-  try {
-    return `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`;
-  } catch (error) {
-    // 极端输入（孤立代理项等）不能让一次头像渲染中断整个群列表。
-    return SAFE_AVATAR_FALLBACK;
-  }
+/** 头像加载失败时使用 views/console/assets 下的静态占位图。 */
+function fallbackAvatar(_name) {
+  return SAFE_AVATAR_FALLBACK;
 }
 
 /* ------------------------------------------------------------------ */
@@ -380,12 +381,10 @@ const THEME_LABELS = {
   light: "日间模式",
   dark: "夜间模式",
 };
-const THEME_ICONS = {
-  system:
-    "M4 3h16a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2ZM8 21h8M12 17v4",
-  light:
-    "M12 8a4 4 0 1 0 0 8a4 4 0 1 0 0-8ZM12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41",
-  dark: "M12 3a6 6 0 0 0 9 9a9 9 0 1 1-9-9Z",
+const THEME_ICON_CLASSES = {
+  system: "icon-theme-system",
+  light: "icon-theme-light",
+  dark: "icon-theme-dark",
 };
 
 /** 将 AstrBot 面板提供的主题状态映射到 body 属性与状态徽标。 */
@@ -407,17 +406,26 @@ function loadThemeMode() {
 
 /** 把主题图标切换到对应形状（带 Morphicons 形变）。 */
 function setThemeIcon(mode) {
-  const next = THEME_ICONS[mode] || THEME_ICONS.system;
-  if (themeMorph) {
+  const key = THEME_CYCLE.includes(mode) ? mode : "system";
+  if (themeMorph && MORPH_PATHS[`theme-${key}`]) {
     try {
-      themeMorph.morphTo(next);
+      themeMorph.morphTo(MORPH_PATHS[`theme-${key}`]);
       return;
     } catch (error) {
       themeMorph = null;
     }
   }
-  const path = $("theme-path");
-  if (path) path.setAttribute("d", next);
+  const next = THEME_ICON_CLASSES[key];
+  const morphPath = document.getElementById("theme-morph-path");
+  if (morphPath && MORPH_PATHS[`theme-${key}`]) {
+    morphPath.setAttribute("d", MORPH_PATHS[`theme-${key}`]);
+    return;
+  }
+  const node = $("theme-icon");
+  if (!node) return;
+  for (const cls of Object.values(THEME_ICON_CLASSES)) {
+    node.classList.toggle(cls, cls === next);
+  }
 }
 
 /** 应用主题模式：system 跟随系统，light/dark 为手动覆盖。 */
@@ -456,35 +464,333 @@ function cycleTheme() {
 /** 切换主视图与导航选中态，并按页面类型触发对应数据加载。 */
 let scrolledRaf = 0;
 
-/** Tab 栏贴到浮动顶栏时扩大渐隐，其余时间保持 10px 常态。 */
+/** 在 Tab 栏前放一个固定锚点；无论 Tab 是否搬走，都用它的位置判定。 */
+function ensureTabsAnchor(head) {
+  if (head._tabsAnchor && head._tabsAnchor.isConnected) return head._tabsAnchor;
+  const anchor = document.createElement("div");
+  anchor.className = "tabs-flow-anchor";
+  head.insertAdjacentElement("beforebegin", anchor);
+  head._tabsAnchor = anchor;
+  return anchor;
+}
+
+/** 给离开原位置的 Tab 栏加占位，避免正文跳动。 */
+function ensureTabsGap(head, height = 0) {
+  let gap = document.createElement("div");
+  gap.className = "tabs-flow-gap";
+  gap.style.height = `${Math.max(0, Math.round(height))}px`;
+  head.insertAdjacentElement("afterend", gap);
+  return gap;
+}
+
+/** 将 Tab 栏搬回内容流原位置。 */
+function restoreTabsHead(head) {
+  if (!head || !head._tabsHome) return;
+  head._tabsHome.insertBefore(head, head._tabsGap);
+  if (head._tabsGap) head._tabsGap.remove();
+  delete head._tabsHome;
+  delete head._tabsGap;
+  head.classList.remove("tabs-in-topbar");
+}
+
+function restoreAllTabsHeads() {
+  document.querySelectorAll(".sticky-head.tabs-in-topbar").forEach(restoreTabsHead);
+}
+
+/** FLIP 包裹：位移用 translate，长度用 Tab 表面的 scaleX 视觉收缩，不裁切、不改布局。 */
+function animateTabsChange(head, change) {
+  head._tabsBusy = true;
+  const oldRect = head.getBoundingClientRect();
+  change();
+  const newRect = head.getBoundingClientRect();
+  if (!oldRect.width || !oldRect.height || !newRect.width || !newRect.height) {
+    head._tabsBusy = false;
+    return;
+  }
+  const dx = oldRect.left - newRect.left;
+  const dy = oldRect.top - newRect.top;
+  const startScale = Math.max(0.2, Math.min(1.8, oldRect.width / newRect.width));
+  const surface = head.querySelector(".seg") || head;
+  surface.getAnimations?.().forEach((animation) => animation.cancel());
+  surface.style.transformOrigin = "left center";
+  let finished = false;
+  let tabAnimations = [];
+  const finish = () => {
+    if (finished) return;
+    finished = true;
+    tabAnimations.forEach((animation) => animation.cancel());
+    tabAnimations = [];
+    head._tabsBusy = false;
+    head.style.transform = "";
+    surface.style.transform = "";
+    surface.style.transformOrigin = "";
+    window.setTimeout(() => updateScrolledClass(), 0);
+  };
+  if (typeof head.animate === "function") {
+    tabAnimations = [
+      head.animate(
+        [
+          { transform: `translate(${dx}px, ${dy}px)` },
+          { transform: "translate(0, 0)" },
+        ],
+        {
+          duration: 500,
+          easing: "cubic-bezier(0.22, 0.7, 0.2, 1)",
+          fill: "both",
+        }
+      ),
+      surface.animate(
+        [{ transform: `scaleX(${startScale})` }, { transform: "scaleX(1)" }],
+        {
+          duration: 500,
+          easing: "cubic-bezier(0.22, 0.7, 0.2, 1)",
+          fill: "both",
+        }
+      ),
+    ];
+    window.setTimeout(finish, 620);
+    return;
+  }
+  head.style.transition = "none";
+  head.style.transform = `translate(${dx}px, ${dy}px)`;
+  surface.style.transform = `scaleX(${startScale})`;
+  void head.offsetWidth;
+  requestAnimationFrame(() => {
+    head.style.transition = "transform 0.5s cubic-bezier(0.22, 0.7, 0.2, 1)";
+    surface.style.transition = "transform 0.5s cubic-bezier(0.22, 0.7, 0.2, 1)";
+    head.style.transform = "";
+    surface.style.transform = "scaleX(1)";
+    head.addEventListener("transitionend", finish, { once: true });
+    window.setTimeout(finish, 620);
+  });
+}
+
+/** 把 Tab 栏搬进浮动顶栏，位于菜单和主题按钮之间。 */
+function mountTabsHead(head) {
+  if (!head || head._tabsHome) return;
+  const home = head.parentElement;
+  if (!home) return;
+  const topbar = document.querySelector(".floating-controls");
+  const theme = topbar ? topbar.querySelector(".topbar-right") : null;
+  if (!topbar || !theme) return;
+  const oldRect = head.getBoundingClientRect();
+  const style = getComputedStyle(head);
+  const flowHeight =
+    head.offsetHeight +
+    (parseFloat(style.marginTop) || 0) +
+    (parseFloat(style.marginBottom) || 0);
+  ensureTabsAnchor(head);
+  const gap = ensureTabsGap(head, flowHeight);
+  gap.style.overflowAnchor = "none";
+  head.style.overflowAnchor = "none";
+  head._tabsHome = home;
+  head._tabsGap = gap;
+  head.classList.add("tabs-in-topbar");
+  animateTabsChange(head, () => {
+    topbar.insertBefore(head, theme);
+  });
+}
+
+/** 滚动事件本身已按帧合并，直接响应，不再额外延迟。 */
 function updateTabsAtTop() {
-  // 键盘展开时视口仍在动画中，算出的吸顶/渐变高度不可信且会制造合成层抖动。
-  if (isKeyboardViewportOpen()) return;
+  applyTabsAtTop();
+}
+
+/** 根据当前位置决定 Tab 是否搬入/搬出顶栏。 */
+function applyTabsAtTop() {
   const active = document.querySelector(".view.active");
-  const tabs = active ? active.querySelector(".tabs.seg") : null;
-  let atTop = false;
-  let fadeH = 0;
-  if (tabs) {
-    const capsule = document.querySelector(".menu-capsule");
-    const capBottom = capsule ? capsule.getBoundingClientRect().bottom : 0;
-    const rect = tabs.getBoundingClientRect();
-    // 触发窗口必须包含整行 Tab 的高度：实机截图里 Tab 顶在胶囊下方约 26px 时
-    // 只差 +4 的判定不成立，条件类永远不触发，高度修复也就不会生效
-    atTop = rect.top <= capBottom + rect.height + 8;
-    // 盖住整个 Tab 行（到 Tab 底部），再加 10px 渐隐；只盖胶囊+10 会让 Tab 下半截露出来
-    fadeH = Math.max(capBottom + 10, rect.bottom + 10);
+  const ownHead = active ? active.querySelector(".sticky-head") : null;
+  const mounted = document.querySelector(
+    ".floating-controls > .sticky-head.tabs-in-topbar"
+  );
+  const head =
+    ownHead ||
+    (mounted && active && mounted._tabsHome && active.contains(mounted._tabsHome)
+      ? mounted
+      : null);
+  const tabs = head ? head.querySelector(".tabs.seg") : null;
+  const capsule = document.querySelector(".menu-capsule");
+  const capBottom = capsule ? capsule.getBoundingClientRect().bottom : 0;
+
+  // 手机端保留原方案：只用原 Tab 位置计算顶部渐隐，不做搬移。
+  if (!isDesktopLayout()) {
+    restoreAllTabsHeads();
+    const mobileTabs = active ? active.querySelector(".tabs.seg") : null;
+    let atTop = false;
+    let fadeH = 0;
+    if (mobileTabs) {
+      const rect = mobileTabs.getBoundingClientRect();
+      atTop = rect.top <= capBottom + rect.height + 8;
+      fadeH = Math.max(capBottom + 10, rect.bottom + 10);
+    }
+    document.body.classList.toggle("tabs-at-top", atTop);
+    if (atTop) {
+      document.body.style.setProperty("--tabs-fade-h", `${Math.round(fadeH)}px`);
+    } else {
+      document.body.style.removeProperty("--tabs-fade-h");
+    }
+    return;
+  }
+
+  if (isKeyboardViewportOpen()) return;
+  if (head && head._tabsBusy) return;
+  // 切页后旧页的 Tab 可能还挂在顶栏，先搬回旧页。
+  document.querySelectorAll(".sticky-head.tabs-in-topbar").forEach((node) => {
+    if (node !== head) restoreTabsHead(node);
+  });
+  if (!tabs || !head) {
+    restoreAllTabsHeads();
+    document.body.classList.remove("tabs-at-top");
+    return;
+  }
+  // 直接看固定锚点是否进入顶栏；锚点不随 Tab 搬移而变化。
+  // 动画期间的 busy 锁避免同一帧反复触发。
+  const anchorRect = ensureTabsAnchor(head).getBoundingClientRect();
+  const atTop = anchorRect.top <= capBottom + 8;
+  if (atTop && !head._tabsHome) {
+    mountTabsHead(head);
+  } else if (!atTop && head._tabsHome) {
+    animateTabsChange(head, () => restoreTabsHead(head));
   }
   document.body.classList.toggle("tabs-at-top", atTop);
   if (atTop) {
-    document.body.style.setProperty("--tabs-fade-h", `${Math.round(fadeH)}px`);
+    document.body.style.setProperty(
+      "--tabs-fade-h",
+      `${Math.round(capBottom + 10)}px`
+    );
   } else {
     document.body.style.removeProperty("--tabs-fade-h");
   }
 }
 
 /** 页面是否已滚离顶部：控制顶部渐隐，避免正文穿到浮层按钮下面。 */
+function pageScrollTop() {
+  const pane = document.querySelector("#main-pane");
+  if (pane) {
+    const overflowY = getComputedStyle(pane).overflowY;
+    if (
+      (overflowY === "auto" || overflowY === "scroll") &&
+      pane.scrollHeight > pane.clientHeight
+    ) {
+      return pane.scrollTop;
+    }
+  }
+  return window.scrollY || 0;
+}
+
+/** 群信息条从原群头像位置缩放移动到顶栏，或反向退回。 */
+function animateGroupMiniHead(show) {
+  const mini = $("group-mini-head");
+  const avatar = $("group-avatar");
+  if (!mini || !avatar) return;
+  const avatarRect = avatar.getBoundingClientRect();
+  const topbar = parseFloat(
+    getComputedStyle(document.documentElement).getPropertyValue("--topbar-h")
+  ) || 56;
+  if (!avatarRect.width || !avatarRect.height) {
+    mini.classList.toggle("is-visible", show);
+    mini.setAttribute("aria-hidden", show ? "false" : "true");
+    return;
+  }
+  // 大卡已滚出顶栏时不再从屏幕外飞入，交给 CSS 在顶栏原位淡入/淡出。
+  if (avatarRect.bottom <= topbar + 4) {
+    if (!show) {
+      mini.classList.remove("is-visible");
+      mini.setAttribute("aria-hidden", "true");
+    }
+    return;
+  }
+  const targetRect = mini.getBoundingClientRect();
+  const fromRect = show ? avatarRect : targetRect;
+  const toRect = show ? targetRect : avatarRect;
+  if (!fromRect.width || !toRect.width) return;
+  const dx = fromRect.left - toRect.left;
+  const dy = fromRect.top - toRect.top;
+  const sx = fromRect.width / toRect.width;
+  const sy = fromRect.height / toRect.height;
+  mini.getAnimations?.().forEach((item) => item.cancel());
+  mini.style.transition = "none";
+  if (typeof mini.animate === "function") {
+    let finished = false;
+    const finish = () => {
+      if (finished) return;
+      finished = true;
+      mini.style.transition = "none";
+      if (!show) {
+        mini.classList.remove("is-visible");
+        mini.setAttribute("aria-hidden", "true");
+      }
+      window.setTimeout(() => {
+        mini.style.transition = "";
+      }, 20);
+    };
+    const animation = mini.animate(
+      [
+        {
+          transform: `translate(${dx}px, ${dy}px) scale(${sx}, ${sy})`,
+          opacity: show ? 0.35 : 1,
+        },
+        { transform: "translate(0, 0) scale(1)", opacity: show ? 1 : 0 },
+      ],
+      {
+        duration: 500,
+        easing: "cubic-bezier(0.22, 1, 0.36, 1)",
+        fill: "both",
+      }
+    );
+    animation.onfinish = () => {
+      animation.cancel();
+      finish();
+    };
+    window.setTimeout(finish, 650);
+  }
+}
+
+/** 手机端群页：群信息滚过顶栏后，把头像/群名/群号放进顶栏按钮中间。 */
+function updateGroupHeadStuck() {
+  const card = $("group-head-card");
+  const mini = $("group-mini-head");
+  const panel = $("group-panel");
+  const active =
+    !isDesktopLayout() &&
+    state.view === "groups" &&
+    panel &&
+    !panel.classList.contains("hidden") &&
+    card;
+  if (!active) {
+    if (mini) {
+      mini.classList.remove("is-visible");
+      mini.setAttribute("aria-hidden", "true");
+    }
+    document.body.classList.remove("group-head-stuck");
+    return;
+  }
+  const topbar = parseFloat(
+    getComputedStyle(document.documentElement).getPropertyValue("--topbar-h")
+  ) || 56;
+  const tabs = document.querySelector(".view.active .tabs.seg");
+  // 等 Tab 栏接近/贴到顶栏时，再把群信息大卡收成胶囊。
+  const stuck = Boolean(
+    tabs && tabs.getBoundingClientRect().top <= topbar + 80
+  );
+  const wasVisible = mini.classList.contains("is-visible");
+  document.body.classList.toggle("group-head-stuck", stuck);
+  if (stuck !== wasVisible) {
+    mini.classList.toggle("is-visible", stuck);
+    mini.setAttribute("aria-hidden", stuck ? "false" : "true");
+  }
+}
+
 function updateScrolledClass() {
-  document.body.classList.toggle("scrolled", window.scrollY > 8);
+  const pane = document.querySelector("#main-pane");
+  const paneScrolled = Boolean(
+    pane &&
+      (getComputedStyle(pane).overflowY === "auto" ||
+        getComputedStyle(pane).overflowY === "scroll") &&
+      pane.scrollTop > 8
+  );
+  document.body.classList.toggle("scrolled", paneScrolled || window.scrollY > 8);
+  updateGroupHeadStuck();
   updateTabsAtTop();
 }
 
@@ -497,7 +803,7 @@ function beginPanelClose() {
   panelClosingTimer = setTimeout(() => {
     document.body.classList.remove("panel-closing");
     updateScrolledClass();
-  }, 470);
+  }, 520);
 }
 
 function scheduleScrolledClass() {
@@ -518,7 +824,7 @@ function switchView(name) {
   });
   updateScrolledClass();
   pushScrollY = 0;
-  closeDrawer();
+  if (!isDesktopLayout()) closeDrawer();
   // r3.4o：切页不再自动滚动到表单位置，避免设置页 Tab 栏被强制吸顶跳转；
   // 页面保持进入前的滚动位置。
   if (apiInFlight === 0 && lockedButtons.size) {
@@ -546,34 +852,116 @@ function switchView(name) {
   }
 }
 
+const MORPH_BASE = "./assets/morph";
+const MORPH_PATHS = {};
+const BUTTON_MORPH_PATHS = {};
+const BUTTON_ICON_NAMES = [
+  "activity", "archive", "arrow-right", "check", "close", "database", "eye",
+  "funnel", "inbox", "layers", "left", "message", "refresh", "reset", "right",
+  "search", "select", "settings", "shield", "sliders", "sparkles", "theme-dark",
+  "theme-light", "theme-system", "trash", "users", "wrench",
+];
 let menuMorph = null;
 let themeMorph = null;
-const MENU_PATH_D = "M4 5h16M4 12h16M4 19h16";
-const CLOSE_PATH_D = "M18 6L6 18M6 6l12 12";
+let morphicons = null;
 
-/** 延迟载入 Morphicons 菜单/主题形变动画；依赖失败时保留静态图标能力。 */
+/** 从 views/console/assets/morph 的运行时副本读取单路径 SVG，供 Morphicons 形变。 */
+async function loadMorphPath(name) {
+  const response = await fetch(`${MORPH_BASE}/${name}.svg`, { cache: "force-cache" });
+  if (!response.ok) throw new Error(`morph ${name} ${response.status}`);
+  const text = await response.text();
+  const doc = new DOMParser().parseFromString(text, "image/svg+xml");
+  const d = doc.querySelector("path")?.getAttribute("d") || "";
+  if (!d) throw new Error(`morph ${name} has no path`);
+  return d;
+}
+
+/** 读取一个图标 SVG 的全部 path 数据（多子路径合并成一个 d）。 */
+async function loadIconPath(name) {
+  const response = await fetch(`./assets/icons/i-${name}.svg`, {
+    cache: "force-cache",
+  });
+  if (!response.ok) throw new Error(`icon ${name} ${response.status}`);
+  const text = await response.text();
+  const doc = new DOMParser().parseFromString(text, "image/svg+xml");
+  const d = [...doc.querySelectorAll("path")]
+    .map((node) => node.getAttribute("d") || "")
+    .filter(Boolean)
+    .join(" ");
+  if (!d) throw new Error(`icon ${name} has no path`);
+  return d;
+}
+
+/** 预加载按钮图标路径，供加载态 Morphicons 使用。 */
+async function preloadButtonMorphPaths() {
+  if (BUTTON_MORPH_PATHS.refresh) return;
+  const values = await Promise.all(
+    BUTTON_ICON_NAMES.map(async (name) => {
+      try {
+        BUTTON_MORPH_PATHS[name] = await loadIconPath(name);
+      } catch (error) {
+        // 单个图标缺失时只用刷新图标兜底。
+      }
+    })
+  );
+  return values;
+}
+
+function createMorphIcon(hostId, pathId, d) {
+  const host = $(hostId);
+  if (!host) return null;
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("class", "icon morph-icon");
+  svg.setAttribute("viewBox", "0 0 24 24");
+  svg.setAttribute("aria-hidden", "true");
+  const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+  path.id = pathId;
+  path.setAttribute("d", d);
+  svg.appendChild(path);
+  host.replaceWith(svg);
+  return path;
+}
+
+/** 加载外部 morph 路径并恢复菜单/主题形变动效。 */
 async function initMorphIcons() {
   try {
+    const names = ["menu", "close", "theme-system", "theme-light", "theme-dark"];
+    const values = await Promise.all(names.map((name) => loadMorphPath(name)));
+    names.forEach((name, index) => {
+      MORPH_PATHS[name] = values[index];
+    });
     const { createMorph } = await import("./vendor/morphicons/dom.js");
-    const path = document.getElementById("menu-path");
-    if (path) {
-      menuMorph = createMorph(path, MENU_PATH_D);
-      menuMorph.set(MENU_PATH_D);
+    morphicons = { createMorph };
+    await preloadButtonMorphPaths();
+    const menuPath = createMorphIcon("menu-icon", "menu-morph-path", MORPH_PATHS.menu);
+    if (menuPath) {
+      menuMorph = createMorph(menuPath, MORPH_PATHS.menu);
+      menuMorph.set(MORPH_PATHS.menu);
     }
-    const themePath = document.getElementById("theme-path");
+    const themePath = createMorphIcon(
+      "theme-icon",
+      "theme-morph-path",
+      MORPH_PATHS[`theme-${state.themeMode}`] || MORPH_PATHS["theme-system"]
+    );
     if (themePath) {
-      themeMorph = createMorph(themePath, THEME_ICONS[state.themeMode]);
-      themeMorph.set(THEME_ICONS[state.themeMode]);
+      themeMorph = createMorph(
+        themePath,
+        MORPH_PATHS[`theme-${state.themeMode}`] || MORPH_PATHS["theme-system"]
+      );
+      themeMorph.set(
+        MORPH_PATHS[`theme-${state.themeMode}`] || MORPH_PATHS["theme-system"]
+      );
     }
   } catch (error) {
-    console.warn("[ActiveReply] morphicons 加载失败，图标回退为静态切换", error);
+    // 文件不可达或旧 WebView 不支持动画时，保留 CSS mask 静态图标。
+    console.warn("[ActiveReply] Morphicons 外部路径加载失败", error);
   }
 }
 
-/** 将汉堡菜单图标切换为关闭图标，动画不可用时直接更新 SVG path。 */
+/** 将汉堡菜单图标在 menu/close 之间切换。 */
 function setMenuMorph(open) {
-  const next = open ? CLOSE_PATH_D : MENU_PATH_D;
-  if (menuMorph) {
+  const next = open ? MORPH_PATHS.close : MORPH_PATHS.menu;
+  if (menuMorph && next) {
     try {
       menuMorph.morphTo(next);
       return;
@@ -581,17 +969,62 @@ function setMenuMorph(open) {
       menuMorph = null;
     }
   }
-  const path = document.getElementById("menu-path");
-  if (path) path.setAttribute("d", next);
+  const morphPath = document.getElementById("menu-morph-path");
+  if (morphPath && next) morphPath.setAttribute("d", next);
+  const node = $("menu-icon");
+  if (node) {
+    node.classList.toggle("icon-menu", !open);
+    node.classList.toggle("icon-close", open);
+  }
 }
 
 let pushScrollY = 0;
 
 /** 卡片锁成 100dvh 时，用内容位移补偿页面滚动，视觉上停在原位。 */
 function setContentScrollOffset(scrollY) {
-  const content = document.querySelector("#main-pane > .content");
+  const content = document.querySelector(
+    "#main-pane > .content, #main-pane .content-viewport > .content"
+  );
   if (!content) return;
   content.style.transform = scrollY ? `translateY(${-scrollY}px)` : "";
+}
+
+/** PC 正文视口宽度用显式 px 动画，避免 100% → calc 不可插值导致瞬移。 */
+function animateContentViewport(viewport, fromWidth, toWidth) {
+  if (!viewport || !fromWidth || !toWidth || fromWidth === toWidth) return;
+  viewport.getAnimations?.().forEach((animation) => animation.cancel());
+  viewport.style.width = `${fromWidth}px`;
+  void viewport.offsetWidth;
+  let finished = false;
+  const finish = () => {
+    if (finished) return;
+    finished = true;
+    viewport.style.width = "";
+  };
+  if (typeof viewport.animate === "function") {
+    const animation = viewport.animate(
+      [{ width: `${fromWidth}px` }, { width: `${toWidth}px` }],
+      {
+        duration: 500,
+        easing: "cubic-bezier(0.16, 1, 0.3, 1)",
+        fill: "both",
+      }
+    );
+    animation.onfinish = () => {
+      animation.cancel();
+      finish();
+    };
+    window.setTimeout(finish, 620);
+    return;
+  }
+  viewport.style.transition = "width 0.5s cubic-bezier(0.16, 1, 0.3, 1)";
+  requestAnimationFrame(() => {
+    viewport.style.width = `${toWidth}px`;
+    window.setTimeout(() => {
+      viewport.style.transition = "";
+      finish();
+    }, 520);
+  });
 }
 
 /** 展开侧边栏并同步遮罩与无障碍状态。 */
@@ -604,10 +1037,17 @@ function openDrawer() {
   if (!$("drawer").classList.contains("open")) {
     pushScrollY = window.scrollY || 0;
   }
-  window.scrollTo(0, 0);
+  if (!isDesktopLayout()) window.scrollTo(0, 0);
   updateScrolledClass();
   $("main-pane").classList.add("is-pushed");
-  setContentScrollOffset(pushScrollY);
+  if (isDesktopLayout()) {
+    // PC 保持窗口滚动位置，body 锁滚动即可，避免先跳顶再补偿造成闪动。
+    setContentScrollOffset(0);
+  } else {
+    // 手机端沿用内容位移补偿。
+    setContentScrollOffset(pushScrollY);
+  }
+  updateScrolledClass();
   document.body.classList.add("drawer-open");
   $("drawer").classList.add("open");
   $("drawer").setAttribute("aria-hidden", "false");
@@ -625,6 +1065,7 @@ function closeDrawer() {
   // 手势中断等异常路径也要清掉内联位移,否则卡片会停在半开位置
   pane.style.transition = "";
   pane.style.transform = "";
+  pane.style.width = "";
   pane.style.borderRadius = "";
   pane.style.boxShadow = "";
   const veil = document.querySelector(".pane-veil");
@@ -635,10 +1076,12 @@ function closeDrawer() {
     drawer.style.transform = "";
   }
   clearFloatingControlsInline();
+  // 关键：关闭时必须移除推挤状态，否则抽屉已收起但主页仍停在右侧。
   pane.classList.remove("is-pushed");
+  if (!isDesktopLayout()) pane.scrollTop = 0;
   setContentScrollOffset(0);
   document.body.classList.remove("drawer-open");
-  if (wasOpen) window.scrollTo(0, pushScrollY);
+  if (wasOpen && !isDesktopLayout()) window.scrollTo(0, pushScrollY);
   updateScrolledClass();
   $("drawer").classList.remove("open");
   $("drawer").setAttribute("aria-hidden", "true");
@@ -659,7 +1102,12 @@ let dragState = null;
 
 /** 完全打开时主面板应右移的距离。 */
 function paneOpenWidth() {
-  return Math.round(window.innerWidth * OPEN_RATIO);
+  const drawer = $("drawer");
+  return drawer ? Math.round(drawer.offsetWidth) : Math.round(window.innerWidth * OPEN_RATIO);
+}
+
+function isDesktopLayout() {
+  return window.matchMedia("(min-width: 900px)").matches;
 }
 
 /** 抽屉当前是否处于打开状态。 */
@@ -675,7 +1123,13 @@ function dragPaneTo(offsetX) {
   const progress = offset / width;
   pane.style.transition = "none";
   const scale = 1 - (1 - DRAWER_SCALE) * progress;
-  pane.style.transform = `translateX(${offset}px) scale(${scale.toFixed(3)})`;
+  if (isDesktopLayout()) {
+    // PC：主面板收窄到剩余宽度，只挤压、不把右侧移出视口。
+    pane.style.width = `calc(100vw - ${offset}px)`;
+    pane.style.transform = `translateX(${offset}px)`;
+  } else {
+    pane.style.transform = `translateX(${offset}px) scale(${scale.toFixed(3)})`;
+  }
   const drawer = $("drawer");
   if (drawer) {
     drawer.style.transition = "none";
@@ -695,7 +1149,12 @@ function dragPaneTo(offsetX) {
   const controls = document.querySelector(".floating-controls");
   if (controls) {
     controls.style.transition = "none";
-    controls.style.transform = `translateX(${offset}px) scale(${scale.toFixed(3)})`;
+    if (isDesktopLayout()) {
+      controls.style.left = `${offset + 20}px`;
+      controls.style.transform = "none";
+    } else {
+      controls.style.transform = `translateX(${offset}px) scale(${scale.toFixed(3)})`;
+    }
   }
 }
 
@@ -712,6 +1171,7 @@ function endPaneDrag(commit) {
   const pane = $("main-pane");
   pane.style.transition = "";
   pane.style.transform = "";
+  pane.style.width = "";
   pane.style.borderRadius = "";
   pane.style.boxShadow = "";
   const drawer = $("drawer");
@@ -724,6 +1184,8 @@ function endPaneDrag(commit) {
     veil.style.transition = "";
     veil.style.opacity = "";
   }
+  const controls = document.querySelector(".floating-controls");
+  if (controls) controls.style.left = "";
   clearFloatingControlsInline();
   if (commit) openDrawer();
   else closeDrawer();
@@ -735,7 +1197,7 @@ function bindPushGesture() {
   const edge = $("pane-edge");
   if (!pane || !edge) return;
   edge.addEventListener("pointerdown", (event) => {
-    if (isDrawerOpen()) return;
+    if (isDesktopLayout() || isDrawerOpen()) return;
     if (event.pointerType === "mouse" && event.button !== 0) return;
     dragState = { startX: event.clientX, moved: 0 };
     try {
@@ -773,7 +1235,7 @@ function bindCloseGesture() {
   let clickTimer = null;
 
   scrim.addEventListener("pointerdown", (event) => {
-    if (!isDrawerOpen()) return;
+    if (isDesktopLayout() || !isDrawerOpen()) return;
     if ($("detail").classList.contains("open")) return; // 详情打开时只接受点击关闭
     if (event.pointerType === "mouse" && event.button !== 0) return;
     drag = { startX: event.clientX, moved: 0 };
@@ -813,6 +1275,7 @@ function bindCloseGesture() {
     endPaneDrag(true);
   });
   scrim.addEventListener("click", () => {
+    if (isDesktopLayout()) return;
     if (suppressClick) {
       suppressClick = false;
       return;
@@ -995,7 +1458,7 @@ function renderOverview(data) {
       `${(data.groups || []).length} 个已知群`
     ),
     statusCard(
-      "记忆 RAG",
+      "记忆",
       s.memory_rag ? "已开启" : "已关闭",
       ragEmbeddingHint(data.embedding),
       onOff(s.memory_rag)
@@ -1038,7 +1501,7 @@ function renderOverview(data) {
     ["React Pattern", s.react_pattern],
     ["智能回复", s.smart_reply],
     ["联网搜索", s.web_search],
-    ["记忆 RAG", s.memory_rag],
+    ["记忆", s.memory_rag],
   ];
   $("overview-switches").innerHTML = switches
     .map(
@@ -1232,11 +1695,13 @@ async function loadGroups(force = false) {
   }
   const requestId = (state.groupsSeq || 0) + 1;
   state.groupsSeq = requestId;
-  showGroupsSkeleton();
+  // 只有首次加载显示骨架；保存后强制刷新沿用现有列表。
+  if (!state.groupsLoaded) showGroupsSkeleton();
   try {
     const data = await callApi("GET", "groups", force ? { force: 1 } : {});
     if (requestId !== state.groupsSeq) return;
     state.groups = data.groups || [];
+    state.groupsLoaded = true;
     renderGroupList();
     renderDrawerGroups();
   } catch (error) {
@@ -1350,6 +1815,18 @@ function buildControl(field, value) {
   return `<input type="text" data-path="${path}" data-kind="str" value="${escapeHtml(value || "")}" />`;
 }
 
+/** 同步顶栏的独立配置按钮高亮。 */
+function syncGroupTopActions() {
+  const button = $("group-mini-independent");
+  const toggle = $("independent-toggle");
+  if (!button || !toggle) return;
+  const active = Boolean(toggle.checked);
+  button.classList.toggle("active", active);
+  button.setAttribute("aria-pressed", active ? "true" : "false");
+  const saveButton = $("group-mini-save");
+  if (saveButton) saveButton.disabled = $("save-group")?.disabled || false;
+}
+
 /** 组合当前群的三组配置表单，并重新绑定控件与 Tab 事件。 */
 function renderGroupPanel() {
   const data = state.currentGroup;
@@ -1362,12 +1839,17 @@ function renderGroupPanel() {
   $("group-name").textContent = data.name || "未命名群";
   $("group-id").textContent = String(data.group_id);
   bindAvatar($("group-avatar"), data.group_id, data.name || "");
+  $("group-mini-name").textContent = data.name || "未命名群";
+  $("group-mini-id").textContent = String(data.group_id);
+  bindAvatar($("group-mini-avatar"), data.group_id, data.name || "");
   $("independent-toggle").checked = independent;
+  syncGroupTopActions();
   $("save-hint").textContent = independent
     ? "当前为本群独立配置，会覆盖全局对应项"
     : "当前跟随全局配置；改完后先打开「独立配置」再保存";
   // 按钮保持可点击：未勾选「独立配置」时点击会触发红闪抖动提示
 
+  updateGroupHeadStuck();
   const panels = FIELD_GROUPS.map((group) => {
     const fields = (data.fields || []).filter((field) =>
       field.path.startsWith(group.prefix)
@@ -1601,7 +2083,9 @@ async function saveGroup() {
   } catch (error) {
     toast(error.message || "保存失败", true);
   } finally {
+    // 保存结束必须恢复按钮；之前误用了未定义的 toggle，异常导致按钮永久禁用。
     button.disabled = false;
+    syncGroupTopActions();
   }
 }
 
@@ -2300,7 +2784,7 @@ function renderStatsTray(stats) {
     <button id="stats-card-toggle" class="source-card-head" type="button">
       <span><b>记忆统计</b><span class="muted small">总数 / 来源 / 时间跨度</span></span>
       <span class="pill">${formatNumber(stats.total_memories)} 条</span>
-      <svg class="icon source-caret" aria-hidden="true"><use href="#i-arrow-right"></use></svg>
+      <span class="icon source-caret icon-arrow-right" aria-hidden="true"></span>
     </button>
     <div class="source-tray ${expanded ? "open" : ""}">
       <div class="stats-grid-mini">
@@ -2351,17 +2835,17 @@ function renderSourceCard(stats) {
     <button id="source-card-toggle" class="source-card-head" type="button">
       <span><b>记忆来源</b><span class="muted small">个人 / 群聊 / 私聊 / 未知</span></span>
       <span class="pill">${formatNumber(total)} 条</span>
-      <svg class="icon source-caret" aria-hidden="true"><use href="#i-arrow-right"></use></svg>
+      <span class="icon source-caret icon-arrow-right" aria-hidden="true"></span>
     </button>
     <div class="source-tray ${expanded ? "open" : ""}">
       ${rows
         .map(
           ([label, count, kind]) => `
-        <div class="source-row">
+        <div class="source-row${count === 0 ? " is-zero" : ""}">
           <span class="source-dot ${kind}"></span>
           <span class="source-label">${label}</span>
           <span class="source-count">${formatNumber(count)}</span>
-          <span class="source-bar"><i class="${kind}" style="width:${(count / barScale) * 100}%"></i></span>
+          <span class="source-bar"><i class="${kind}" style="width:${count === 0 ? 0 : (count / barScale) * 100}%"></i></span>
         </div>`
         )
         .join("")}
@@ -2471,6 +2955,9 @@ function renderRagRows(items) {
     body.closest("table")?.classList.toggle("is-selecting", state.rag.selectMode);
     body.innerHTML =
       '<tr><td colspan="4" class="muted center pad">当前筛选条件下没有记忆</td></tr>';
+    body.classList.remove("rag-fade-in");
+    void body.offsetWidth;
+    if (state.rag.loadedOnce) body.classList.add("rag-fade-in");
     syncRagBulkBar();
     return;
   }
@@ -2626,7 +3113,7 @@ function renderRagRows(items) {
                 item.memory_id
               )}" aria-pressed="${selected ? "true" : "false"}" aria-label="选择记忆 ${escapeHtml(
                 item.memory_id
-              )}"><svg class="icon" aria-hidden="true"><use href="#i-select"></use></svg></button>`
+              )}"><span class="icon icon-select" aria-hidden="true"></span></button>`
             : ""
         }<span class="mem-id-prefix">ID：</span><span class="mem-id-value">${escapeHtml(
           item.memory_id
@@ -2636,7 +3123,7 @@ function renderRagRows(items) {
         <td class="mem-toggle-cell">
           <button class="icon-btn mem-toggle" type="button" data-toggle="${escapeHtml(
             item.memory_id
-          )}" aria-label="展开记忆"><svg class="icon" aria-hidden="true"><use href="#i-arrow-right"></use></svg></button>
+          )}" aria-label="展开记忆"><span class="icon icon-arrow-right" aria-hidden="true"></span></button>
         </td>
       </tr>
       <tr class="mem-detail" data-mem-detail="${escapeHtml(item.memory_id)}">
@@ -2705,6 +3192,9 @@ function renderRagRows(items) {
     })
     .join("");
 
+  body.classList.remove("rag-fade-in");
+  void body.offsetWidth;
+  if (state.rag.loadedOnce) body.classList.add("rag-fade-in");
   body.closest("table")?.classList.toggle("is-selecting", state.rag.selectMode);
   syncRagBulkBar();
   body.querySelectorAll(".mem-row").forEach((row) => {
@@ -3070,12 +3560,10 @@ function renderAutoMemory(data) {
   if (!data) return;
   const memoryEnabled = data.memory_enabled !== false;
   const enabled = Boolean(data.enabled);
-  const status = $("auto-memory-status");
-  status.textContent = memoryEnabled ? (enabled ? "已开启" : "已关闭") : "记忆未启用";
-  status.className = `pill ${enabled && memoryEnabled ? "" : "muted-pill"}`;
   const toggle = $("auto-memory-toggle");
-  toggle.textContent = memoryEnabled ? (enabled ? "关闭" : "开启") : "未启用";
-  toggle.disabled = !memoryEnabled;
+  toggle.checked = Boolean(enabled && memoryEnabled);
+  // 总开关关闭时也要允许从自动记忆页打开，由后端联动两个开关。
+  toggle.disabled = false;
   const provider = data.provider_id ? data.provider_id : "跟随当前会话模型";
   const rows = [
     ["抽取模型", provider],
@@ -3105,8 +3593,8 @@ async function toggleAutoMemory() {
   const current = state.autoMemory;
   if (!current) return;
   const next = !current.enabled;
-  const button = $("auto-memory-toggle");
-  button.disabled = true;
+  const toggle = $("auto-memory-toggle");
+  toggle.disabled = true;
   try {
     const data = await callApi("POST", "memory/auto/toggle", { enable: next });
     state.autoMemory = data;
@@ -3117,7 +3605,8 @@ async function toggleAutoMemory() {
   } catch (error) {
     toast(error.message || "切换失败", true);
   } finally {
-    button.disabled = false;
+    toggle.disabled = false;
+    toggle.checked = Boolean(state.autoMemory?.enabled);
   }
 }
 
@@ -3127,6 +3616,14 @@ const RAG_SOURCE_LABELS = {
   group: "群聊",
   private: "私聊",
   unknown: "未知",
+};
+
+const RAG_KIND_LABELS = {
+  fact: "事实",
+  episode: "事件",
+  plan: "计划",
+  preference: "偏好",
+  relation: "关系",
 };
 
 /** 参与者身份筛选值的中文名（与筛选弹窗选项一致）。 */
@@ -3176,6 +3673,9 @@ function ragFilterSummary() {
   if (state.rag.memoryType) {
     parts.push(RAG_SOURCE_LABELS[state.rag.memoryType] || state.rag.memoryType);
   }
+  if (state.rag.kind) {
+    parts.push(RAG_KIND_LABELS[state.rag.kind] || state.rag.kind);
+  }
   if (state.rag.scope) {
     const scopeLabel = ragScopeLabel(state.rag.scope);
     if (scopeLabel) parts.push(scopeLabel);
@@ -3212,10 +3712,12 @@ function ragSkeletonRows(count = 6) {
     { length: count },
     () => `<tr class="mem-row skeleton-mem-row" aria-hidden="true">
       <td colspan="4" class="skeleton-mem-cell">
-        <span class="skeleton skeleton-line skeleton-line-id"></span>
-        <span class="skeleton skeleton-line skeleton-line-time"></span>
-        <span class="skeleton skeleton-line skeleton-line-scope"></span>
-        <span class="skeleton skeleton-arrow"></span>
+        <div class="skeleton-mem-card">
+          <span class="skeleton skeleton-line skeleton-line-id"></span>
+          <span class="skeleton skeleton-line skeleton-line-time"></span>
+          <span class="skeleton skeleton-line skeleton-line-scope"></span>
+          <span class="skeleton skeleton-arrow"></span>
+        </div>
       </td>
     </tr>`
   ).join("");
@@ -3260,7 +3762,8 @@ function showGroupsSkeleton() {
 async function loadRagList() {
   const requestId = (state.rag.requestId || 0) + 1;
   state.rag.requestId = requestId;
-  showRagSkeleton();
+  // 仅首次加载显示骨架；筛选、翻页、刷新保留当前列表。
+  if (!state.rag.loadedOnce) showRagSkeleton();
   if (state.rag.selectMode) {
     state.rag.selected.clear();
     syncRagBulkBar();
@@ -3274,6 +3777,7 @@ async function loadRagList() {
   if (state.rag.scope) params.group_scope = state.rag.scope;
   if (state.rag.role) params.role_id = state.rag.role;
   if (state.rag.memoryType) params.memory_type = state.rag.memoryType;
+  if (state.rag.kind) params.kind = state.rag.kind;
   // r3.3m：「已归档」视图下生命周期筛选无意义（后端也会忽略，这里同步隐藏）。
   if (state.rag.lifecycle && !state.rag.archivedOnly) {
     params.lifecycle = state.rag.lifecycle;
@@ -3300,6 +3804,7 @@ async function loadRagList() {
       return;
     }
     state.rag.items = Array.isArray(data.items) ? data.items : [];
+    state.rag.loadedOnce = true;
     renderRagRows(state.rag.items);
     $("rag-page-info").textContent = `第 ${state.rag.page} / ${totalPages} 页 · 共 ${formatNumber(
       state.rag.total
@@ -3347,6 +3852,8 @@ function toggleRagArchived() {
   }
   state.rag.page = 1;
   syncRagArchivedButton();
+  // 退出批量选择时同步刷新选择按钮/批量栏，避免按钮残留 active 高亮。
+  syncRagBulkBar();
   void loadRagList();
 }
 
@@ -3362,8 +3869,7 @@ function syncRagSelectButton() {
 
 function syncRagBulkBar() {
   const bar = $("rag-bulk-bar");
-  if (!bar) return;
-  bar.hidden = !state.rag.selectMode;
+  if (bar) bar.hidden = !state.rag.selectMode;
   const count = state.rag.selected.size;
   const countLabel = $("rag-bulk-count");
   if (countLabel) countLabel.textContent = `已选 ${count} 条`;
@@ -3374,17 +3880,28 @@ function syncRagBulkBar() {
   }
   const deleteBtn = $("rag-bulk-delete");
   if (deleteBtn) deleteBtn.disabled = count === 0;
+  // 无论批量栏是否存在都要同步选择按钮，避免按钮状态卡死。
   syncRagSelectButton();
 }
 
 /** 进入/退出批量选择模式；进入时清空旧选择。 */
 function toggleRagSelectMode(force) {
   const next = typeof force === "boolean" ? force : !state.rag.selectMode;
-  if (next === state.rag.selectMode) return;
+  if (next === state.rag.selectMode) {
+    // 即使状态没变也重新同步，修复历史遗留的 active 高亮卡住。
+    syncRagBulkBar();
+    return;
+  }
   state.rag.selectMode = next;
   state.rag.selected.clear();
-  renderRagRows(state.rag.items);
-  syncRagBulkBar();
+  // 先同步按钮，再重绘；即使渲染异常也不会把按钮高亮卡住。
+  syncRagSelectButton();
+  try {
+    renderRagRows(state.rag.items);
+  } finally {
+    syncRagBulkBar();
+    syncRagSelectButton();
+  }
 }
 
 /** 切换单条记忆的勾选状态。 */
@@ -3651,7 +4168,7 @@ async function showMemory(memoryId) {
     $("detail-body").querySelectorAll("[data-copy-raw]").forEach((btn) => {
       btn.addEventListener("click", async () => {
         try {
-          await navigator.clipboard.writeText(JSON.stringify(data, null, 2));
+          await copyTextToClipboard(JSON.stringify(data, null, 2));
           toast("原始 JSON 已复制");
         } catch {
           toast("复制失败，请长按选择", true);
@@ -3670,7 +4187,7 @@ function openDetailPanel() {
     document.activeElement.blur?.();
   }
   const detail = $("detail");
-  if (isDrawerOpen()) closeDrawer();
+  if (!isDesktopLayout() && isDrawerOpen()) closeDrawer();
   if (!detail.classList.contains("open")) {
     pushScrollY = window.scrollY || 0;
   }
@@ -3832,6 +4349,7 @@ async function purgeMemory(memoryId) {
 /** 打开筛选弹窗，回填当前筛选条件。 */
 function openFilterModal() {
   $("filter-type").value = state.rag.memoryType;
+  if ($("filter-kind")) $("filter-kind").value = state.rag.kind;
   $("filter-scope").value = state.rag.scope;
   $("filter-identity").value = state.rag.identity;
   if ($("filter-lifecycle")) $("filter-lifecycle").value = state.rag.lifecycle;
@@ -3847,7 +4365,7 @@ function closeFilterModal() {
 }
 
 /* ------------------------------------------------------------------ */
-/* 开发者模式（r3.3）                                                  */
+/* 开发者选项（r3.3）                                                  */
 /* ------------------------------------------------------------------ */
 /** 切换开发者页「密钥门槛」与「工具面板」的显隐。 */
 function setDevAuthed(authed) {
@@ -3881,6 +4399,43 @@ function handleDevAuthError(error) {
   return true;
 }
 
+/** 记忆分类修复：先预览候选，确认后再写库；无需开发者密钥。 */
+async function repairMemoryKinds() {
+  const button = $("dev-memory-repair");
+  if (!button || button.disabled) return;
+  button.disabled = true;
+  try {
+    const preview = await callApi("POST", "rag/repair_kinds", {
+      apply: false,
+      use_model: true,
+    });
+    const count = Number(preview.repairable || 0);
+    if (!count) {
+      toast("没有需要修复的记忆分类");
+      return;
+    }
+    const samples = (Array.isArray(preview.items) ? preview.items : [])
+      .slice(0, 3)
+      .map((item) => `#${item.memory_id} ${item.old_kind} → ${item.new_kind}`)
+      .join("；");
+    const ok = await askConfirm(
+      `发现 ${count} 条可修复记忆${samples ? `：${samples}` : ""}。\n\n先用规则、再用模型复核后改判类型并重算有效期，是否应用？`,
+      { danger: true }
+    );
+    if (!ok) return;
+    const result = await callApi("POST", "rag/repair_kinds", {
+      apply: true,
+      use_model: true,
+    });
+    toast(`已修复 ${Number(result.applied || 0)} 条记忆分类`);
+    await Promise.all([loadRagStats(true), loadRagList()]);
+  } catch (error) {
+    toast(error.message || "记忆分类修复失败", true);
+  } finally {
+    button.disabled = false;
+  }
+}
+
 /** 开发者登录：用密钥换取限时令牌，成功后展示提示词/自检工具。 */
 async function devLogin() {
   const input = $("dev-key");
@@ -3903,7 +4458,7 @@ async function devLogin() {
     // 登录成功后立即清空密钥输入框，避免明文停留在 DOM 中。
     if (input) input.value = "";
     setDevAuthed(true);
-    toast("已进入开发者模式");
+    toast("已进入开发者选项");
     void loadDevPrompts();
   } catch (error) {
     // 失败时清空输入，避免密钥明文停留在页面上。
@@ -3915,7 +4470,7 @@ async function devLogin() {
   }
 }
 
-/** 退出开发者模式：注销服务端令牌并回到密钥门槛。 */
+/** 退出开发者选项：注销服务端令牌并回到密钥门槛。 */
 async function devLogout() {
   const token = state.dev.token;
   resetDevGate();
@@ -3925,10 +4480,10 @@ async function devLogout() {
     // 令牌已失效时本地照常退出，不打扰用户。
     console.warn("[ActiveReply] 注销开发者令牌失败", error);
   }
-  toast("已退出开发者模式");
+  toast("已退出开发者选项");
 }
 
-/** 读取开发者模式里的抽取提示词补充层（r3.3n）。 */
+/** 读取开发者选项里的抽取提示词补充层（r3.3n）。 */
 async function loadDevPrompts() {
   if (!state.dev.token) return;
   try {
@@ -3947,7 +4502,7 @@ async function loadDevPrompts() {
   }
 }
 
-/** 保存开发者模式里的抽取提示词补充层（r3.3n）。 */
+/** 保存开发者选项里的抽取提示词补充层（r3.3n）。 */
 async function saveDevPrompts() {
   if (!state.dev.token) {
     resetDevGate();
@@ -4091,9 +4646,73 @@ async function devPromptPreview() {
 const BUTTON_LOCK_MIN_MS = 1000;
 /** 兜底上限：极端情况下请求迟迟不结算，也不能让按钮永久卡住。 */
 const BUTTON_LOCK_MAX_MS = 6000;
+/** 刷新图标转一圈的时长，必须与 CSS 的 areply-icon-spin 保持一致。 */
+const BUTTON_SPIN_MS = 1000;
+/** 形变回原图标的收尾时长。 */
+const BUTTON_MORPH_BACK_MS = 500;
 /** 当前处于加载锁状态的按钮：button -> { startedAt, startedAtCount, spinner }。 */
 const lockedButtons = new Map();
 let lockMonitorTimer = 0;
+
+/** 把按钮图标替换成可被 Morphicons 操作的 SVG path。 */
+function startButtonMorph(button, entry) {
+  if (!button || !lockedButtons.has(button) || entry.morphStarted) return;
+  const refreshD = BUTTON_MORPH_PATHS.refresh;
+  if (!refreshD) {
+    entry.morphStarted = false;
+    void preloadButtonMorphPaths().then(() => {
+      if (lockedButtons.has(button)) startButtonMorph(button, entry);
+    });
+    return;
+  }
+  if (!morphicons) {
+    entry.morphStarted = false;
+    window.setTimeout(() => {
+      if (lockedButtons.has(button)) startButtonMorph(button, entry);
+    }, 120);
+    return;
+  }
+  entry.morphStarted = true;
+  const originalIcon = button.querySelector(".icon");
+  let iconName = "";
+  if (originalIcon) {
+    iconName = [...originalIcon.classList]
+      .find((name) => name.startsWith("icon-") && name !== "icon")
+      ?.slice(5) || "";
+  }
+  const initialD = BUTTON_MORPH_PATHS[iconName] || refreshD;
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("class", "icon morph-icon btn-morph-icon");
+  svg.setAttribute("viewBox", "0 0 24 24");
+  svg.setAttribute("aria-hidden", "true");
+  const pathEl = document.createElementNS("http://www.w3.org/2000/svg", "path");
+  pathEl.setAttribute("d", initialD);
+  svg.appendChild(pathEl);
+  if (originalIcon) {
+    entry.originalIcon = originalIcon;
+    originalIcon.replaceWith(svg);
+  } else {
+    entry.createdIcon = true;
+    entry.morphSvg = svg;
+    svg.classList.add("btn-morph-overlay");
+    button.classList.add("btn-morph-textless");
+    button.appendChild(svg);
+  }
+  entry.morphSvg = svg;
+  entry.originalPathD = initialD;
+  if (!entry.spinStartedAt) entry.spinStartedAt = performance.now();
+  try {
+    const morph = morphicons.createMorph(pathEl, initialD, {
+      strokeWidth: 1.8,
+      reducedMotion: "user",
+    });
+    entry.morph = morph;
+    morph.morphTo(refreshD);
+  } catch (error) {
+    // 形变失败时保留刷新图标，由 CSS 继续旋转。
+    pathEl.setAttribute("d", refreshD);
+  }
+}
 
 /** 给按钮加加载锁；同一次点击只登记一次，由 unlockButton 释放。 */
 function lockButton(button) {
@@ -4104,30 +4723,76 @@ function lockButton(button) {
         ? performance.now()
         : Date.now(),
     startedAtCount: apiStartedCount,
-    spinner: null,
+    morphStarted: false,
+    spinStartedAt: 0,
+    unlockScheduled: false,
+    finishing: false,
   };
-  const spinner = document.createElement("span");
-  spinner.className = "btn-spinner";
-  spinner.setAttribute("aria-hidden", "true");
-  button.appendChild(spinner);
-  entry.spinner = spinner;
   button.classList.add("btn-loading");
   button.setAttribute("aria-busy", "true");
   button.dataset.locking = "1";
   lockedButtons.set(button, entry);
+  startButtonMorph(button, entry);
   ensureLockMonitor();
 }
 
 /** 解锁单个按钮并清理加载态标记。 */
+function finishButtonUnlock(button, entry) {
+  entry.finishing = true;
+  button.classList.add("btn-morph-back");
+  const backD = entry.originalPathD;
+  const refreshD = BUTTON_MORPH_PATHS.refresh;
+  if (entry.morph && backD && refreshD && backD !== refreshD) {
+    try {
+      entry.morph.morphTo(backD);
+    } catch (error) {
+      // 形变回退失败时直接恢复原图标。
+    }
+  }
+  window.setTimeout(() => {
+    if (entry.morph) entry.morph.destroy();
+    if (entry.morphSvg) {
+      if (entry.originalIcon) entry.morphSvg.replaceWith(entry.originalIcon);
+      else entry.morphSvg.remove();
+    }
+    button.classList.remove("btn-loading", "btn-morph-back", "btn-morph-textless");
+    button.removeAttribute("aria-busy");
+    delete button.dataset.locking;
+    lockedButtons.delete(button);
+  }, BUTTON_MORPH_BACK_MS);
+}
+
+/** 解锁单个按钮；若图标还在转，先转完完整一圈再形变回原图标。 */
 function unlockButton(button) {
   const entry = lockedButtons.get(button);
-  if (entry) {
-    if (entry.spinner && entry.spinner.isConnected) entry.spinner.remove();
-    lockedButtons.delete(button);
+  if (!entry) {
+    button.classList.remove("btn-loading", "btn-morph-back", "btn-morph-textless");
+    button.removeAttribute("aria-busy");
+    delete button.dataset.locking;
+    return;
   }
-  button.classList.remove("btn-loading");
-  button.removeAttribute("aria-busy");
-  delete button.dataset.locking;
+  if (entry.finishing || entry.unlockScheduled) return;
+  if (entry.morphSvg) {
+    const now =
+      typeof performance !== "undefined" && performance.now
+        ? performance.now()
+        : Date.now();
+    const started = entry.spinStartedAt || now;
+    const elapsed = Math.max(0, now - started);
+    let wait = 0;
+    if (elapsed < BUTTON_SPIN_MS) {
+      wait = BUTTON_SPIN_MS - elapsed;
+    } else {
+      const remainder = elapsed % BUTTON_SPIN_MS;
+      wait = remainder < 40 ? 0 : BUTTON_SPIN_MS - remainder;
+    }
+    entry.unlockScheduled = true;
+    if (wait > 0) {
+      window.setTimeout(() => finishButtonUnlock(button, entry), wait + 10);
+      return;
+    }
+  }
+  finishButtonUnlock(button, entry);
 }
 
 /**
@@ -4276,10 +4941,10 @@ function installViewportRecovery() {
 
   // 诊断历史：定期采样 + 关键事件采样（聚焦/失焦/滚动/resize）。
   startUiHistorySampler();
-  window.addEventListener("scroll", () => recordUiSample("scroll"), {
+  window.addEventListener("scroll", () => scheduleUiSample("scroll"), {
     passive: true,
   });
-  window.addEventListener("resize", () => recordUiSample("resize"), {
+  window.addEventListener("resize", () => scheduleUiSample("resize"), {
     passive: true,
   });
 
@@ -4348,9 +5013,20 @@ function recordUiSample(reason = "") {
   if (uiHistory.length > 80) uiHistory.shift();
 }
 
+let uiSampleRaf = 0;
+
+function scheduleUiSample(reason = "") {
+  if (uiSampleRaf) return;
+  uiSampleRaf = requestAnimationFrame(() => {
+    uiSampleRaf = 0;
+    recordUiSample(reason);
+  });
+}
+
 function startUiHistorySampler() {
   if (uiHistoryTimer) return;
-  uiHistoryTimer = window.setInterval(() => recordUiSample("tick"), 400);
+  // 诊断采样只需要低频趋势；400ms 会持续读取布局属性，提升到 1s 降低开销。
+  uiHistoryTimer = window.setInterval(() => recordUiSample("tick"), 1000);
 }
 
 function formatUiHistory() {
@@ -4526,9 +5202,11 @@ function recoverUiState(reason = "") {
   const drawerOpen = drawer.classList.contains("open");
   const detailOpen = detail.classList.contains("open");
   if (drawerOpen && detailOpen) {
-    // 两个面板同时打开是非法状态：保留详情，关闭抽屉。
-    closeDrawer();
-    return;
+    // 手机端两个面板同时打开是非法状态；PC 端保留侧栏，由汉堡按钮控制。
+    if (!isDesktopLayout()) {
+      closeDrawer();
+      return;
+    }
   }
   if (!drawerOpen) {
     document.body.classList.remove("drawer-open");
@@ -4601,6 +5279,17 @@ function installButtonFeedback() {
   );
 }
 
+/** 给每个主页内容套一层宽度视口，侧栏开合时只动画外层宽度。 */
+function wrapContentViews() {
+  document.querySelectorAll("#main-pane > .content").forEach((content) => {
+    if (content.parentElement?.classList.contains("content-viewport")) return;
+    const viewport = document.createElement("div");
+    viewport.className = "content-viewport";
+    content.parentNode.insertBefore(viewport, content);
+    viewport.appendChild(content);
+  });
+}
+
 function bindEvents() {
   $("menu-btn").addEventListener("click", () => {
     if (menuRecoverTriggered) {
@@ -4620,11 +5309,16 @@ function bindEvents() {
   bindPushGesture();
   bindCloseGesture();
   window.addEventListener("scroll", scheduleScrolledClass, { passive: true });
+  // PC 端主页面自身是滚动容器，必须监听它的 scroll 才能切换 Tab 浮标。
+  $("main-pane")?.addEventListener("scroll", scheduleScrolledClass, {
+    passive: true,
+  });
   // resize 处理统一放在 installViewportRecovery（含键盘基线重算）。
   updateScrolledClass();
   document.addEventListener("keydown", (event) => {
     if (event.key === "Escape") {
-      closeDrawer();
+      // PC 端侧栏只允许通过汉堡按钮开关。
+      if (!isDesktopLayout()) closeDrawer();
       closeDetail();
     }
   });
@@ -4712,10 +5406,27 @@ function bindEvents() {
 
     data.independent = true;
     $("save-hint").textContent = "当前为本群独立配置，会覆盖全局对应项";
+    syncGroupTopActions();
   });
 
   $("save-group").addEventListener("click", () => void saveGroup());
   $("reset-group").addEventListener("click", () => void resetGroup());
+
+  $("group-mini-independent")?.addEventListener("click", () => {
+    const data = state.currentGroup;
+    const toggle = $("independent-toggle");
+    if (!data || !toggle) return;
+    if (toggle.checked) {
+      void followGlobal(data.group_id);
+      return;
+    }
+    toggle.checked = true;
+    data.independent = true;
+    $("save-hint").textContent = "当前为本群独立配置，会覆盖全局对应项";
+    syncGroupTopActions();
+  });
+  $("group-mini-reset")?.addEventListener("click", resetGroup);
+  $("group-mini-save")?.addEventListener("click", () => void saveGroup());
 
   // 全局设置：兜底用 document 级事件委托，避免个别环境里逐元素绑定失效
   document.addEventListener(
@@ -4753,6 +5464,7 @@ function bindEvents() {
   $("rag-search").addEventListener("click", () => openFilterModal());
   $("filter-apply").addEventListener("click", () => {
     state.rag.memoryType = $("filter-type").value;
+    state.rag.kind = $("filter-kind")?.value || "";
     state.rag.scope = $("filter-scope").value;
     state.rag.identity = $("filter-identity").value;
     state.rag.lifecycle = $("filter-lifecycle")?.value || "";
@@ -4766,12 +5478,14 @@ function bindEvents() {
   // r3.3g：筛选弹窗新增「清空」；清空筛选条件但保留「已归档」开关状态。
   $("filter-clear").addEventListener("click", () => {
     $("filter-type").value = "";
+    if ($("filter-kind")) $("filter-kind").value = "";
     $("filter-scope").value = "";
     $("filter-identity").value = "";
     if ($("filter-lifecycle")) $("filter-lifecycle").value = "";
     $("rag-keyword").value = "";
     $("rag-role").value = "";
     state.rag.memoryType = "";
+    state.rag.kind = "";
     state.rag.scope = "";
     state.rag.identity = "";
     state.rag.lifecycle = "";
@@ -4802,7 +5516,6 @@ function bindEvents() {
   $("rag-bulk-archive")?.addEventListener("click", () => void bulkArchiveSelected());
   $("rag-bulk-delete")?.addEventListener("click", () => void bulkDeleteSelected());
   $("theme-btn").addEventListener("click", () => cycleTheme());
-  $("drawer-blocks").addEventListener("click", () => switchView("blocks"));
   $("block-add").addEventListener("click", () => void onBlockAddGlobal());
   $("block-search").addEventListener("input", (event) => {
     state.blockState.global.search = event.target.value;
@@ -4822,7 +5535,7 @@ function bindEvents() {
     const button = event.target.closest("[data-block-remove]");
     if (button) void removeBlockEntry(button);
   });
-  $("auto-memory-toggle").addEventListener("click", () => void toggleAutoMemory());
+  $("auto-memory-toggle").addEventListener("change", () => void toggleAutoMemory());
   $("auto-memory-settings").addEventListener("click", () => {
     state.globalTab = "memory_rag";
     switchView("settings");
@@ -4842,8 +5555,33 @@ function bindEvents() {
     state.rag.page = 1;
     void loadRagList();
   });
-  // 开发者模式（r3.3）：侧栏扳手按钮进入，密钥校验通过后才展示提示词/自检。
+  // 开发者选项（r3.3）：侧栏扳手按钮进入，密钥校验通过后才展示提示词/自检。
   $("drawer-dev")?.addEventListener("click", () => switchView("dev"));
+  $("dev-memory-repair")?.addEventListener("click", () => void repairMemoryKinds());
+  $("dev-tour-replay")?.addEventListener("click", () => startTour(true));
+  $("tour-skip")?.addEventListener("click", () => closeTour(true));
+  $("tour-next")?.addEventListener("click", () => {
+    if (tourStepIndex + 1 < TOUR_STEPS.length) {
+      void renderTourStep(tourStepIndex + 1);
+    } else {
+      closeTour(true);
+    }
+  });
+  $("tour-hit")?.addEventListener("click", () => {
+    const step = TOUR_STEPS[tourStepIndex];
+    const target = step ? document.querySelector(step.selector) : null;
+    if (!target) return;
+    const last = tourStepIndex + 1 >= TOUR_STEPS.length;
+    if (last) closeTour(true);
+    target.click();
+    if (!last) {
+      window.setTimeout(() => {
+        if ($("tour-root") && !$("tour-root").hidden) {
+          void renderTourStep(tourStepIndex + 1);
+        }
+      }, 120);
+    }
+  });
   $("dev-login")?.addEventListener("click", () => void devLogin());
   $("dev-key")?.addEventListener("keydown", (event) => {
     if (event.key !== "Enter") return;
@@ -4856,7 +5594,7 @@ function bindEvents() {
   );
   $("dev-logout")?.addEventListener("click", () => void devLogout());
   $("dev-prompt-save")?.addEventListener("click", () => void saveDevPrompts());
-  // 开发者模式保留「界面诊断」入口；注意它会切页，抓现场请用 Tab 连点 5 次。
+  // 开发者选项保留「界面诊断」入口；注意它会切页，抓现场请用 Tab 连点 5 次。
   $("dev-diag")?.addEventListener("click", () => showUiDiagnostics());
   $("ui-diag-close")?.addEventListener("click", hideUiDiagnostics);
   $("ui-diag-recover")?.addEventListener("click", () => {
@@ -4869,10 +5607,195 @@ function bindEvents() {
 /* ------------------------------------------------------------------ */
 /* 启动                                                                */
 /* ------------------------------------------------------------------ */
+/* ------------------------------------------------------------------ */
+/* 漫游式引导                                                          */
+/* ------------------------------------------------------------------ */
+const TOUR_VERSION = "beta.5";
+const TOUR_SEEN_KEY = `activeReply.tour.${TOUR_VERSION}`;
+let tourStepIndex = 0;
+
+const TOUR_STEPS = [
+  {
+    selector: "#menu-btn",
+    title: "从侧边栏开始",
+    text: "先打开侧边栏，开发者选项的入口在这里。",
+    before: () => closeDrawer(),
+  },
+  {
+    selector: "#drawer-dev",
+    title: "开发者选项",
+    text: "侧边栏底部的扳手按钮就是开发者选项；记忆分类修复不需要开发者密钥。",
+    before: () => openDrawer(),
+  },
+  {
+    selector: "#dev-memory-repair",
+    title: "记忆分类修复",
+    text: "在这里扫描并修复被误标为「事实」的事件、计划、偏好和关系，先预览再确认，不会直接改库。",
+    before: () => switchView("dev"),
+  },
+];
+
+let tourSeenOnServer = false;
+
+function tourSeen() {
+  try {
+    if (localStorage.getItem(TOUR_SEEN_KEY) === "1") return true;
+  } catch {
+    // fall through to server-side state
+  }
+  return tourSeenOnServer;
+}
+
+async function loadTourSeen() {
+  if (tourSeen()) return true;
+  try {
+    const data = await callApi("GET", "tour/state", { version: TOUR_VERSION });
+    tourSeenOnServer = Boolean(data && data.seen);
+  } catch {
+    tourSeenOnServer = false;
+  }
+  if (tourSeenOnServer) {
+    try {
+      localStorage.setItem(TOUR_SEEN_KEY, "1");
+    } catch {
+      // 服务端已经记住，localStorage 不可用不影响结果。
+    }
+  }
+  return tourSeenOnServer;
+}
+
+function markTourSeen() {
+  tourSeenOnServer = true;
+  try {
+    localStorage.setItem(TOUR_SEEN_KEY, "1");
+  } catch {
+    // 服务端文件才是跨重进插件的真正持久化来源。
+  }
+  void callApi("POST", "tour/seen", { version: TOUR_VERSION }).catch(() => {});
+}
+
+function positionTourPopover(target, animate = false) {
+  const pop = $("tour-pop");
+  if (!pop || !target) return;
+  const spotNode = $("tour-spot");
+  if (spotNode) spotNode.style.transition = animate ? "" : "none";
+  pop.style.transition = animate ? "" : "none";
+  const rect = target.getBoundingClientRect();
+  const pad = 6;
+  const spot = $("tour-spot");
+  if (spot) {
+    spot.style.top = `${Math.max(4, rect.top - pad)}px`;
+    spot.style.left = `${Math.max(4, rect.left - pad)}px`;
+    spot.style.width = `${Math.min(window.innerWidth - 8, rect.width + pad * 2)}px`;
+    spot.style.height = `${Math.min(window.innerHeight - 8, rect.height + pad * 2)}px`;
+  }
+  const hit = $("tour-hit");
+  if (hit) {
+    hit.style.top = `${Math.max(4, rect.top - pad)}px`;
+    hit.style.left = `${Math.max(4, rect.left - pad)}px`;
+    hit.style.width = `${Math.min(window.innerWidth - 8, rect.width + pad * 2)}px`;
+    hit.style.height = `${Math.min(window.innerHeight - 8, rect.height + pad * 2)}px`;
+  }
+  const popRect = pop.getBoundingClientRect();
+  const maxLeft = Math.max(12, window.innerWidth - popRect.width - 12);
+  const left = Math.min(maxLeft, Math.max(12, rect.left + rect.width / 2 - popRect.width / 2));
+  let top = rect.bottom + 12;
+  if (top + popRect.height > window.innerHeight - 12) {
+    top = Math.max(12, rect.top - popRect.height - 12);
+  }
+  pop.style.left = `${left}px`;
+  pop.style.top = `${top}px`;
+}
+
+function closeTour(markSeen = true) {
+  const root = $("tour-root");
+  if (root) {
+    root.hidden = true;
+    root.setAttribute("aria-hidden", "true");
+  }
+  if (markSeen) markTourSeen();
+}
+
+async function renderTourStep(index) {
+  const root = $("tour-root");
+  if (!root || root.hidden) return;
+  const step = TOUR_STEPS[index];
+  if (!step) {
+    closeTour(true);
+    return;
+  }
+  tourStepIndex = index;
+  try {
+    await step.before?.();
+  } catch (error) {
+    console.warn("[ActiveReply] 引导步骤切换失败", error);
+  }
+  await new Promise((resolve) => setTimeout(resolve, 320));
+  const target = document.querySelector(step.selector);
+  if (!target) {
+    if (index + 1 < TOUR_STEPS.length) void renderTourStep(index + 1);
+    else closeTour(true);
+    return;
+  }
+  // 引导定位必须等页面/抽屉滚动完成；平滑滚动会让 rect 在动画中过期，
+  // 导致聚光灯落在按钮原来的位置。
+  target.scrollIntoView({ block: "center", behavior: "auto" });
+  await new Promise((resolve) => requestAnimationFrame(() => resolve()));
+  await new Promise((resolve) => requestAnimationFrame(() => resolve()));
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  $("tour-step").textContent = `${index + 1} / ${TOUR_STEPS.length}`;
+  $("tour-title").textContent = step.title;
+  $("tour-text").textContent = step.text;
+  $("tour-next").textContent = index + 1 < TOUR_STEPS.length ? "下一步" : "完成";
+  root.hidden = false;
+  root.setAttribute("aria-hidden", "false");
+  positionTourPopover(target, true);
+}
+
+function startTour(force = false) {
+  if (!force && tourSeen()) return;
+  const root = $("tour-root");
+  if (!root) return;
+  markTourSeen();
+  tourStepIndex = 0;
+  root.hidden = false;
+  root.setAttribute("aria-hidden", "false");
+  void renderTourStep(0);
+}
+
+async function maybeStartTour() {
+  if (await loadTourSeen()) return;
+  window.setTimeout(() => startTour(false), 700);
+}
+
+let tourRepositionRaf = 0;
+
+function repositionTour() {
+  const root = $("tour-root");
+  if (!root || root.hidden) return;
+  const step = TOUR_STEPS[tourStepIndex];
+  const target = step ? document.querySelector(step.selector) : null;
+  if (target) positionTourPopover(target, false);
+}
+
+function scheduleTourReposition() {
+  if (tourRepositionRaf) return;
+  tourRepositionRaf = requestAnimationFrame(() => {
+    tourRepositionRaf = 0;
+    repositionTour();
+  });
+}
+window.addEventListener("scroll", scheduleTourReposition, {
+  passive: true,
+  capture: true,
+});
+window.addEventListener("resize", scheduleTourReposition, { passive: true });
+
 /** 等待 AstrBot bridge、注册主题变化监听，再进入状态概览页。 */
 async function init() {
   refreshTopbarHeight();
   try {
+    wrapContentViews();
     bindEvents();
   } catch (error) {
     // r3.3r：单个绑定失败不能让整页事件全部失效。
@@ -4886,6 +5809,7 @@ async function init() {
       });
     }
     $("scrim")?.addEventListener("click", () => {
+      if (isDesktopLayout()) return;
       if ($("detail")?.classList.contains("open")) closeDetail();
       else closeDrawer();
     });
@@ -4931,6 +5855,7 @@ async function init() {
     console.warn("bridge.ready failed", error);
   }
   switchView("overview");
+  maybeStartTour();
 }
 
 void init();

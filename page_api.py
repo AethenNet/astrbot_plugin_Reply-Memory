@@ -96,6 +96,31 @@ async def _read_payload() -> tuple[dict[str, Any], str]:
         return {}, str(exc)
 
 
+def bind_memory_switch_patch(patch: dict[str, Any]) -> None:
+    """让记忆 RAG 总开关和自动记忆开关保持同值。
+
+    任一开关出现在补丁里时，同步另一个字段；这样自动记忆页和全局设置页
+    无论从哪边切换，保存后的状态都一致。
+    """
+    memory = patch.get("memory_rag")
+    if not isinstance(memory, dict):
+        return
+    control = memory.get("memory_control")
+    generation = memory.get("memory_generation")
+    if isinstance(control, dict) and "enable" in control:
+        value = bool(control["enable"])
+        if isinstance(generation, dict):
+            generation["auto_extract_enable"] = value
+        else:
+            memory["memory_generation"] = {"auto_extract_enable": value}
+    elif isinstance(generation, dict) and "auto_extract_enable" in generation:
+        value = bool(generation["auto_extract_enable"])
+        if isinstance(control, dict):
+            control["enable"] = value
+        else:
+            memory["memory_control"] = {"enable": value}
+
+
 class PageApi:
     """将控制台路由操作映射到插件配置、存储和运行状态的适配器。
 
@@ -111,6 +136,9 @@ class PageApi:
         # r3.3：开发者令牌与失败时间戳都只放进程内存，插件重载后自然失效。
         self._dev_tokens: dict[str, float] = {}
         self._dev_fail_times: list[float] = []
+        # 修复预览缓存：模型复核成本较高，确认应用时复用最近一次预览，
+        # 避免第二次再调用模型；缓存只存在进程内。
+        self._kind_repair_preview: tuple[float, list[dict[str, Any]]] = (0.0, [])
 
     # ------------------------------------------------------------------ #
     # 展示与校验辅助
@@ -302,6 +330,7 @@ class PageApi:
         允许宿主不支持写盘，仅本次运行生效。
         """
         previous = copy.deepcopy(dict(self.plugin.config))
+        bind_memory_switch_patch(patch)
         merged = deep_merge(copy.deepcopy(previous), patch)
         warning = ""
         try:
@@ -407,6 +436,11 @@ class PageApi:
         "vector_ms",
         # P1-3：词法超时后转向量兜底的次数（与整体降级区分）。
         "lexical_timeout",
+        # 这些状态原先只写不读；纳入运行态快照后可在诊断接口看到。
+        "recall_abandoned",
+        "recall_busy",
+        "embedding_write_timeout",
+        "tool_recall_busy",
     )
 
     def _runtime_metrics(self) -> dict[str, Any]:
@@ -993,6 +1027,7 @@ class PageApi:
         group_scope = query_get("group_scope", "", str)
         role_id = query_get("role_id", "", str)
         memory_type = query_get("memory_type", "", str)
+        kind = query_get("kind", "", str)
         identity = query_get("identity", "", str)
         lifecycle = str(query_get("lifecycle", "", str) or "").strip().lower()
         include_archived = bool(query_get("include_archived", 0, int))
@@ -1011,6 +1046,7 @@ class PageApi:
                 group_scope=group_scope or "",
                 role_id=role_id or "",
                 memory_type=memory_type or "",
+                kind=kind or "",
                 identity=identity or "",
                 include_archived=include_archived,
                 archived_only=archived_only,
@@ -1149,6 +1185,9 @@ class PageApi:
                 )
             except Exception:
                 effective = importance
+        # 有效重要性只应衰减，不允许高于写入时的 importance；
+        # 旧缓存/旧版本字段若给出更大值，展示层在此夹紧。
+        effective = min(importance, effective)
         item["effective_importance"] = round(
             max(0.0, min(IMPORTANCE_MAX, effective)), 3
         )
@@ -1439,6 +1478,106 @@ class PageApi:
             logger.error(f"[ActiveReply] 清理记忆失败: {exc}", exc_info=True)
             return fail(f"清理失败：{exc}")
         self._invalidate_recall_cache_hook("page_api")
+        return ok(result)
+
+    def _tour_state_path(self) -> Path | None:
+        """控制台引导状态文件；放在插件数据目录，避免依赖 iframe localStorage。"""
+        root = getattr(self.plugin, "data_dir", None)
+        if root is None:
+            return None
+        try:
+            return Path(root) / "console_ui_state.json"
+        except (TypeError, ValueError):
+            return None
+
+    def _read_tour_state(self) -> dict[str, Any]:
+        path = self._tour_state_path()
+        if path is None:
+            return {}
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    async def get_tour_state(self) -> dict[str, Any]:
+        """返回当前版本引导是否已看；由 Dashboard 会话保护，无需开发者密钥。"""
+        version = str(query_get("version", "", str) or "").strip()
+        if not re.fullmatch(r"[A-Za-z0-9._-]{1,32}", version):
+            return fail("版本号无效")
+        state = self._read_tour_state()
+        seen = state.get("tour_seen")
+        seen = seen if isinstance(seen, dict) else {}
+        return ok({"version": version, "seen": bool(seen.get(version))})
+
+    async def mark_tour_seen(self) -> dict[str, Any]:
+        """持久化记录引导已看，避免 iframe 每次重新进入都重复播放。"""
+        payload, error = await _read_payload()
+        if error:
+            return fail(error)
+        body = payload if isinstance(payload, dict) else {}
+        version = str(body.get("version") or "").strip()
+        if not re.fullmatch(r"[A-Za-z0-9._-]{1,32}", version):
+            return fail("版本号无效")
+        path = self._tour_state_path()
+        if path is None:
+            return fail("插件数据目录不可用")
+        state = self._read_tour_state()
+        seen = state.get("tour_seen")
+        seen = dict(seen) if isinstance(seen, dict) else {}
+        seen[version] = True
+        state["tour_seen"] = seen
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temp = path.with_suffix(path.suffix + ".tmp")
+            temp.write_text(
+                json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            os.replace(temp, path)
+        except OSError as exc:
+            logger.warning("[ActiveReply] 保存引导状态失败: %s", exc)
+            return fail(f"保存引导状态失败：{exc}")
+        return ok({"version": version, "seen": True})
+
+    async def rag_repair_kinds(self) -> dict[str, Any]:
+        """规则 + 模型复核记忆分类；默认只预览，显式 apply 才写库。"""
+        readonly = self._memory_readonly_error()
+        if readonly:
+            return fail(readonly)
+        payload, error = await _read_payload()
+        if error:
+            return fail(error)
+        body = payload if isinstance(payload, dict) else {}
+        apply_changes = self._truthy(body.get("apply"))
+        use_model = self._truthy(body.get("use_model", True))
+        try:
+            if apply_changes:
+                cached_at, cached_items = self._kind_repair_preview
+                if cached_items and time.time() - cached_at < 600:
+                    applied = await asyncio.to_thread(
+                        self.plugin.memory_store.apply_kind_repairs,
+                        cached_items,
+                    )
+                    self._kind_repair_preview = (0.0, [])
+                    result = {"applied": int(applied), "cached": True}
+                else:
+                    result = await self.plugin.apply_memory_kind_repairs(
+                        use_model=use_model
+                    )
+            else:
+                result = await self.plugin.repair_memory_kind_candidates(
+                    use_model=use_model
+                )
+                self._kind_repair_preview = (
+                    time.time(),
+                    list(result.pop("_all", [])),
+                )
+        except Exception as exc:
+            logger.error(f"[ActiveReply] 记忆分类修复失败: {exc}", exc_info=True)
+            return fail(f"修复失败：{exc}")
+        result.pop("_all", None)
+        if apply_changes and int(result.get("applied") or 0) > 0:
+            self._invalidate_recall_cache_hook("repair_kinds")
         return ok(result)
 
     async def prompt_preview(self) -> dict[str, Any]:

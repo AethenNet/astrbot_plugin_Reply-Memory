@@ -1309,7 +1309,16 @@ class MemoryOpsMixin:
                 provider_id,
             )
         try:
-            provider = self.context.get_using_provider(origin)
+            if origin:
+                provider = self.context.get_using_provider(origin)
+            else:
+                # 页面维护任务没有会话 origin；优先取宿主默认 provider。
+                provider = self.context.get_using_provider()
+        except TypeError:
+            try:
+                provider = self.context.get_using_provider(origin)
+            except Exception:
+                provider = None
         except Exception:
             provider = None
         return provider if isinstance(provider, Provider) else None
@@ -1763,6 +1772,32 @@ class MemoryOpsMixin:
             r"^\[(?:Bot/[^/\]]+|[^/\]]+/[^/\]]+)/([^\]]+)\]", str(line or "")
         )
         return match.group(1).strip() if match else ""
+
+    def _evidence_source(
+        self, lines: list[str], quotes: list[str]
+    ) -> tuple[str, float | None]:
+        """按 quotes 找到最后一条证据消息的 ID 与真实发送时间。"""
+        targets = [
+            re.sub(r"\s+", "", str(quote or ""))
+            for quote in quotes
+            if str(quote or "").strip()
+        ]
+        if not targets or not lines:
+            return "", None
+        best_id = ""
+        best_time: float | None = None
+        for line in lines:
+            parsed = parse_line(line)
+            if parsed is None or not parsed.sender_id:
+                continue
+            body = re.sub(r"\s+", "", parsed.body or "")
+            if not body or not any(target in body for target in targets):
+                continue
+            best_id = str(parsed.msg_id or "").strip()
+            stamp = self._parse_timestamp(parsed.stamp) if parsed.stamp else None
+            if stamp is not None:
+                best_time = float(stamp)
+        return best_id, best_time
 
     @staticmethod
     def _last_message_id(lines: list[str]) -> str:
@@ -2317,11 +2352,15 @@ class MemoryOpsMixin:
                 source_time = parsed_time
                 break
         sender_id = sender_id_override or (human_ids[0] if human_ids else "")
-        sender_role = sender_role_override or self._cached_member_role(
-            role_group_id, sender_id
-        )
         cached_roles = self._group_role_cache.get(role_group_id)
         known_roles = cached_roles[1] if cached_roles else {}
+        # 窗口角色表比单独查 sender 更完整；缓存未命中时才回退 member，
+        # 避免顶层 sender_role 与 role_identities 出现 member/group_admin 矛盾。
+        sender_role = (
+            sender_role_override
+            or known_roles.get(str(sender_id or ""))
+            or self._cached_member_role(role_group_id, sender_id)
+        )
         prompt_hash = hashlib.sha1(episode_template.encode("utf-8")).hexdigest()[:12]
         source_batch = last_msg_id or ""
         # 双层输出：episode 先写，后续原子记忆挂到它的 ID 上。
@@ -2424,10 +2463,27 @@ class MemoryOpsMixin:
             }
             if sender_id:
                 role_identities[sender_id] = sender_role
+            # 模型仍可能把“本窗口发生的事”写成 fact；写入前用同一套
+            # JSON 规则做兜底改判，避免新记录继续污染 TTL 和类型统计。
+            if str(item.get("kind") or "") == "fact":
+                inferred_kind, inferred_reason = self._repair_kind_from_content(
+                    item.get("content") or ""
+                )
+                if inferred_kind != "fact":
+                    self._journal(
+                        origin,
+                        f"分类自动纠正：fact -> {inferred_kind}（{inferred_reason}）",
+                    )
+                    item["kind"] = inferred_kind
             # 参与者身份取原始窗口行，保留昵称/别名与稳定 ID。
             participant_identities = build_participant_identities(
                 role_ids, lines, self_id=self_id or ""
             )
+            evidence_msg_id, evidence_time = self._evidence_source(
+                filtered, valid_quotes
+            )
+            item_source_msg_id = evidence_msg_id or last_msg_id
+            item_source_time = evidence_time or source_time
             memory_id, dup = await self._store_memory(
                 content=item["content"],
                 role_ids=role_ids,
@@ -2443,8 +2499,8 @@ class MemoryOpsMixin:
                 valid_until=item["valid_until"],
                 sender_id=role_ids[0],
                 sender_role=sender_role,
-                source_msg_id=last_msg_id,
-                source_time=source_time,
+                source_msg_id=item_source_msg_id,
+                source_time=item_source_time,
                 importance=item["importance"],
                 source_batch=source_batch,
                 extra={
@@ -3485,7 +3541,7 @@ class MemoryOpsMixin:
     def _dump_detail_payload(payload: dict[str, Any], max_chars: int) -> str:
         """把记忆详情序列化成合法 JSON；超长只截断 content 字段（F50）。
 
-        ``RecallBudget.clip`` 直接切整个字符串会把 JSON 截成非法格式，模型
+        直接切整个字符串会把 JSON 截成非法格式，模型
         一个字段也拿不到；这里优先缩短正文并标记 ``content_truncated``，
         其它字段（证据等）保持完整。
         """
@@ -3563,3 +3619,258 @@ class MemoryOpsMixin:
             else [],
         }
         return self._dump_detail_payload(payload, gate.budget.max_result_chars)
+
+    # ------------------------------------------------------------------ #
+    # 记忆分类修复（只依据已有 JSON 的规则重分类）
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _repair_kind_from_content(content: str) -> tuple[str, str]:
+        """用保守规则判断被误标为 fact 的正文应归到哪个 kind。
+
+        只在证据明确时改判；默认返回 fact。调用方还会限制为只修复
+        ``old_kind == "fact"`` 的记录，避免覆盖模型已经给出的明确分类。
+        """
+        text = str(content or "").strip()[:4000]
+        if not text:
+            return "fact", ""
+        time_like = bool(
+            re.search(
+                r"\d{4}[-/年]\d{1,2}[-/月]\d{1,2}|凌晨|今天|昨天|今晚|刚刚|刚才|当时",
+                text,
+            )
+        )
+        episode_terms = (
+            "得知", "发生", "炸了", "停运", "停服", "故障", "事故", "新闻",
+            "律师函", "仓库", "跑路", "关闭", "没了", "删了", "完成", "结束",
+            "吵架", "讨论", "收到", "看到",
+        )
+        plan_terms = (
+            "明天", "后天", "下周", "下次", "以后", "计划", "安排", "准备",
+            "打算", "约定", "截止", "提醒", "记得",
+        )
+        preference_terms = (
+            "喜欢", "讨厌", "最爱", "偏好", "习惯", "爱吃", "不喜欢", "不爱",
+        )
+        relation_terms = (
+            "朋友", "同事", "群主", "管理员", "对象", "女朋友", "男朋友",
+            "家人", "亲戚", "认识", "关系", "老板",
+        )
+        episode_hits = [term for term in episode_terms if term in text]
+        plan_hits = [term for term in plan_terms if term in text]
+        preference_hits = [term for term in preference_terms if term in text]
+        relation_hits = [term for term in relation_terms if term in text]
+        if time_like and episode_hits:
+            episode_hits.append("时间词")
+        scores = {
+            "episode": len(episode_hits),
+            "plan": len(plan_hits),
+            "preference": len(preference_hits),
+            "relation": len(relation_hits),
+        }
+        best = max(scores, key=lambda key: scores[key])
+        if scores[best] < 2:
+            return "fact", ""
+        labels = {
+            "episode": episode_hits,
+            "plan": plan_hits,
+            "preference": preference_hits,
+            "relation": relation_hits,
+        }[best]
+        return best, "命中" + "、".join(labels[:4])
+
+    @staticmethod
+    def _repair_ttl(
+        cfg: PluginConfig, kind: str, importance: float, created_at: float
+    ) -> tuple[float | None, int, float]:
+        """按新 kind 重算写入时 TTL；返回 (valid_until, base_days, ttl_days)。"""
+        base = max(0, int(cfg.memory_rag.ttl_base.base_days(kind)))
+        if cfg.memory_rag.ttl_adaptive_enable:
+            if base <= 0:
+                return None, 0, 0.0
+            factor = 0.5 + max(0.0, min(IMPORTANCE_MAX, float(importance))) / IMPORTANCE_MAX
+            days = float(base) * factor
+            return created_at + days * 86400.0, base, days
+        legacy_days = int(cfg.memory_rag.kind_decay.expiry_days(kind))
+        if legacy_days <= 0:
+            return None, 0, 0.0
+        return created_at + legacy_days * 86400.0, legacy_days, float(legacy_days)
+
+    def _build_kind_repair_item(
+        self,
+        cfg: PluginConfig,
+        row: dict[str, Any],
+        new_kind: str,
+        reason: str,
+        *,
+        method: str,
+    ) -> dict[str, Any]:
+        """构造一条可写回的重分类候选。"""
+        old_kind = str(row.get("kind") or "fact").strip().lower() or "fact"
+        created_at = float(
+            row.get("created_at") or row.get("memory_time") or time.time()
+        )
+        valid_until, base_days, ttl_days = self._repair_ttl(
+            cfg, new_kind, float(row.get("importance") or 0.0), created_at
+        )
+        metadata = dict(row.get("extra_metadata") or {})
+        metadata["kind_repaired_from"] = old_kind
+        metadata["kind_repaired_at"] = time.time()
+        metadata["kind_repaired_by"] = method
+        metadata["ttl_base_days"] = int(base_days)
+        metadata["ttl_days"] = round(float(ttl_days), 3)
+        return {
+            "memory_id": int(row["memory_id"]),
+            "old_kind": old_kind,
+            "new_kind": new_kind,
+            "kind": new_kind,
+            "reason": reason,
+            "brief": str(row["content"] or "").replace("\n", " ")[:100],
+            "valid_until": valid_until,
+            "extra_metadata": metadata,
+        }
+
+    async def _review_kind_with_model(
+        self, rows: list[dict[str, Any]]
+    ) -> tuple[dict[int, str], bool]:
+        """用抽取模型批量复核 fact 正文；返回 id->kind 与是否实际调用成功。"""
+        if not rows:
+            return {}, False
+        cfg = self._global_cfg()
+        provider = self._extract_provider("", cfg)
+        if provider is None:
+            logger.info("[ActiveReply] 记忆分类复核跳过：没有可用 provider")
+            return {}, False
+        decided: dict[int, str] = {}
+        allowed = {"fact", "preference", "plan", "episode", "relation"}
+        for offset in range(0, len(rows), 30):
+            batch = rows[offset : offset + 30]
+            payload = [
+                {
+                    "id": int(row["memory_id"]),
+                    "content": str(row["content"] or "")[:300],
+                }
+                for row in batch
+            ]
+            prompt = (
+                "你是长期记忆分类器。根据每条记忆正文，只判断它应归为哪种类型：\n"
+                "episode=本窗口发生的事件/新闻/事故/新成员入群/成员动态；"
+                "plan=未来计划、约定、行程；preference=长期喜欢/讨厌/习惯；"
+                "relation=人与人的关系；fact=稳定的身份、规则、长期事实。\n"
+                "拿不准一律保持 fact，不要为了改而改。只输出 JSON："
+                '{"items":[{"id": 87, "kind": "episode"}]}。\n'
+                "待分类：" + json.dumps(payload, ensure_ascii=False)
+            )
+            try:
+                try:
+                    response = await asyncio.wait_for(
+                        provider.text_chat(
+                            prompt=prompt,
+                            session_id=uuid.uuid4().hex,
+                            persist=False,
+                            max_tokens=2048,
+                        ),
+                        timeout=30,
+                    )
+                except TypeError:
+                    response = await asyncio.wait_for(
+                        provider.text_chat(
+                            prompt=prompt,
+                            session_id=uuid.uuid4().hex,
+                            persist=False,
+                        ),
+                        timeout=30,
+                    )
+            except Exception as exc:
+                logger.warning("[ActiveReply] 记忆分类模型复核失败: %s", exc)
+                continue
+            parsed = self._json_loads_lenient(
+                str(getattr(response, "completion_text", "") or "")
+            )
+            entries = (
+                parsed.get("items") if isinstance(parsed, dict) else parsed
+            )
+            if not isinstance(entries, list):
+                continue
+            valid_ids = {int(row["memory_id"]) for row in batch}
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                try:
+                    memory_id = int(entry.get("id") or entry.get("memory_id") or 0)
+                except (TypeError, ValueError):
+                    continue
+                kind = str(entry.get("kind") or "").strip().lower()
+                if memory_id in valid_ids and kind in allowed and kind != "fact":
+                    decided[memory_id] = kind
+        return decided, bool(decided)
+
+    async def repair_memory_kind_candidates(self, use_model: bool = True) -> dict[str, Any]:
+        """扫描活动记忆，先用规则、再用模型复核可重分类的 fact 记录。"""
+        store = self.memory_store
+        if store is None:
+            return {"scanned": 0, "repairable": 0, "items": [], "_all": []}
+        cfg = self._global_cfg()
+        rows = store.list_kind_repair_rows()
+        fact_rows = [
+            row
+            for row in rows
+            if str(row.get("kind") or "fact").strip().lower()
+            in {"fact", "unknown", ""}
+        ]
+        items: list[dict[str, Any]] = []
+        rule_ids: set[int] = set()
+        for row in fact_rows:
+            new_kind, reason = self._repair_kind_from_content(row["content"])
+            if new_kind == "fact":
+                continue
+            rule_ids.add(int(row["memory_id"]))
+            items.append(
+                self._build_kind_repair_item(
+                    cfg, row, new_kind, reason, method="rule"
+                )
+            )
+        model_reviewed = 0
+        model_available = False
+        if use_model:
+            remaining = [
+                row
+                for row in fact_rows
+                if int(row["memory_id"]) not in rule_ids
+            ][:60]
+            model_reviewed = len(remaining)
+            decisions, model_available = await self._review_kind_with_model(remaining)
+            by_id = {int(row["memory_id"]): row for row in remaining}
+            for memory_id, new_kind in decisions.items():
+                row = by_id.get(memory_id)
+                if row is None:
+                    continue
+                items.append(
+                    self._build_kind_repair_item(
+                        cfg,
+                        row,
+                        new_kind,
+                        "模型复核",
+                        method="model",
+                    )
+                )
+        return {
+            "scanned": len(rows),
+            "fact_scanned": len(fact_rows),
+            "repairable": len(items),
+            "model_reviewed": model_reviewed,
+            "model_available": model_available,
+            "items": items[:50],
+            "_all": items,
+        }
+
+    async def apply_memory_kind_repairs(self, use_model: bool = True) -> dict[str, Any]:
+        """重新扫描并原子应用规则/模型重分类，返回应用数量。"""
+        found = await self.repair_memory_kind_candidates(use_model=use_model)
+        repairs = found.pop("_all", [])
+        applied = 0
+        if repairs and self.memory_store is not None:
+            applied = await asyncio.to_thread(
+                self.memory_store.apply_kind_repairs, repairs
+            )
+        found["applied"] = int(applied)
+        return found

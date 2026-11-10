@@ -70,6 +70,7 @@
   --drawer-scale: 0.95;
   --frost-bg: rgba(255, 255, 255, 0.58);
   --frost-bg-hover: rgba(255, 255, 255, 0.78);
+  --frost-control-bg: rgba(255, 255, 255, 0.70);
   --frost-border: rgba(255, 255, 255, 0.78);
   --frost-highlight: rgba(255, 255, 255, 0.7);
   --frost-shadow: 0 8px 22px rgba(15, 23, 42, 0.10);
@@ -139,6 +140,7 @@ body[data-theme="dark"] {
   --pane-veil: rgba(28, 34, 43, 0.62);
   --frost-bg: rgba(22, 28, 36, 0.58);
   --frost-bg-hover: rgba(30, 38, 48, 0.72);
+  --frost-control-bg: rgba(22, 28, 36, 0.70);
   --frost-border: rgba(255, 255, 255, 0.10);
   --frost-highlight: rgba(255, 255, 255, 0.14);
   --frost-shadow: 0 10px 26px rgba(0, 0, 0, 0.35);
@@ -158,6 +160,11 @@ body {
   margin: 0;
   padding: 0;
   min-height: 100%;
+}
+
+/* 侧栏开合时 body 会切换滚动条；预留 gutter，避免整页横向闪一下。 */
+html {
+  scrollbar-gutter: stable;
 }
 
 body {
@@ -231,7 +238,7 @@ textarea {
   pointer-events: none;
   /* 与卡片同一变换原点（视口纵向中心）：胶囊会跟着卡片一起缩到 95%、下移 2.5vh */
   transform-origin: left 50vh;
-  transition: transform 0.45s cubic-bezier(0.16, 1, 0.3, 1);
+  transition: transform 0.5s cubic-bezier(0.16, 1, 0.3, 1);
 }
 
 body.drawer-open .floating-controls,
@@ -328,9 +335,16 @@ body.detail-open .floating-controls {
 
 
 .content {
+  width: 100%;
   max-width: 1220px;
   margin: 0 auto;
   padding: 80px 20px 64px;
+}
+
+/* 外层只负责宽度动画，内层内容的最大宽度保持稳定，避免 max-width 切换造成瞬移。 */
+.content-viewport {
+  width: 100%;
+  margin: 0 auto;
 }
 
 .section-head {
@@ -403,7 +417,7 @@ body.drawer-open .scrim.show { pointer-events: auto; }
      缩放锚在右缘，保证滑动过程中与主面板左缘始终贴合、不出现缝。 */
   transform: translateX(-100%) scale(var(--drawer-scale, 0.95));
   transform-origin: right center;
-  transition: transform 0.45s cubic-bezier(0.16, 1, 0.3, 1);
+  transition: transform 0.5s cubic-bezier(0.16, 1, 0.3, 1);
 }
 
 .drawer.open {
@@ -418,9 +432,9 @@ body.drawer-open .scrim.show { pointer-events: auto; }
   background: var(--bg);
   transform-origin: left center;
   /* 关闭态不设置 transform,避免固定定位的弹层/提示条以主面板为容器 */
-  transition: transform 0.45s cubic-bezier(0.16, 1, 0.3, 1),
-    border-radius 0.45s cubic-bezier(0.16, 1, 0.3, 1),
-    box-shadow 0.45s cubic-bezier(0.16, 1, 0.3, 1);
+  transition: transform 0.5s cubic-bezier(0.16, 1, 0.3, 1),
+    border-radius 0.5s cubic-bezier(0.16, 1, 0.3, 1),
+    box-shadow 0.5s cubic-bezier(0.16, 1, 0.3, 1);
   /* 关闭态不能有 will-change/transform：否则 fixed 浮层会以主面板为容器，随页面滚走 */
 }
 
@@ -463,9 +477,10 @@ body.drawer-open .pane-edge {
   pointer-events: none;
   background: linear-gradient(180deg, var(--bg) 0%, transparent 100%);
   opacity: 0;
-  /* r3.3w：去掉常驻 will-change/translateZ 与高度过渡。键盘改变 iframe 视口时
-     常驻合成层会保留旧尺寸的命中区域，是「点击偏移」的放大器。 */
-  transition: opacity 0.28s cubic-bezier(0.22, 1, 0.36, 1);
+  /* 高度也做过渡，避免滚动到顶栏时遮罩突然撑开；不使用常驻合成层。 */
+  transition:
+    opacity 0.36s cubic-bezier(0.22, 1, 0.36, 1),
+    height 0.42s cubic-bezier(0.22, 1, 0.36, 1);
 }
 
 body.scrolled .top-fade {
@@ -510,8 +525,8 @@ body.tabs-at-top .top-fade {
   /* r3.3w：关闭态不创建全屏 backdrop-filter 合成层；只在面板打开时启用。 */
   -webkit-backdrop-filter: none;
   backdrop-filter: none;
-  transition: opacity 0.45s cubic-bezier(0.16, 1, 0.3, 1),
-    visibility 0s linear 0.45s;
+  transition: opacity 0.5s cubic-bezier(0.16, 1, 0.3, 1),
+    visibility 0s linear 0.5s;
 }
 
 body.drawer-open .pane-veil,
@@ -520,7 +535,7 @@ body.detail-open .pane-veil {
   visibility: visible;
   -webkit-backdrop-filter: blur(1.2px);
   backdrop-filter: blur(1.2px);
-  transition: opacity 0.45s cubic-bezier(0.16, 1, 0.3, 1),
+  transition: opacity 0.5s cubic-bezier(0.16, 1, 0.3, 1),
     visibility 0s linear 0s;
 }
 
@@ -604,17 +619,6 @@ body.detail-open {
   min-height: 0;
 }
 
-.drawer-label {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 10px 12px 6px;
-  font-size: 11.5px;
-  letter-spacing: 0.08em;
-  color: var(--muted);
-  text-transform: uppercase;
-}
-
 .drawer-groups {
   display: flex;
   flex-direction: column;
@@ -650,9 +654,22 @@ body.detail-open {
   color: var(--text);
 }
 
+.drawer-group {
+  position: relative;
+}
+
 .drawer-group.active {
-  background: var(--primary-weak);
+  background: color-mix(in srgb, var(--primary) 18%, var(--surface));
   color: var(--primary);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--primary) 28%, transparent);
+}
+
+.drawer-group.active:hover {
+  background: color-mix(in srgb, var(--primary) 23%, var(--surface));
+}
+
+.drawer-group.active .drawer-group-name {
+  font-weight: 700;
 }
 
 .drawer-group .gid {
@@ -674,8 +691,42 @@ body.detail-open {
   padding: 12px 16px 18px;
   border-top: 1px solid var(--border);
   display: flex;
-  flex-direction: column;
+  flex-direction: row;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.drawer-foot > #drawer-version {
+  flex: 1 1 auto;
+  min-width: 0;
+  margin: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11px;
+}
+
+.drawer-foot-actions {
+  flex: 0 0 auto;
+  flex-wrap: nowrap;
   gap: 6px;
+}
+
+.drawer-foot .drawer-settings {
+  padding: 6px 9px;
+  gap: 4px;
+  font-size: 11.5px;
+}
+
+.drawer-foot .drawer-settings > .icon {
+  width: 13px;
+  height: 13px;
+}
+
+.drawer-foot .drawer-dev {
+  width: 32px;
+  height: 32px;
 }
 
 /* ---------- 卡片 ---------- */
@@ -687,18 +738,6 @@ body.detail-open {
   box-shadow: var(--shadow-sm);
   padding: 18px;
   margin-bottom: 20px;
-}
-
-.card-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  margin-bottom: 12px;
-}
-
-.card-head h3 {
-  font-size: 17px;
 }
 
 .grid.two {
@@ -1034,7 +1073,17 @@ body.detail-open {
 
 /* 选中项:浅强调底 + 左侧 3px 强调色竖条 */
 .group-item.active {
-  background: var(--primary-weak);
+  background: color-mix(in srgb, var(--primary) 16%, var(--surface));
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--primary) 24%, transparent);
+}
+
+.group-item.active:hover {
+  background: color-mix(in srgb, var(--primary) 21%, var(--surface));
+}
+
+.group-item.active .gname {
+  color: var(--primary);
+  font-weight: 700;
 }
 
 .group-item.active::before {
@@ -1043,9 +1092,10 @@ body.detail-open {
   left: 0;
   top: 12px;
   bottom: 12px;
-  width: 3px;
-  border-radius: 3px;
+  width: 4px;
+  border-radius: 4px;
   background: var(--primary);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--primary) 18%, transparent);
 }
 
 .group-item .chevron {
@@ -1111,20 +1161,6 @@ body.detail-open {
   height: 40px;
   border-radius: 999px;
   padding: 0 16px;
-}
-
-.panel-head {
-  display: flex;
-  justify-content: space-between;
-  align-items: flex-start;
-  gap: 12px;
-  padding-bottom: 14px;
-  border-bottom: 1px solid var(--hairline);
-}
-
-.panel-head h3 {
-  font-family: var(--mono);
-  font-size: 17px;
 }
 
 .switch-inline {
@@ -1498,7 +1534,7 @@ html {
 }
 
 .switch input:checked + .slider {
-  background: var(--primary);
+  background: #00b553;
 }
 
 .switch input:checked + .slider::before {
@@ -1517,15 +1553,6 @@ html {
 
 .switch.readonly .slider {
   cursor: default;
-}
-
-.form-footer {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding-top: 16px;
-  margin-top: 8px;
-  border-top: 1px solid var(--hairline);
 }
 
 /* ---------- 按钮 ---------- */
@@ -1684,16 +1711,8 @@ button:disabled {
   width: 150px;
 }
 
-.w-roles {
-  width: 150px;
-}
-
 .w-time {
   width: 180px;
-}
-
-.w-act {
-  width: 140px;
 }
 
 .pill {
@@ -1768,7 +1787,7 @@ button:disabled {
   overflow: hidden;
   transform: translateX(-100%) scale(var(--drawer-scale, 0.95));
   transform-origin: right center;
-  transition: transform 0.45s cubic-bezier(0.16, 1, 0.3, 1);
+  transition: transform 0.5s cubic-bezier(0.16, 1, 0.3, 1);
   z-index: 5;
   display: flex;
   flex-direction: column;
@@ -2095,8 +2114,7 @@ button:disabled {
     justify-content: flex-start;
   }
 
-  .w-scope,
-  .w-roles {
+  .w-scope {
     display: none;
   }
 
@@ -2104,13 +2122,6 @@ button:disabled {
     font-size: 12.5px;
   }
 
-  .panel-head {
-    flex-direction: column;
-  }
-
-  .form-footer {
-    flex-wrap: wrap;
-  }
 }
 
 /* 390px 一档:整页不出现横向滚动,仅分段控件自身可横滚 */
@@ -2243,6 +2254,23 @@ button:disabled {
 .drawer-manage:hover {
   border-color: var(--primary);
   color: var(--primary);
+}
+
+/* 管理全部群：缩小为内容宽度，不再占满整行。 */
+.drawer-manage-merged {
+  width: auto;
+  max-width: 100%;
+  align-self: flex-start;
+  padding: 7px 10px;
+  gap: 8px;
+}
+
+.drawer-manage-merged .drawer-manage-title {
+  font-size: 13px;
+}
+
+.drawer-manage-merged .drawer-count {
+  margin-left: 8px;
 }
 
 .drawer-settings {
@@ -2457,22 +2485,6 @@ button:disabled {
   border-color: var(--danger) !important;
 }
 
-/* 提示小圆点 */
-.hint-dot {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 15px;
-  height: 15px;
-  margin-left: 6px;
-  border-radius: 50%;
-  background: var(--surface-3);
-  color: var(--muted);
-  font-size: 10.5px;
-  cursor: help;
-  vertical-align: middle;
-}
-
 /* 全局设置表单:行规则已在「群配置」区统一(label 左 / control 右 / hint 下方) */
 @media (max-width: 720px) {
   .group-panel-head {
@@ -2512,22 +2524,20 @@ button:disabled {
 
 
 /* ---------- 内联 SVG 图标 ---------- */
-.svg-sprite {
-  position: absolute;
-  width: 0;
-  height: 0;
-  overflow: hidden;
-}
-
 .icon {
+  display: inline-block;
   width: 16px;
   height: 16px;
   flex: none;
-  stroke: currentColor;
-  fill: none;
-  stroke-width: 1.8;
-  stroke-linecap: round;
-  stroke-linejoin: round;
+  background-color: currentColor;
+  -webkit-mask-image: var(--icon-url);
+  mask-image: var(--icon-url);
+  -webkit-mask-repeat: no-repeat;
+  mask-repeat: no-repeat;
+  -webkit-mask-position: center;
+  mask-position: center;
+  -webkit-mask-size: contain;
+  mask-size: contain;
   vertical-align: middle;
 }
 
@@ -2680,11 +2690,15 @@ button:disabled {
 }
 
 .auto-memory-head {
+  display: block;
+}
+
+.auto-memory-title-row {
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
   gap: 12px;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
 }
 
 .auto-memory-head h3 {
@@ -2693,13 +2707,34 @@ button:disabled {
 }
 
 .auto-memory-head p {
-  margin: 0;
+  margin: 4px 0 0;
+}
+
+@media (max-width: 480px) {
+  .auto-memory-head p {
+    font-size: 11.5px;
+  }
 }
 
 .auto-memory-actions {
   display: inline-flex;
-  align-items: center;
-  gap: 8px;
+  align-items: flex-start;
+  align-self: flex-start;
+  justify-content: flex-end;
+  flex: none;
+  margin-left: auto;
+  gap: 10px;
+}
+
+.auto-memory-switch {
+  height: 31px;
+  min-height: 31px;
+  margin-top: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  gap: 0;
+  align-self: flex-start;
 }
 
 .auto-memory-body {
@@ -2733,19 +2768,6 @@ button:disabled {
   overflow-wrap: break-word;
 }
 
-.auto-memory-stats {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px 16px;
-  margin-top: 12px;
-  font-size: 12.5px;
-  color: var(--text-2);
-}
-
-.auto-memory-stats b {
-  color: var(--text);
-}
-
 .auto-memory-foot {
   margin-top: 10px;
 }
@@ -2756,16 +2778,12 @@ button:disabled {
   border-color: var(--border) !important;
 }
 
-.source-pill {
-  font-size: 11px;
-}
-
 /* ---------- 用户屏蔽 ---------- */
 .drawer-foot-actions {
   display: flex;
   align-items: center;
-  gap: 8px;
-  flex-wrap: wrap;
+  gap: 6px;
+  flex-wrap: nowrap;
 }
 
 .drawer-foot-actions .drawer-settings {
@@ -2835,6 +2853,14 @@ button:disabled {
   gap: 10px;
   margin-top: 10px;
   align-items: end;
+}
+
+/* 群配置内的“用户屏蔽”页需要独立浅色卡片，避免表单和页面底色混在一起。 */
+#group-form .tab-panel[data-panel="user_block"] {
+  padding: var(--card-pad);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
 }
 
 .block-form.compact {
@@ -2923,15 +2949,62 @@ button.btn-loading .icon {
   transform: scale(0.15) rotate(-120deg);
 }
 
-.btn-spinner {
+/* 刷新按钮：图标留在原位旋转，不切换成额外 spinner。 */
+button .icon-refresh {
+  transform-origin: 50% 50%;
+  transition: transform 0.24s ease, opacity 0.15s ease;
+}
+
+button.btn-loading .icon-refresh {
+  opacity: 1;
+  transform: none;
+  will-change: transform;
+  animation: areply-icon-spin 1s linear infinite;
+}
+
+@keyframes areply-icon-spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+/* 所有按钮加载态：Morphicons 形变为 i-refresh 后旋转。 */
+button .btn-morph-icon {
+  opacity: 1;
+  transform: none;
+  transform-origin: 50% 50%;
+}
+
+button.btn-loading .btn-morph-icon {
+  opacity: 1 !important;
+  /* 不能给 transform 加 !important，否则会压过 CSS 旋转动画。 */
+  transform: none;
+  will-change: transform;
+  animation: areply-icon-spin 1s linear infinite;
+}
+
+/* 转完完整一圈后停止旋转，开始形变回原图标。 */
+button.btn-morph-back .btn-morph-icon {
+  animation: none;
+}
+
+.btn-morph-icon.btn-morph-overlay {
   position: absolute;
-  width: 14px;
-  height: 14px;
-  border: 2px solid currentColor;
-  border-right-color: transparent;
-  border-radius: 50%;
-  pointer-events: none;
-  animation: areply-spin 0.7s linear infinite, areply-fade 0.15s ease;
+  top: 50%;
+  left: 50%;
+  width: 16px;
+  height: 16px;
+  margin: -8px 0 0 -8px;
+  color: var(--text);
+  z-index: 2;
+}
+
+button.btn-morph-textless {
+  font-size: 0;
+  color: transparent;
+}
+
+button.btn-morph-textless .btn-morph-icon {
+  color: var(--text);
 }
 
 @keyframes areply-spin {
@@ -3003,13 +3076,48 @@ button.btn-loading .icon {
   padding-bottom: 12px;
 }
 
+/* 记忆统计托盘内容较多；240px 会把后半部分卡片裁掉，单独放宽高度。 */
+#rag-stats-card .source-tray.open {
+  max-height: 1400px;
+}
+
 .source-row {
   display: grid;
-  grid-template-columns: 10px 48px 64px 1fr;
-  gap: 8px;
+  grid-template-columns: 8px minmax(0, 1fr) auto minmax(96px, 150px);
+  gap: 10px;
   align-items: center;
-  padding: 7px 0;
+  padding: 8px 10px;
+  border-radius: 10px;
   font-size: 12.5px;
+  transition: background 0.16s ease;
+}
+
+.source-row + .source-row {
+  margin-top: 2px;
+}
+
+.source-row:hover {
+  background: color-mix(in srgb, var(--surface-2) 62%, transparent);
+}
+
+.source-row.is-zero {
+  grid-template-columns: 8px minmax(0, 1fr) auto;
+  background: color-mix(in srgb, var(--surface-2) 45%, transparent);
+}
+
+.source-row.is-zero .source-bar {
+  display: none;
+}
+
+.source-row.is-zero .source-count {
+  color: var(--muted);
+  font-weight: 500;
+}
+
+.source-count {
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+  font-weight: 700;
 }
 
 .source-dot {
@@ -3039,16 +3147,34 @@ button.btn-loading .icon {
 }
 
 .source-bar {
-  height: 6px;
+  height: 8px;
   border-radius: 999px;
-  background: var(--surface-3);
+  background: color-mix(in srgb, var(--surface-3) 78%, transparent);
   overflow: hidden;
 }
 
 .source-bar i {
   display: block;
   height: 100%;
+  min-width: 4px;
   border-radius: inherit;
+  transition: width 0.45s cubic-bezier(0.22, 0.7, 0.2, 1);
+}
+
+.source-bar i.personal {
+  background: linear-gradient(90deg, var(--dot-blue), color-mix(in srgb, var(--dot-blue) 55%, var(--surface)));
+}
+
+.source-bar i.group {
+  background: linear-gradient(90deg, var(--dot-green), color-mix(in srgb, var(--dot-green) 55%, var(--surface)));
+}
+
+.source-bar i.private {
+  background: linear-gradient(90deg, var(--dot-violet), color-mix(in srgb, var(--dot-violet) 55%, var(--surface)));
+}
+
+.source-bar i.unknown {
+  background: linear-gradient(90deg, var(--dot-gray), color-mix(in srgb, var(--dot-gray) 55%, var(--surface)));
 }
 
 /* ---------- 身份 / 类型颜色(全部走 token,底色由前景色混合得到) ---------- */
@@ -3448,6 +3574,7 @@ button.btn-loading .icon {
   display: block;
   height: 100%;
   width: 100%;
+  margin: 0 auto;
   background: var(--snack-bar);
 }
 
@@ -3593,7 +3720,14 @@ button.btn-loading .icon {
 }
 
 .sticky-head .seg-wrap {
+  width: fit-content;
+  max-width: 100%;
   margin: 0;
+}
+
+.sticky-head .seg {
+  width: fit-content;
+  max-width: 100%;
 }
 
 .head-card {
@@ -4088,9 +4222,9 @@ button.btn-loading .icon {
 /* 记忆页「自动记忆」:窄屏时状态徽标在左、开关按钮在右,独占一行 */
 @media (max-width: 720px) {
   .auto-memory-actions {
-    width: 100%;
-    justify-content: space-between;
-    margin-left: 0;
+    width: auto;
+    justify-content: flex-end;
+    margin-left: auto;
   }
 }
 
@@ -4272,8 +4406,8 @@ button.btn-loading .icon {
 }
 
 #independent-wrap .switch input:checked + .slider {
-  background: var(--primary);
-  border-color: var(--primary);
+  background: #00b553;
+  border-color: #00b553;
 }
 
 #independent-wrap .switch input:checked + .slider::before {
@@ -4505,10 +4639,6 @@ button.btn-loading .icon {
 #view-dev .dev-hint {
   margin: 0;
   line-height: 1.55;
-}
-
-#view-dev #dev-hint:empty {
-  display: none;
 }
 
 /* 窄屏:三列筛选收紧间距,输入框不溢出;开发者工具按钮独占一行更好点按 */
@@ -5468,15 +5598,6 @@ button.btn-loading .icon {
   font-weight: 700;
 }
 
-.drawer-manage-sub {
-  margin-top: 1px;
-  color: var(--muted);
-  font-size: 10.5px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
 .drawer-count {
   margin-left: auto;
   padding: 1px 7px;
@@ -5531,27 +5652,83 @@ button.btn-loading .icon {
 .skeleton-mem-row .skeleton-mem-cell {
   position: relative !important;
   display: block !important;
-  padding: 8px 42px 8px 10px !important;
-  border: 0 !important;
-  background: transparent !important;
+  width: 100% !important;
+  min-height: 88px;
+  padding: 16px 18px !important;
+  border: 1px solid var(--hairline) !important;
+  border-radius: 14px !important;
+  background: color-mix(in srgb, var(--surface-2) 72%, var(--hairline)) !important;
+  overflow: hidden;
+  box-sizing: border-box;
+}
+
+/* 和真实记忆卡片一致：ID / 时间 / 群范围 / 右侧箭头。 */
+.skeleton-mem-card {
+  display: grid;
+  grid-template-columns: minmax(0, 1.15fr) minmax(0, 0.9fr) minmax(0, 0.8fr) 28px;
+  align-items: center;
+  gap: 16px;
+  min-height: 55px;
+}
+
+.skeleton-mem-card .skeleton-line {
+  width: 100%;
+  margin: 0;
+}
+
+.skeleton-mem-card .skeleton-line-id { height: 14px; }
+.skeleton-mem-card .skeleton-line-time { height: 12px; }
+.skeleton-mem-card .skeleton-line-scope { height: 12px; }
+
+/* 整张骨架卡片扫光；内部灰条仍保留自身 shimmer。 */
+.skeleton-mem-cell::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  transform: translateX(-100%);
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    color-mix(in srgb, var(--surface) 55%, transparent) 50%,
+    transparent 100%
+  );
+  animation: skeleton-card-shimmer 1.4s linear infinite;
+  pointer-events: none;
+}
+
+.skeleton-mem-row .skeleton::after {
+  display: none;
+}
+
+@keyframes skeleton-card-shimmer {
+  from { transform: translateX(-100%); }
+  to { transform: translateX(100%); }
+}
+
+/* 加载完成后内容缓慢淡入。 */
+@keyframes rag-row-fade-in {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+#rag-body.rag-fade-in > tr.mem-row {
+  animation: rag-row-fade-in 0.4s ease both;
 }
 
 .skeleton-line {
   height: 12px;
   margin: 0 0 5px;
+  background: color-mix(in srgb, var(--surface) 55%, var(--hairline));
 }
 
 .skeleton-line-id { width: 42%; height: 13px; }
 .skeleton-line-time { width: 56%; height: 11px; }
 .skeleton-line-scope { width: 38%; height: 11px; margin-bottom: 0; }
 .skeleton-arrow {
-  position: absolute;
-  top: 50%;
-  right: 9px;
   width: 28px;
   height: 28px;
   border-radius: 50%;
-  transform: translateY(-50%);
+  justify-self: end;
 }
 
 .skeleton-drawer-row {
@@ -5700,14 +5877,18 @@ button.btn-loading .icon {
   color: var(--text-2) !important;
 }
 
-#rag-select-btn:hover,
-#rag-archived-btn:hover {
-  color: var(--primary) !important;
-  border-color: var(--primary) !important;
+/* 触屏设备不保留粘滞 hover，避免点完后按钮仍显得发绿。 */
+@media (hover: hover) {
+  #rag-select-btn:hover,
+  #rag-archived-btn:hover {
+    color: var(--primary) !important;
+    border-color: var(--primary) !important;
+  }
 }
 
-#rag-select-btn.active,
-#rag-archived-btn.active {
+/* 高亮只认 aria-pressed，避免历史遗留的 .active 类导致按钮一直发绿。 */
+#rag-select-btn[aria-pressed="true"],
+#rag-archived-btn[aria-pressed="true"] {
   color: var(--primary) !important;
   border-color: var(--primary) !important;
   background: color-mix(in srgb, var(--primary) 10%, var(--surface-2)) !important;
@@ -5812,4 +5993,693 @@ button.btn-loading .icon {
   color: var(--muted);
   font-size: 12px;
   line-height: 1.55;
+}
+
+/* 漫游式引导：透明聚光灯 + 深色遮罩，不拦截背景点击。 */
+.tour-root {
+  position: fixed;
+  inset: 0;
+  z-index: 120;
+  pointer-events: auto;
+  overscroll-behavior: none;
+}
+.tour-spot {
+  position: fixed;
+  border: 2px solid var(--primary);
+  border-radius: 10px;
+  box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.72);
+  pointer-events: none;
+  transition:
+    top 0.24s cubic-bezier(0.22, 0.7, 0.2, 1),
+    left 0.24s cubic-bezier(0.22, 0.7, 0.2, 1),
+    width 0.24s cubic-bezier(0.22, 0.7, 0.2, 1),
+    height 0.24s cubic-bezier(0.22, 0.7, 0.2, 1);
+  will-change: top, left, width, height;
+}
+.tour-hit {
+  position: fixed;
+  z-index: 1;
+  border-radius: 10px;
+  cursor: pointer;
+  pointer-events: auto;
+}
+.tour-pop {
+  position: fixed;
+  z-index: 2;
+  width: min(330px, calc(100vw - 24px));
+  padding: 14px 16px;
+  border: 1px solid var(--hairline);
+  border-radius: 14px;
+  background: var(--surface);
+  color: var(--text);
+  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.45);
+  pointer-events: auto;
+  transition: top 0.2s ease, left 0.2s ease;
+}
+.tour-step {
+  display: inline-block;
+  margin-bottom: 4px;
+  color: var(--primary);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+}
+.tour-pop h3 {
+  margin: 0 0 6px;
+  font-size: 16px;
+}
+.tour-pop p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12.5px;
+  line-height: 1.65;
+}
+.tour-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+/* 外置 SVG 图标：颜色由 background-color: currentColor 控制。 */
+.icon-activity { --icon-url: url("./assets/icons/i-activity.svg"); }
+.icon-archive { --icon-url: url("./assets/icons/i-archive.svg"); }
+.icon-arrow-right { --icon-url: url("./assets/icons/i-arrow-right.svg"); }
+.icon-check { --icon-url: url("./assets/icons/i-check.svg"); }
+.icon-close { --icon-url: url("./assets/icons/i-close.svg"); }
+.icon-database { --icon-url: url("./assets/icons/i-database.svg"); }
+.icon-eye { --icon-url: url("./assets/icons/i-eye.svg"); }
+.icon-funnel { --icon-url: url("./assets/icons/i-funnel.svg"); }
+.icon-inbox { --icon-url: url("./assets/icons/i-inbox.svg"); }
+.icon-layers { --icon-url: url("./assets/icons/i-layers.svg"); }
+.icon-left { --icon-url: url("./assets/icons/i-left.svg"); }
+.icon-menu { --icon-url: url("./assets/icons/i-menu.svg"); }
+.icon-message { --icon-url: url("./assets/icons/i-message.svg"); }
+.icon-refresh { --icon-url: url("./assets/icons/i-refresh.svg"); }
+.icon-reset { --icon-url: url("./assets/icons/i-reset.svg"); }
+.icon-right { --icon-url: url("./assets/icons/i-right.svg"); }
+.icon-search { --icon-url: url("./assets/icons/i-search.svg"); }
+.icon-select { --icon-url: url("./assets/icons/i-select.svg"); }
+.icon-settings { --icon-url: url("./assets/icons/i-settings.svg"); }
+.icon-shield { --icon-url: url("./assets/icons/i-shield.svg"); }
+.icon-sliders { --icon-url: url("./assets/icons/i-sliders.svg"); }
+.icon-sparkles { --icon-url: url("./assets/icons/i-sparkles.svg"); }
+.icon-theme-dark { --icon-url: url("./assets/icons/i-theme-dark.svg"); }
+.icon-theme-light { --icon-url: url("./assets/icons/i-theme-light.svg"); }
+.icon-theme-system { --icon-url: url("./assets/icons/i-theme-system.svg"); }
+.icon-trash { --icon-url: url("./assets/icons/i-trash.svg"); }
+.icon-users { --icon-url: url("./assets/icons/i-users.svg"); }
+.icon-wrench { --icon-url: url("./assets/icons/i-wrench.svg"); }
+
+/* Morphicons 专用图标：路径由外部 SVG 文件加载，不走 mask。 */
+.icon.morph-icon {
+  background: none;
+  -webkit-mask: none;
+  mask: none;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+/* PC 端：侧边栏推挤主页面时缩到剩余宽度，而不是整体移出屏幕。 */
+@media (min-width: 900px) {
+  :root {
+    --drawer-w: 360px;
+    --pane-scale: 0.95;
+  }
+
+  body {
+    overflow: hidden;
+  }
+
+  .main-pane {
+    width: 100%;
+    height: 100vh;
+    overflow-y: auto;
+    overflow-anchor: none;
+    transition:
+      width 0.5s cubic-bezier(0.16, 1, 0.3, 1),
+      transform 0.5s cubic-bezier(0.16, 1, 0.3, 1),
+      border-radius 0.5s cubic-bezier(0.16, 1, 0.3, 1),
+      box-shadow 0.5s cubic-bezier(0.16, 1, 0.3, 1);
+  }
+
+  .drawer {
+    transition: transform 0.5s cubic-bezier(0.16, 1, 0.3, 1);
+  }
+
+  /* 开合双向都保留 left/right/top 过渡，按钮不会瞬移。 */
+  .floating-controls {
+    transition:
+      left 0.5s cubic-bezier(0.16, 1, 0.3, 1),
+      right 0.5s cubic-bezier(0.16, 1, 0.3, 1),
+      top 0.5s cubic-bezier(0.16, 1, 0.3, 1),
+      transform 0.5s cubic-bezier(0.16, 1, 0.3, 1);
+  }
+
+  .main-pane.is-pushed {
+    /* 卡片宽度补到缩放后正好填满剩余区域：内容完整且右侧无空白。 */
+    width: calc(105.2632vw - 378.947px);
+    height: 100vh;
+    transform: translateX(var(--drawer-w)) scale(var(--pane-scale));
+    border-radius: var(--pane-radius) 0 0 var(--pane-radius);
+    box-shadow: var(--shadow-push);
+    overflow-y: auto;
+  }
+
+  body.panel-closing .drawer {
+    will-change: transform;
+  }
+
+  /* Tab 栏移动到浮动顶栏内部，和菜单/主题按钮同一 flex 行。 */
+  .sticky-head {
+    max-width: 100vw;
+    background: transparent;
+  }
+
+  /* PC Tab 栏与汉堡/主题按钮同款磨砂质感。 */
+  .sticky-head .seg {
+    background: var(--frost-bg);
+    border: 1px solid var(--frost-border);
+    box-shadow: var(--frost-shadow), inset 0 1px 0 var(--frost-highlight);
+    -webkit-backdrop-filter: blur(16px) saturate(1.35);
+    backdrop-filter: blur(16px) saturate(1.35);
+  }
+
+  .floating-controls > .sticky-head.tabs-in-topbar {
+    position: static;
+    flex: 0 1 auto;
+    min-width: 0;
+    width: fit-content;
+    max-width: 100%;
+    height: 46px;
+    margin: 0 auto;
+    padding: 0;
+    /* 容器本身透明；只让内部 .seg 显示标签背景，避免右侧出现整块灰底。 */
+    background: transparent;
+    box-shadow: none;
+    border-radius: 14px;
+    transform: none;
+    transform-origin: top left;
+    pointer-events: auto;
+    display: flex;
+    align-items: center;
+    z-index: auto;
+  }
+
+  .floating-controls > .sticky-head.tabs-in-topbar .seg-wrap {
+    display: flex;
+    align-items: center;
+    width: auto;
+    max-width: 100%;
+    height: 100%;
+    margin: 0;
+    overflow: visible;
+    pointer-events: auto;
+  }
+
+  .floating-controls > .sticky-head.tabs-in-topbar .seg {
+    width: auto;
+    max-width: 100%;
+  }
+
+  /* PC 不要 Tab 下方的渐变遮罩。 */
+  .sticky-head .seg-wrap::after,
+  .floating-controls > .sticky-head.tabs-in-topbar .seg-wrap::after {
+    display: none;
+  }
+
+  body.tabs-at-top .top-fade {
+    display: none;
+  }
+
+  /* 搬到顶栏时原位置占位，避免正文跳动。 */
+  .tabs-flow-gap {
+    display: block;
+    width: 100%;
+    pointer-events: none;
+  }
+
+  /* 固定测量锚点：不随 Tab 搬移而变化，避免边界处反复吸顶/回归。 */
+  .tabs-flow-anchor {
+    display: block;
+    width: 0;
+    height: 0;
+    margin: 0;
+    padding: 0;
+    pointer-events: none;
+  }
+
+  /* PC 展开侧栏后主页面仍可操作；不显示遮罩，也不靠点击遮罩关闭。 */
+  body.drawer-open .scrim.show,
+  body.drawer-open .pane-veil {
+    pointer-events: none;
+  }
+
+  body.drawer-open .pane-veil {
+    opacity: 0;
+    visibility: hidden;
+  }
+
+  /* PC 侧栏打开后，顶栏按钮跟随主卡片一起缩放，始终留在卡片内。 */
+  /* 顶栏只跟随卡片位置移动，按钮本身保持原始大小。 */
+  /* PC：主题按钮紧挨 Active Reply，隐藏“浅色/深色”徽标。 */
+  .floating-controls {
+    justify-content: flex-start;
+    gap: 10px;
+  }
+
+  .topbar-right {
+    order: 1;
+    margin-left: 10px;
+  }
+
+  #theme-chip {
+    display: none;
+  }
+
+  .floating-controls > .sticky-head.tabs-in-topbar {
+    order: 2;
+    margin-left: 10px;
+    margin-right: 0;
+  }
+
+  /* 顶栏内缩到卡片内部，避免贴着卡片圆角/边缘。 */
+  body.drawer-open .floating-controls {
+    left: calc(var(--drawer-w) + 28px);
+    right: calc(2.5vw + 28px);
+    top: calc(2.5vh + 20px);
+    width: auto;
+    transform: none;
+    transition:
+      left 0.5s cubic-bezier(0.16, 1, 0.3, 1),
+      right 0.5s cubic-bezier(0.16, 1, 0.3, 1),
+      top 0.5s cubic-bezier(0.16, 1, 0.3, 1);
+  }
+}
+
+
+/* 指定磨砂控件：透明度 70%，模糊半径取原 16px 的 70% = 11.2px。 */
+.menu-capsule,
+.theme-btn,
+.sticky-head .seg {
+  background: var(--frost-control-bg);
+  -webkit-backdrop-filter: blur(11.2px) saturate(1.35);
+  backdrop-filter: blur(11.2px) saturate(1.35);
+}
+
+.menu-capsule:hover,
+.theme-btn:hover {
+  background: var(--frost-control-bg);
+}
+
+/* 侧栏：管理全部群保持紧凑宽度，底部版本与操作同一行。 */
+.drawer-manage.drawer-manage-merged {
+  width: auto;
+  max-width: 100%;
+  align-self: flex-start;
+  padding: 7px 10px !important;
+}
+
+.drawer-foot > #drawer-version {
+  flex: 1 1 auto;
+  min-width: 0;
+  margin: 0;
+}
+
+/* 管理全部群：恢复整行按钮，缩短纵向高度。 */
+.drawer-manage.drawer-manage-merged {
+  width: 100%;
+  max-width: 100%;
+  align-self: stretch;
+  margin: 2px 0 6px !important;
+  padding: 6px 10px !important;
+  gap: 8px;
+  border-radius: 11px;
+}
+
+.drawer-manage-merged .drawer-manage-icon {
+  flex: 0 0 26px;
+  width: 26px;
+  height: 26px;
+  border-radius: 8px;
+}
+
+.drawer-manage-merged .drawer-manage-title {
+  font-size: 13px;
+  line-height: 1.2;
+}
+
+.drawer-manage-merged .drawer-count {
+  margin-left: auto;
+}
+
+/* 手机端群页：群信息进入顶栏，位于菜单与主题按钮之间；Tab 遮罩保持原样。 */
+.group-mini-head {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 46px;
+  padding: 0 10px;
+  border: 1px solid var(--frost-control-border, var(--frost-border));
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--surface) 54%, transparent);
+  -webkit-backdrop-filter: blur(20px) saturate(1.6);
+  backdrop-filter: blur(20px) saturate(1.6);
+  box-shadow: var(--frost-shadow);
+  overflow: hidden;
+  pointer-events: auto;
+}
+
+.group-mini-head[hidden] {
+  display: none !important;
+}
+
+.group-mini-avatar {
+  width: 30px;
+  height: 30px;
+  flex: none;
+  border-radius: 9px;
+  object-fit: cover;
+  background: var(--surface-2);
+}
+
+.group-mini-text {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  min-width: 0;
+  line-height: 1.2;
+}
+
+.group-mini-text b {
+  overflow: hidden;
+  color: var(--text);
+  font-size: 12.5px;
+  font-weight: 700;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.group-mini-text span {
+  overflow: hidden;
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+@media (max-width: 899px) {
+  /* Circle to Pill：群信息条出现时，胶囊平滑收成圆形图标。 */
+  .menu-capsule {
+    max-width: 240px;
+    overflow: hidden;
+    transition:
+      max-width 0.5s cubic-bezier(0.22, 1, 0.36, 1),
+      padding 0.5s cubic-bezier(0.22, 1, 0.36, 1),
+      gap 0.5s cubic-bezier(0.22, 1, 0.36, 1);
+  }
+
+  .menu-capsule-label {
+    max-width: 180px;
+    overflow: hidden;
+    opacity: 1;
+    white-space: nowrap;
+    transition:
+      max-width 0.5s cubic-bezier(0.22, 1, 0.36, 1),
+      opacity 0.35s ease;
+  }
+
+  body.group-head-stuck .menu-capsule {
+    max-width: 46px;
+    padding: 0 7px;
+    gap: 0;
+  }
+
+  body.group-head-stuck .menu-capsule-label {
+    max-width: 0;
+    opacity: 0;
+  }
+}
+
+@media (min-width: 900px) {
+  .group-mini-head {
+    display: none !important;
+  }
+}
+
+
+/* 群信息条进出动画：从顶栏上方淡入下滑；原群信息卡同步淡出。 */
+@media (max-width: 899px) {
+  .group-mini-head {
+    position: absolute;
+    left: 66px;
+    right: 66px;
+    top: 0;
+    z-index: 1;
+    opacity: 0;
+    visibility: hidden;
+    transform: translateY(-8px) scale(0.94);
+    transition:
+      opacity 0.5s ease,
+      transform 0.5s cubic-bezier(0.22, 1, 0.36, 1),
+      visibility 0s linear 0.5s;
+  }
+
+  .group-mini-head.is-visible {
+    opacity: 1;
+    visibility: visible;
+    transform: translateY(0) scale(1);
+    transition:
+      opacity 0.5s ease,
+      transform 0.5s cubic-bezier(0.22, 1, 0.36, 1),
+      visibility 0s linear 0s;
+  }
+
+  #group-head-card {
+    position: static;
+    transition:
+      opacity 0.5s ease,
+      transform 0.5s cubic-bezier(0.22, 1, 0.36, 1);
+  }
+
+  body.group-head-stuck #group-head-card {
+    opacity: 1;
+    visibility: visible;
+    transform: none;
+  }
+}
+
+/* 顶栏群信息条内的独立配置 / 恢复默认 / 保存。 */
+.group-mini-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex: none;
+  margin-left: auto;
+}
+
+.group-mini-action {
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: var(--frost-chip-bg);
+  color: var(--text-2);
+  -webkit-backdrop-filter: blur(12px) saturate(1.3);
+  backdrop-filter: blur(12px) saturate(1.3);
+  box-shadow: var(--frost-chip-shadow);
+  transition:
+    color 0.18s ease,
+    background 0.18s ease;
+}
+
+.group-mini-action > .icon {
+  width: 14px;
+  height: 14px;
+}
+
+.group-mini-action:hover {
+  color: var(--primary);
+  background: var(--frost-control-bg);
+}
+
+.group-mini-action.active {
+  color: var(--primary);
+  background: color-mix(in srgb, var(--primary) 14%, var(--frost-chip-bg));
+}
+
+.group-mini-action.primary {
+  background: var(--primary);
+  color: var(--on-primary, #fff);
+}
+
+.group-mini-action:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+/* Card to Pill：群信息卡收缩后必须让出空间，避免大卡残留在胶囊下方。 */
+@media (max-width: 899px) {
+  #group-head-card {
+    max-height: 320px;
+    overflow: hidden;
+    transition:
+      max-height 0.5s cubic-bezier(0.22, 1, 0.36, 1),
+      padding 0.5s cubic-bezier(0.22, 1, 0.36, 1),
+      margin 0.5s cubic-bezier(0.22, 1, 0.36, 1),
+      opacity 0.5s ease,
+      transform 0.5s cubic-bezier(0.22, 1, 0.36, 1);
+  }
+
+  body.group-head-stuck #group-head-card {
+    max-height: 0 !important;
+    padding-top: 0 !important;
+    padding-bottom: 0 !important;
+    margin-top: 0 !important;
+    margin-bottom: 0 !important;
+    border-width: 0 !important;
+    opacity: 0;
+  }
+}
+
+/* 内嵌操作按钮：固定圆形、去掉描边和阴影，保留磨砂。 */
+.group-mini-action,
+.group-mini-action:focus-visible {
+  flex: 0 0 28px;
+  align-self: center;
+  width: 28px !important;
+  min-width: 28px !important;
+  max-width: 28px !important;
+  height: 28px !important;
+  min-height: 28px !important;
+  max-height: 28px !important;
+  aspect-ratio: 1 / 1;
+  box-sizing: border-box;
+  padding: 0 !important;
+  border: 0 !important;
+  border-radius: 50% !important;
+  box-shadow: none !important;
+  background: var(--frost-chip-bg);
+  -webkit-backdrop-filter: blur(12px) saturate(1.3);
+  backdrop-filter: blur(12px) saturate(1.3);
+}
+
+.group-mini-action.active {
+  background: color-mix(in srgb, var(--primary) 14%, var(--frost-chip-bg));
+}
+
+.group-mini-action.primary {
+  background: var(--primary);
+  color: var(--on-primary, #fff);
+}
+
+/* 仅群信息卡片磨砂；卡片上的保存/恢复按钮加圆形小灰底。 */
+#group-head-card {
+  background: var(--frost-control-bg) !important;
+  border: 1px solid var(--frost-border) !important;
+  box-shadow: var(--frost-shadow), inset 0 1px 0 var(--frost-highlight) !important;
+  -webkit-backdrop-filter: blur(16px) saturate(1.35);
+  backdrop-filter: blur(16px) saturate(1.35);
+}
+
+/* 顶部群信息胶囊内三个按钮的浅灰圆形底。 */
+@media (max-width: 899px) {
+  .group-mini-action {
+    background: color-mix(in srgb, var(--text-2) 50%, var(--surface-3)) !important;
+    border: none !important;
+    border-radius: 50% !important;
+    box-shadow: none !important;
+  }
+
+  .group-mini-action.active {
+    background: color-mix(in srgb, var(--primary) 10%, var(--surface-2)) !important;
+  }
+
+  .group-mini-action.primary {
+    background: var(--primary) !important;
+  }
+}
+
+/* 顶部胶囊按钮灰底：提高对比度，确保独立配置/恢复按钮清晰可见。 */
+@media (max-width: 899px) {
+  #group-mini-independent,
+  #group-mini-reset {
+    background: color-mix(in srgb, var(--text-2) 70%, var(--surface-3)) !important;
+    color: var(--surface) !important;
+    border: 1px solid color-mix(in srgb, var(--text-2) 40%, transparent) !important;
+    border-radius: 50% !important;
+  }
+
+  #group-mini-independent.active {
+    background: color-mix(in srgb, var(--primary) 26%, var(--surface-3)) !important;
+    color: var(--primary) !important;
+    border-color: color-mix(in srgb, var(--primary) 45%, transparent) !important;
+  }
+
+  #group-mini-save {
+    color: var(--primary-text, #fff) !important;
+  }
+}
+
+/* 顶部胶囊按钮改为参考图的浅灰圆底，图标恢复深色。 */
+@media (max-width: 899px) {
+  #group-mini-independent,
+  #group-mini-reset {
+    background: var(--surface-2) !important;
+    color: var(--text) !important;
+    border: none !important;
+    box-shadow: none !important;
+  }
+
+  #group-mini-independent.active {
+    background: var(--surface-2) !important;
+    color: var(--primary) !important;
+    border: none !important;
+  }
+}
+
+/* 汉堡菜单图标严格居中；收成圆形时不再受文字标签影响。 */
+.menu-capsule-icon {
+  line-height: 0;
+}
+
+.menu-capsule-icon .icon {
+  display: block;
+  margin: auto;
+}
+
+@media (max-width: 899px) {
+  body.group-head-stuck .menu-capsule {
+    justify-content: center;
+    padding: 0 !important;
+    gap: 0 !important;
+  }
+
+  body.group-head-stuck .menu-capsule-label {
+    flex: 0 1 0;
+    min-width: 0;
+    width: 0;
+  }
+}
+
+/* 汉堡菜单收圆时固定 46px 宽高，避免 auto 宽度被内容挤成椭圆。 */
+@media (max-width: 899px) {
+  body.group-head-stuck .menu-capsule {
+    width: 46px !important;
+    min-width: 46px !important;
+    max-width: 46px !important;
+    flex: 0 0 46px;
+    height: 46px !important;
+    padding: 0 !important;
+    border-radius: 50% !important;
+  }
 }

@@ -1504,6 +1504,7 @@ class MemoryStore:
         group_scope: str = "",
         role_id: str = "",
         memory_type: str = "",
+        kind: str = "",
         identity: str = "",
         include_archived: bool = False,
         archived_only: bool = False,
@@ -1573,6 +1574,10 @@ class MemoryStore:
         elif memory_type:
             where.append("m.memory_type = ?")
             params.append(memory_type)
+        kind = str(kind or "").strip().lower()
+        if kind in {"fact", "episode", "plan", "preference", "relation"}:
+            where.append("m.kind = ?")
+            params.append(kind)
         identity = str(identity or "").strip()
         if identity:
             # r3.3f：身份筛选改为「发送者身份 或 任一参与者角色徽标」。
@@ -1689,9 +1694,9 @@ class MemoryStore:
     def delete_memory_with_trash_id(self, memory_id: int) -> int | None:
         """删除记忆并返回回收站 ID（同一条连接内完成，F54）。
 
-        ``delete_memory`` 只能返回 bool，调用方若要立刻撤销删除还需要再查一次
-        ``latest_trash_id``，两次连接之间可能插入别的删除。本方法在同一个事务
-        里返回 ``trash_id``；记录不存在或 ID 非法时返回 ``None``。
+        ``delete_memory`` 只能返回 bool，调用方若要立刻撤销删除还需要重新查询；
+        两次连接之间可能插入别的删除。本方法在同一个事务里返回 ``trash_id``；
+        记录不存在或 ID 非法时返回 ``None``。
         """
         try:
             target = int(memory_id)
@@ -1779,10 +1784,10 @@ class MemoryStore:
         return payload
 
     def restore_memory(self, trash_id: int) -> int | None:
-        """从回收站恢复一条记忆，返回新 ID。"""
+        """从回收站恢复一条记忆，优先返回原 ID；原 ID 被占用时返回新 ID。"""
         with self._lock, closing(self._connect()) as conn, conn:
             row = conn.execute(
-                "SELECT payload, roles FROM memory_trash WHERE trash_id = ?",
+                "SELECT original_id, payload, roles FROM memory_trash WHERE trash_id = ?",
                 (int(trash_id),),
             ).fetchone()
             if row is None:
@@ -1825,20 +1830,23 @@ class MemoryStore:
             # 撤销删除应当让它重新可用，因此清掉已过期的有效期。
             if not archived and valid_until is not None and valid_until <= restored_at:
                 valid_until = None
-            conn.execute(
-                """
-                INSERT INTO memories (
-                    content, embedding, embedding_dim, memory_time,
-                    group_scope, group_id, platform_id, extra_metadata,
-                    created_at, updated_at, memory_type, sender_id, sender_role,
-                    source_msg_id, source_time, importance,
-                    embedding_blob, embedding_norm, grams,
-                    kind, entities, valid_until, confidence, source_batch,
-                    last_access, decay_reset_at, archived, archive_reason, archived_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    content,
+            # 撤销删除应恢复原 memory_id；只有原 ID 已被占用时才回退到新 ID。
+            original_id = self._safe_int(payload.get("id"), 0)
+            if original_id <= 0:
+                original_id = self._safe_int(row["original_id"], 0)
+            if original_id > 0 and conn.execute(
+                "SELECT 1 FROM memories WHERE id = ?", (original_id,)
+            ).fetchone():
+                logger.warning(
+                    "[ActiveReply] 原记忆 ID 已被占用，撤销时将使用新 ID: %s",
+                    original_id,
+                )
+                original_id = 0
+            id_column = "id, " if original_id > 0 else ""
+            id_mark = "?, " if original_id > 0 else ""
+            values = (
+                    (original_id, content) if original_id > 0 else (content,)
+            ) + (
                     "",
                     embedding_dim,
                     self._safe_timestamp(payload.get("memory_time"), restored_at),
@@ -1873,9 +1881,24 @@ class MemoryStore:
                     int(archived),
                     archive_reason,
                     archived_at,
-                ),
             )
-            new_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+            conn.execute(
+                f"""
+                INSERT INTO memories (
+                    {id_column}content, embedding, embedding_dim, memory_time,
+                    group_scope, group_id, platform_id, extra_metadata,
+                    created_at, updated_at, memory_type, sender_id, sender_role,
+                    source_msg_id, source_time, importance,
+                    embedding_blob, embedding_norm, grams,
+                    kind, entities, valid_until, confidence, source_batch,
+                    last_access, decay_reset_at, archived, archive_reason, archived_at
+                ) VALUES ({id_mark}?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                values,
+            )
+            new_id = original_id or int(
+                conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+            )
             conn.executemany(
                 "INSERT OR IGNORE INTO memory_roles(memory_id, role_id) VALUES (?, ?)",
                 [(new_id, role) for role in roles],
@@ -1884,14 +1907,6 @@ class MemoryStore:
                 "DELETE FROM memory_trash WHERE trash_id = ?", (int(trash_id),)
             )
             return new_id
-
-    def latest_trash_id(self) -> int | None:
-        """返回最近一次删除写入回收站的 ID。"""
-        with self._lock, closing(self._connect()) as conn:
-            row = conn.execute(
-                "SELECT MAX(trash_id) AS tid FROM memory_trash"
-            ).fetchone()
-        return int(row["tid"]) if row and row["tid"] is not None else None
 
     def purge_trash(self, days: float) -> int:
         """删除回收站中超过保留期的记录，返回删除条数。
@@ -2513,6 +2528,72 @@ class MemoryStore:
                 (float(timestamp),),
             ).fetchone()
         return int(row["cnt"]) if row else 0
+
+    def list_kind_repair_rows(self) -> list[dict[str, Any]]:
+        """返回可参与“规则重分类”的活动记忆字段快照。"""
+        with self._lock, closing(self._connect()) as conn:
+            rows = conn.execute(
+                "SELECT id, content, kind, importance, access_count, "
+                "created_at, memory_time, valid_until, extra_metadata "
+                "FROM memories WHERE archived = 0 ORDER BY id"
+            ).fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            result.append(
+                {
+                    "memory_id": int(row["id"]),
+                    "content": str(row["content"] or ""),
+                    "kind": str(row["kind"] or "fact"),
+                    "importance": self._safe_float(row["importance"], IMPORTANCE_DEFAULT),
+                    "access_count": self._safe_int(row["access_count"], 0),
+                    "created_at": self._safe_float(
+                        row["created_at"], self._safe_float(row["memory_time"], 0.0)
+                    ),
+                    "memory_time": self._safe_float(row["memory_time"], 0.0),
+                    "valid_until": (
+                        self._safe_float(row["valid_until"], 0.0)
+                        if row["valid_until"] is not None
+                        else None
+                    ),
+                    "extra_metadata": self._parse_metadata(row["extra_metadata"]),
+                }
+            )
+        return result
+
+    def apply_kind_repairs(self, repairs: list[dict[str, Any]]) -> int:
+        """原子写回规则重分类结果，返回实际更新条数。"""
+        if not repairs:
+            return 0
+        now = time.time()
+        updated = 0
+        with self._lock, closing(self._connect()) as conn, conn:
+            for item in repairs:
+                try:
+                    memory_id = int(item.get("memory_id"))
+                except (TypeError, ValueError):
+                    continue
+                kind = str(
+                    item.get("kind") or item.get("new_kind") or ""
+                ).strip().lower()
+                if memory_id <= 0 or kind not in {"fact", "preference", "plan", "episode", "relation"}:
+                    continue
+                metadata = item.get("extra_metadata")
+                if not isinstance(metadata, dict):
+                    metadata = {}
+                cursor = conn.execute(
+                    "UPDATE memories SET kind = ?, valid_until = ?, "
+                    "extra_metadata = ?, updated_at = ? "
+                    "WHERE id = ? AND archived = 0",
+                    (
+                        kind,
+                        item.get("valid_until"),
+                        json.dumps(metadata, ensure_ascii=False),
+                        now,
+                        memory_id,
+                    ),
+                )
+                updated += max(0, int(cursor.rowcount or 0))
+        return updated
 
     def get_stats(self) -> dict[str, Any]:
         """统计记忆总量、关联范围/角色数和最早、最近记忆时间。"""

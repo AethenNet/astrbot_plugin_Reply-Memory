@@ -31,14 +31,13 @@ def dump_trimmed_json(
         payload = dict(payload)
         if isinstance(payload.get(list_key), list):
             payload[list_key] = list(payload[list_key])
-    if isinstance(payload, dict):
-        try:
-            original_count = int(payload.get("count") or 0)
-        except (TypeError, ValueError, OverflowError):
-            pass
-        records = payload.get(list_key)
-        if isinstance(records, list):
-            original_length = len(records)
+    try:
+        original_count = int(payload.get("count") or 0)
+    except (TypeError, ValueError, OverflowError):
+        pass
+    records = payload.get(list_key)
+    if isinstance(records, list):
+        original_length = len(records)
     try:
         limit = max(1, int(max_chars))
     except (TypeError, ValueError, OverflowError):
@@ -109,14 +108,6 @@ class RecallBudget:
         """累计一次调用的实际耗时。"""
         if seconds and seconds > 0:
             self.elapsed += float(seconds)
-
-    def clip(self, text: str) -> str:
-        """把返回内容截断到长度上限。"""
-        value = str(text or "")
-        if len(value) <= self.max_result_chars:
-            return value
-        return value[: self.max_result_chars] + "…（已截断）"
-
 
 def get_budget(event: Any) -> RecallBudget:
     """取出当前事件共享的预算；没有时创建并挂到事件 extra 上。"""

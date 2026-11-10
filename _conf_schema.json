@@ -154,7 +154,7 @@
       },
       "image_caption": {
         "description": "图片转述",
-        "hint": "启用图片转述能力。历史默认写入 [Image]，模型可通过工具按需补全描述",
+        "hint": "当对话模型不支持图片输入时，调用图片转述模型来获得图片描述。留空代表不使用，需要关闭AstrBot内置图片转述。",
         "type": "bool",
         "default": false
       },
