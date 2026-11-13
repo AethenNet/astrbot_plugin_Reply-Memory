@@ -394,14 +394,14 @@
           },
           "auto_extract_min_confidence": {
             "description": "最低置信度",
-            "hint": "低于该值的候选记忆会被丢弃；按五档标准，日常讨论通常为 0.50-0.60，简单闲聊为 0.30-0.40。默认 0.50 可保留日常讨论，只过滤闲聊以下",
+            "hint": "低于该值的候选记忆会被丢弃；按五档标准，日常讨论通常为 0.50-0.60，简单闲聊为 0.30-0.40。默认 0.25 可保留大多数闲聊和讨论",
             "type": "float",
             "slider": {
               "min": 0,
               "max": 1,
               "step": 0.05
             },
-            "default": 0.5
+            "default": 0.25
           },
           "auto_extract_scope": {
             "description": "记忆作用域",
@@ -468,6 +468,40 @@
               "step": 1
             },
             "default": 3
+          },
+          "memory_kind_classifier": {
+            "description": "分类复核模型",
+            "hint": "抽取类型不确定时再调用一次模型，按内容、证据和最近聊天上下文复核；规则已确定时不额外调用",
+            "type": "bool",
+            "default": true
+          },
+          "memory_kind_confidence_threshold": {
+            "description": "分类置信度阈值",
+            "hint": "低于该值的分类会进入复核；默认 0.75",
+            "type": "float",
+            "slider": {
+              "min": 0.5,
+              "max": 0.95,
+              "step": 0.05
+            },
+            "default": 0.75
+          },
+          "memory_kind_repair_confidence": {
+            "description": "修复置信度阈值",
+            "hint": "批量修复只应用达到该置信度的分类结果，低于阈值的记录标记待复核；默认 0.80（规则层上限约 0.92）",
+            "type": "float",
+            "slider": {
+              "min": 0.5,
+              "max": 0.9,
+              "step": 0.05
+            },
+            "default": 0.8
+          },
+          "memory_kind_reverse_repair": {
+            "description": "允许反向修复",
+            "hint": "开启后除了 fact→事件，也允许高置信度地把 plan/preference/relation/episode/experience 改为其他类型；默认只修 fact",
+            "type": "bool",
+            "default": false
           }
         }
       },
@@ -575,7 +609,7 @@
           },
           "memory_ttl_base": {
             "description": "按类型基础有效期（天）",
-            "hint": "每条记忆按类型的基础有效期，单位天，范围 1–365；重要性和访问次数会在此基础上延长。计划/事件可短一些，事实/关系可长一些。",
+            "hint": "每条记忆按类型的基础有效期，单位天，范围 0–365；0 表示永不过期。重要性和访问次数会在此基础上延长，计划/事件可短一些，事实/关系可长一些。",
             "type": "object",
             "items": {
               "plan_days": {
@@ -631,6 +665,17 @@
                   "step": 1
                 },
                 "default": 180,
+                "hint": "0 表示该类型永不过期；其余数值为基础天数，范围 0–365，重要性和访问次数会在此基础上延长。"
+              },
+              "experience_days": {
+                "description": "经验·基础天数",
+                "type": "int",
+                "slider": {
+                  "min": 0,
+                  "max": 365,
+                  "step": 1
+                },
+                "default": 60,
                 "hint": "0 表示该类型永不过期；其余数值为基础天数，范围 0–365，重要性和访问次数会在此基础上延长。"
               }
             }
@@ -689,6 +734,16 @@
                   "step": 1
                 },
                 "default": 120
+              },
+              "experience_half_life_days": {
+                "description": "经验·半衰期",
+                "type": "int",
+                "slider": {
+                  "min": 7,
+                  "max": 365,
+                  "step": 1
+                },
+                "default": 30
               }
             }
           }

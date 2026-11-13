@@ -12,7 +12,7 @@
  * 已持久化数据。各视图函数只负责当前页面区域，避免一次操作重建无关页面。
  */
 
-const UI_BUILD = 35;
+const UI_BUILD = 36;
 console.info(`[ActiveReply] UI build ${UI_BUILD}`);
 
 const bridge = window.AstrBotPluginView || window.AstrBotPluginPage || null;
@@ -113,6 +113,7 @@ const state = {
     role: "",
     memoryType: "",
     kind: "",
+    needsReview: false,
     identity: "",
     // r3.3l：生命周期筛选（即将过期/已过期/低价值将归档/长期未访问）。
     lifecycle: "",
@@ -2203,6 +2204,9 @@ function buildSchemaControl(meta, value, path) {
 /** 与记忆页面板重复的全局配置：只保留面板入口，避免两处改同一个值。 */
 const HIDDEN_GLOBAL_PATHS = new Set([
   "memory_rag.memory_generation.auto_extract_enable",
+  // 记忆修复设置已移到开发者选项的记忆修复卡片旁。
+  "memory_rag.memory_generation.memory_kind_repair_confidence",
+  "memory_rag.memory_generation.memory_kind_reverse_repair",
 ]);
 
 /** 页面内数字键盘状态（r3.3w）：替代系统软键盘，避免输入后 WebView 视口错位。 */
@@ -2916,14 +2920,35 @@ const MEMORY_KIND_BADGES = {
   plan: { label: "计划", cls: "kind-plan" },
   preference: { label: "偏好", cls: "kind-preference" },
   relation: { label: "关系", cls: "kind-relation" },
+  experience: { label: "经验", cls: "kind-experience" },
   fact: { label: "事实", cls: "kind-fact" },
 };
 
 function memoryKindBadge(item, isAtom) {
   const kind = String(item.kind || "fact").toLowerCase();
   const meta = MEMORY_KIND_BADGES[kind] || MEMORY_KIND_BADGES.fact;
+  const extra = item.extra_metadata || {};
+  const confidence = item.kind_confidence ?? extra.kind_confidence;
+  const reason = item.kind_reason ?? extra.kind_reason;
+  const reviewSuggested =
+    item.kind_review_suggested ?? extra.kind_review_suggested;
+  const reviewReason = item.kind_review_reason ?? extra.kind_review_reason;
+  const needsReview = Boolean(
+    item.kind_needs_review ?? extra.kind_needs_review
+  );
+  const details = [];
+  if (confidence !== undefined && confidence !== null) {
+    details.push(`置信度 ${Number(confidence).toFixed(2)}`);
+  }
+  if (reason) details.push(String(reason));
+  if (reviewSuggested) details.push(`建议 ${reviewSuggested}`);
+  if (reviewReason) details.push(String(reviewReason));
+  const title = details.length ? ` title="${escapeHtml(details.join(" · "))}"` : "";
   const atom = isAtom ? '<span class="pill atom-mark">原子</span>' : "";
-  return `<span class="pill ${meta.cls}">${meta.label}</span>${atom}`;
+  const review = needsReview
+    ? '<span class="pill kind-review">待复核</span>'
+    : "";
+  return `<span class="pill ${meta.cls}"${title}>${meta.label}</span>${atom}${review}`;
 }
 
 function memoryEpisodeId(extraMetadata) {
@@ -3279,9 +3304,13 @@ function highlightJson(json) {
 }
 
 /** 展示记忆关联的原始消息证据。 */
+let detailRequestSeq = 0;
+
 async function showSource(memoryId) {
+  const requestId = ++detailRequestSeq;
   try {
     const item = await callApi("GET", `rag/${encodeURIComponent(memoryId)}`);
+    if (requestId !== detailRequestSeq) return;
     const meta = item.extra_metadata || {};
     const quotes = meta.quotes || (meta.evidence ? [meta.evidence] : []);
     const sourceMessages = Array.isArray(meta.source_messages)
@@ -3624,6 +3653,7 @@ const RAG_KIND_LABELS = {
   plan: "计划",
   preference: "偏好",
   relation: "关系",
+  experience: "经验",
 };
 
 /** 参与者身份筛选值的中文名（与筛选弹窗选项一致）。 */
@@ -3676,6 +3706,7 @@ function ragFilterSummary() {
   if (state.rag.kind) {
     parts.push(RAG_KIND_LABELS[state.rag.kind] || state.rag.kind);
   }
+  if (state.rag.needsReview) parts.push("待复核");
   if (state.rag.scope) {
     const scopeLabel = ragScopeLabel(state.rag.scope);
     if (scopeLabel) parts.push(scopeLabel);
@@ -3778,6 +3809,7 @@ async function loadRagList() {
   if (state.rag.role) params.role_id = state.rag.role;
   if (state.rag.memoryType) params.memory_type = state.rag.memoryType;
   if (state.rag.kind) params.kind = state.rag.kind;
+  if (state.rag.needsReview) params.needs_review = 1;
   // r3.3m：「已归档」视图下生命周期筛选无意义（后端也会忽略，这里同步隐藏）。
   if (state.rag.lifecycle && !state.rag.archivedOnly) {
     params.lifecycle = state.rag.lifecycle;
@@ -4000,8 +4032,10 @@ async function bulkDeleteSelected() {
 
 /** 查询并在详情抽屉中展示指定记忆的完整 JSON 内容。 */
 async function showMemory(memoryId) {
+  const requestId = ++detailRequestSeq;
   try {
     const data = await callApi("GET", `rag/${encodeURIComponent(memoryId)}`);
+    if (requestId !== detailRequestSeq) return;
     const rules = state.rag.rules || {};
     const meta =
       data.extra_metadata && typeof data.extra_metadata === "object"
@@ -4025,6 +4059,9 @@ async function showMemory(memoryId) {
         }`
       : "永久（该类型不写有效期）";
     const kind = String(data.kind || "fact").toLowerCase();
+    const needsReview = Boolean(
+      data.kind_needs_review ?? meta.kind_needs_review
+    );
     const atoms = Array.isArray(data.atoms) ? data.atoms : [];
     const topics = Array.isArray(meta.topics)
       ? meta.topics.map(String).filter(Boolean)
@@ -4136,6 +4173,34 @@ async function showMemory(memoryId) {
         </div>
       </section>
       <section class="detail-section">
+        <h4>分类复核</h4>
+        <div class="detail-kind-editor">
+          <select id="detail-kind-select" class="input" aria-label="记忆类型">
+            ${Object.entries(MEMORY_KIND_BADGES)
+              .map(
+                ([value, badge]) =>
+                  `<option value="${value}" ${value === kind ? "selected" : ""}>${badge.label}</option>`
+              )
+              .join("")}
+          </select>
+          <div class="detail-kind-actions">
+            <button id="detail-kind-save" class="primary small-btn" type="button">保存类型</button>
+            <button id="detail-kind-reviewed" class="ghost small-btn" type="button">标记已复核</button>
+          </div>
+        </div>
+        <p class="muted small">
+          分类置信度：${
+            meta.kind_confidence !== undefined
+              ? Number(meta.kind_confidence).toFixed(2)
+              : "未记录"
+          }${meta.kind_reason ? ` · ${escapeHtml(String(meta.kind_reason))}` : ""}${
+            meta.kind_review_suggested
+              ? ` · 建议 ${escapeHtml(String(meta.kind_review_suggested))}`
+              : ""
+          }${needsReview ? " · 当前待复核" : ""}
+        </p>
+      </section>
+      <section class="detail-section">
         <h4>关键事实</h4>
         ${factsHtml}
       </section>
@@ -4175,6 +4240,29 @@ async function showMemory(memoryId) {
         }
       });
     });
+    const saveKind = async (markReviewed, useSelected = true) => {
+      const select = $("detail-kind-select");
+      const nextKind = useSelected && select ? select.value : kind;
+      if (!nextKind) return;
+      try {
+        await callApi(
+          "POST",
+          `rag/${encodeURIComponent(data.memory_id || memoryId)}/kind`,
+          {
+            kind: nextKind,
+            expected_kind: kind,
+            mark_reviewed: markReviewed,
+          }
+        );
+        toast(useSelected ? "类型已保存并标记已复核" : "已标记复核");
+        await Promise.all([loadRagStats(false), loadRagList()]);
+        await showMemory(data.memory_id || memoryId);
+      } catch (error) {
+        toast(error.message || "修改类型失败", true);
+      }
+    };
+    $("detail-kind-save")?.addEventListener("click", () => void saveKind(true, true));
+    $("detail-kind-reviewed")?.addEventListener("click", () => void saveKind(true, false));
     openDetailPanel();
   } catch (error) {
     toast(error.message || "加载详情失败", true);
@@ -4399,7 +4487,89 @@ function handleDevAuthError(error) {
   return true;
 }
 
-/** 记忆分类修复：先预览候选，确认后再写库；无需开发者密钥。 */
+/** 打开记忆修复设置：从当前全局配置回填。 */
+async function openRepairSettings() {
+  // 开发者页不会自动加载全局设置；先确认值存在，避免用页面默认值
+  // 覆盖用户已保存的修复阈值/反向开关。
+  let confidence = getPath(
+    state.globalValues,
+    "memory_rag.memory_generation.memory_kind_repair_confidence"
+  );
+  let reverse = getPath(
+    state.globalValues,
+    "memory_rag.memory_generation.memory_kind_reverse_repair"
+  );
+  if (confidence === undefined || reverse === undefined) {
+    try {
+      const data = await callApi("GET", "config");
+      state.globalValues = data.values || {};
+      if (data.schema) state.schema = data.schema;
+      confidence = getPath(
+        state.globalValues,
+        "memory_rag.memory_generation.memory_kind_repair_confidence"
+      );
+      reverse = getPath(
+        state.globalValues,
+        "memory_rag.memory_generation.memory_kind_reverse_repair"
+      );
+    } catch (error) {
+      toast(error.message || "读取记忆修复设置失败", true);
+      return;
+    }
+  }
+  const input = $("repair-confidence");
+  if (input) input.value = String(confidence ?? 0.8);
+  if ($("repair-confidence-value")) {
+    $("repair-confidence-value").textContent = Number(input?.value || 0.8).toFixed(2);
+  }
+  if ($("repair-reverse")) $("repair-reverse").checked = Boolean(reverse);
+  const modal = $("repair-settings-modal");
+  if (modal) {
+    modal.classList.add("open");
+    modal.setAttribute("aria-hidden", "false");
+  }
+}
+
+function closeRepairSettings() {
+  const modal = $("repair-settings-modal");
+  if (!modal) return;
+  modal.classList.remove("open");
+  modal.setAttribute("aria-hidden", "true");
+}
+
+async function saveRepairSettings() {
+  const button = $("repair-settings-save");
+  if (!button || button.disabled) return;
+  const confidence = Number($("repair-confidence")?.value || 0.8);
+  const reverse = Boolean($("repair-reverse")?.checked);
+  button.disabled = true;
+  try {
+    await callApi("POST", "config/save", {
+      values: {
+        "memory_rag.memory_generation.memory_kind_repair_confidence": confidence,
+        "memory_rag.memory_generation.memory_kind_reverse_repair": reverse,
+      },
+    });
+    setPath(
+      state.globalValues,
+      "memory_rag.memory_generation.memory_kind_repair_confidence",
+      confidence
+    );
+    setPath(
+      state.globalValues,
+      "memory_rag.memory_generation.memory_kind_reverse_repair",
+      reverse
+    );
+    closeRepairSettings();
+    toast("记忆修复设置已保存");
+  } catch (error) {
+    toast(error.message || "保存记忆修复设置失败", true);
+  } finally {
+    button.disabled = false;
+  }
+}
+
+/** 记忆修复：先预览候选，确认后再写库；无需开发者密钥。 */
 async function repairMemoryKinds() {
   const button = $("dev-memory-repair");
   if (!button || button.disabled) return;
@@ -4410,8 +4580,13 @@ async function repairMemoryKinds() {
       use_model: true,
     });
     const count = Number(preview.repairable || 0);
+    const reviewCount = Number(preview.review_count || 0);
     if (!count) {
-      toast("没有需要修复的记忆分类");
+      toast(
+        reviewCount
+          ? `没有高置信度可修复项；${reviewCount} 条置信度不足，尚未处理`
+          : "没有需要修复的记忆"
+      );
       return;
     }
     const samples = (Array.isArray(preview.items) ? preview.items : [])
@@ -4419,7 +4594,7 @@ async function repairMemoryKinds() {
       .map((item) => `#${item.memory_id} ${item.old_kind} → ${item.new_kind}`)
       .join("；");
     const ok = await askConfirm(
-      `发现 ${count} 条可修复记忆${samples ? `：${samples}` : ""}。\n\n先用规则、再用模型复核后改判类型并重算有效期，是否应用？`,
+      `发现 ${count} 条可修复记忆${samples ? `：${samples}` : ""}。${reviewCount ? `另有 ${reviewCount} 条低置信度记录待复核。` : ""}\n\n先用规则、再用模型复核后改判类型、重算有效期并修复群身份，是否应用？`,
       { danger: true }
     );
     if (!ok) return;
@@ -4427,10 +4602,14 @@ async function repairMemoryKinds() {
       apply: true,
       use_model: true,
     });
-    toast(`已修复 ${Number(result.applied || 0)} 条记忆分类`);
+    const marked = Number(result.review_marked || 0);
+    toast(
+      `已修复 ${Number(result.applied || 0)} 条记忆` +
+        (marked ? `，标记待复核 ${marked} 条` : "")
+    );
     await Promise.all([loadRagStats(true), loadRagList()]);
   } catch (error) {
-    toast(error.message || "记忆分类修复失败", true);
+    toast(error.message || "记忆修复失败", true);
   } finally {
     button.disabled = false;
   }
@@ -5465,6 +5644,7 @@ function bindEvents() {
   $("filter-apply").addEventListener("click", () => {
     state.rag.memoryType = $("filter-type").value;
     state.rag.kind = $("filter-kind")?.value || "";
+    state.rag.needsReview = Boolean($("filter-review")?.checked);
     state.rag.scope = $("filter-scope").value;
     state.rag.identity = $("filter-identity").value;
     state.rag.lifecycle = $("filter-lifecycle")?.value || "";
@@ -5479,6 +5659,7 @@ function bindEvents() {
   $("filter-clear").addEventListener("click", () => {
     $("filter-type").value = "";
     if ($("filter-kind")) $("filter-kind").value = "";
+    if ($("filter-review")) $("filter-review").checked = false;
     $("filter-scope").value = "";
     $("filter-identity").value = "";
     if ($("filter-lifecycle")) $("filter-lifecycle").value = "";
@@ -5486,6 +5667,7 @@ function bindEvents() {
     $("rag-role").value = "";
     state.rag.memoryType = "";
     state.rag.kind = "";
+    state.rag.needsReview = false;
     state.rag.scope = "";
     state.rag.identity = "";
     state.rag.lifecycle = "";
@@ -5558,7 +5740,18 @@ function bindEvents() {
   // 开发者选项（r3.3）：侧栏扳手按钮进入，密钥校验通过后才展示提示词/自检。
   $("drawer-dev")?.addEventListener("click", () => switchView("dev"));
   $("dev-memory-repair")?.addEventListener("click", () => void repairMemoryKinds());
-  $("dev-tour-replay")?.addEventListener("click", () => startTour(true));
+  $("dev-memory-repair-settings")?.addEventListener("click", () => void openRepairSettings());
+  $("repair-settings-cancel")?.addEventListener("click", closeRepairSettings);
+  $("repair-settings-save")?.addEventListener("click", () => void saveRepairSettings());
+  $("repair-confidence")?.addEventListener("input", () => {
+    if ($("repair-confidence-value")) {
+      $("repair-confidence-value").textContent = Number(
+        $("repair-confidence").value || 0.8
+      ).toFixed(2);
+    }
+  });
+  $("dev-tour-replay")?.addEventListener("click", () => startTour(true, "beta.6"));
+  $("dev-tour-replay-beta5")?.addEventListener("click", () => startTour(true, "beta.5"));
   $("tour-skip")?.addEventListener("click", () => closeTour(true));
   $("tour-next")?.addEventListener("click", () => {
     if (tourStepIndex + 1 < TOUR_STEPS.length) {
@@ -5610,11 +5803,14 @@ function bindEvents() {
 /* ------------------------------------------------------------------ */
 /* 漫游式引导                                                          */
 /* ------------------------------------------------------------------ */
-const TOUR_VERSION = "beta.5";
-const TOUR_SEEN_KEY = `activeReply.tour.${TOUR_VERSION}`;
+const TOUR_VERSION = "beta.6";
+let activeTourVersion = TOUR_VERSION;
+let TOUR_SEEN_KEY = `activeReply.tour.${activeTourVersion}`;
 let tourStepIndex = 0;
 
-const TOUR_STEPS = [
+// 历史版本的引导步骤保留在代码里，服务端 tour_seen 也按版本分别记录；
+// 升级只切换当前 TOUR_VERSION，不覆盖旧版本引导数据。
+const TOUR_STEPS_BETA5 = [
   {
     selector: "#menu-btn",
     title: "从侧边栏开始",
@@ -5624,16 +5820,106 @@ const TOUR_STEPS = [
   {
     selector: "#drawer-dev",
     title: "开发者选项",
-    text: "侧边栏底部的扳手按钮就是开发者选项；记忆分类修复不需要开发者密钥。",
+    text: "侧边栏底部的扳手按钮就是开发者选项；记忆修复不需要开发者密钥。",
     before: () => openDrawer(),
   },
   {
     selector: "#dev-memory-repair",
-    title: "记忆分类修复",
-    text: "在这里扫描并修复被误标为「事实」的事件、计划、偏好和关系，先预览再确认，不会直接改库。",
+    title: "记忆修复",
+    text: "在这里扫描并修复被误标为「事实」的事件、计划、偏好和关系，以及群主/群管身份，先预览再确认，不会直接改库。",
     before: () => switchView("dev"),
   },
 ];
+
+/** 等记忆列表的首条真实记录（排除骨架）；空库超时返回 null。 */
+async function waitForTourMemoryRow(timeoutMs = 3000) {
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    const row = document.querySelector(
+      "#rag-body tr.mem-row:not(.skeleton-mem-row)"
+    );
+    if (row) return row;
+    await new Promise((resolve) => setTimeout(resolve, 120));
+  }
+  return null;
+}
+
+const TOUR_STEPS_BETA6 = [
+  {
+    selector: "#rag-body",
+    title: "待复核记录",
+    text: "带「待复核」的记忆先在这里找。顶部「筛选」里还有「只看待复核」开关，可只显示需要人工确认的记录。",
+    before: () => {
+      closeDrawer();
+      closeDetail();
+      closeFilterModal();
+      switchView("rag");
+    },
+  },
+  {
+    selector: "#rag-body tr.mem-row:not(.skeleton-mem-row)",
+    title: "展开记忆",
+    text: "点这条记忆（或行尾箭头）展开记录。",
+    before: async () => {
+      closeDrawer();
+      closeDetail();
+      closeFilterModal();
+      switchView("rag");
+      const row = await waitForTourMemoryRow();
+      if (!row) {
+        toast("暂无可复核记忆，已跳过本次引导", true);
+        closeTour(true);
+        return;
+      }
+      const detail = document.querySelector(
+        `[data-mem-detail="${CSS.escape(row.dataset.memRow)}"]`
+      );
+      if (detail?.classList.contains("open")) row.click();
+    },
+  },
+  {
+    selector: "#rag-body [data-detail]",
+    title: "打开记忆详情",
+    text: "展开后点眼睛图标，进入「记忆详情」。",
+    before: async () => {
+      closeDrawer();
+      closeDetail();
+      switchView("rag");
+      // switchView 会触发列表重绘；等重绘完成再展开，否则 click 命中的
+      // 是即将被替换的旧行，下一步眼睛图标仍然不可见。
+      const row = await waitForTourMemoryRow();
+      if (!row) {
+        toast("暂无可复核记忆，已跳过本次引导", true);
+        closeTour(true);
+        return;
+      }
+      const detail = document.querySelector(
+        `[data-mem-detail="${CSS.escape(row.dataset.memRow)}"]`
+      );
+      if (detail && !detail.classList.contains("open")) row.click();
+      await new Promise((resolve) => setTimeout(resolve, 260));
+    },
+  },
+  {
+    selector: "#detail-kind-select",
+    title: "分类复核",
+    text: "详情底部的「分类复核」：选类型 → 保存类型；确认无误后点「标记已复核」。",
+    before: async () => {
+      closeDrawer();
+      closeFilterModal();
+      switchView("rag");
+      const button = document.querySelector("#rag-body [data-detail]");
+      if (button) await showMemory(button.dataset.detail);
+      await new Promise((resolve) => setTimeout(resolve, 120));
+    },
+  },
+];
+
+const TOURS = {
+  "beta.5": TOUR_STEPS_BETA5,
+  "beta.6": TOUR_STEPS_BETA6,
+};
+let TOUR_STEPS = TOURS[activeTourVersion];
 
 let tourSeenOnServer = false;
 
@@ -5671,7 +5957,9 @@ function markTourSeen() {
   } catch {
     // 服务端文件才是跨重进插件的真正持久化来源。
   }
-  void callApi("POST", "tour/seen", { version: TOUR_VERSION }).catch(() => {});
+  void callApi("POST", "tour/seen", { version: activeTourVersion }).catch(
+    () => {}
+  );
 }
 
 function positionTourPopover(target, animate = false) {
@@ -5752,7 +6040,12 @@ async function renderTourStep(index) {
   positionTourPopover(target, true);
 }
 
-function startTour(force = false) {
+function startTour(force = false, version = TOUR_VERSION) {
+  const steps = TOURS[version] || TOURS[TOUR_VERSION];
+  if (!steps) return;
+  activeTourVersion = version;
+  TOUR_STEPS = steps;
+  TOUR_SEEN_KEY = `activeReply.tour.${version}`;
   if (!force && tourSeen()) return;
   const root = $("tour-root");
   if (!root) return;

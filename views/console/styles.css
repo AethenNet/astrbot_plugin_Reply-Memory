@@ -47,6 +47,7 @@
   --pill-slate: #64748b;
   --pill-blue: #1d4ed8;
   --pill-violet: #6d28d9;
+  --pill-teal: #0f766e;
   --pill-gray: #64748b;
   --dot-blue: #3b82f6;
   --dot-green: #10b981;
@@ -126,6 +127,7 @@ body[data-theme="dark"] {
   --pill-slate: #94a3b8;
   --pill-blue: #7aa7ff;
   --pill-violet: #a78bfa;
+  --pill-teal: #5eead4;
   --pill-gray: #94a3b8;
   --dot-blue: #5b9dff;
   --dot-green: #34d399;
@@ -3333,6 +3335,12 @@ button.btn-morph-textless .btn-morph-icon {
   border-color: color-mix(in srgb, var(--pill-green) 26%, transparent);
 }
 
+.pill.kind-experience {
+  color: var(--pill-teal);
+  background: color-mix(in srgb, var(--pill-teal) 12%, transparent);
+  border-color: color-mix(in srgb, var(--pill-teal) 26%, transparent);
+}
+
 .pill.kind-relation {
   color: var(--pill-violet);
   background: color-mix(in srgb, var(--pill-violet) 12%, transparent);
@@ -4633,6 +4641,23 @@ button.btn-morph-textless .btn-morph-icon {
 
 #view-dev .dev-actions > button {
   flex: none;
+}
+#view-dev .repair-actions {
+  align-items: center;
+}
+#view-dev .repair-actions > #dev-memory-repair {
+  flex: 1 1 auto;
+}
+#view-dev .repair-actions > .repair-settings-btn {
+  flex: 0 0 44px;
+  width: 44px;
+  height: 44px;
+  min-width: 44px;
+  border-radius: 50%;
+  padding: 0;
+}
+#repair-confidence {
+  width: 100%;
 }
 
 /* 密钥提示行:没有文字时不占位(空行不撑高门禁卡),有文字时按小灰字展示 */
@@ -6682,4 +6707,65 @@ button.btn-morph-textless .btn-morph-icon {
     padding: 0 !important;
     border-radius: 50% !important;
   }
+}
+
+/* 分类待复核标记 */
+.pill.kind-review {
+  color: var(--pill-amber);
+  background: color-mix(in srgb, var(--pill-amber) 12%, transparent);
+  border-color: color-mix(in srgb, var(--pill-amber) 28%, transparent);
+}
+
+.detail-kind-editor {
+  display: grid;
+  gap: 8px;
+}
+.detail-kind-editor .input {
+  width: 100%;
+  min-width: 0;
+}
+.detail-kind-actions {
+  display: flex;
+  gap: 8px;
+}
+.detail-kind-actions .small-btn {
+  flex: 1 1 0;
+  min-width: 0;
+}
+.tour-replay-actions {
+  flex-wrap: wrap;
+}
+.tour-replay-actions .ghost {
+  flex: 1 1 0;
+  min-width: 0;
+}
+.filter-review-row {
+  flex-direction: row !important;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-height: 46px;
+  padding: 0 14px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface-2);
+  font-size: 13px;
+  color: var(--text-2);
+  cursor: pointer;
+}
+.filter-review-row .switch {
+  margin-left: auto;
+}
+
+/* 经验类型：列表左侧使用青绿色直条。 */
+.rag-table tbody tr.mem-row.kind-experience {
+  --card-kind: var(--pill-teal);
+  border-top-color: var(--hairline) !important;
+  border-left-color: var(--hairline) !important;
+}
+.rag-table tbody tr.mem-row.kind-experience td:first-child {
+  border-left: 0 !important;
+  border-radius: 0 !important;
+  padding-left: 0 !important;
+  margin-left: 0 !important;
 }

@@ -12,7 +12,7 @@ CONFIDENCE_TIER_DEFAULTS = {
     "spam": 0.10,
 }
 
-MEMORY_KINDS = ("fact", "preference", "plan", "episode", "relation")
+MEMORY_KINDS = ("fact", "preference", "plan", "episode", "relation", "experience")
 
 MEMORY_KEYWORDS = ("记住", "记一下", "帮我记", "记着", "别忘了")
 

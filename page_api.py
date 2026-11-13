@@ -138,7 +138,9 @@ class PageApi:
         self._dev_fail_times: list[float] = []
         # 修复预览缓存：模型复核成本较高，确认应用时复用最近一次预览，
         # 避免第二次再调用模型；缓存只存在进程内。
-        self._kind_repair_preview: tuple[float, list[dict[str, Any]]] = (0.0, [])
+        self._kind_repair_preview: tuple[
+            float, list[dict[str, Any]], list[dict[str, Any]]
+        ] = (0.0, [], [])
 
     # ------------------------------------------------------------------ #
     # 展示与校验辅助
@@ -913,6 +915,7 @@ class PageApi:
                 "episode": int(rag.ttl_base.base_days("episode")),
                 "preference": int(rag.ttl_base.base_days("preference")),
                 "relation": int(rag.ttl_base.base_days("relation")),
+                "experience": int(rag.ttl_base.base_days("experience")),
                 "fact": int(rag.ttl_base.base_days("fact")),
             },
             "decay_enable": bool(rag.importance_decay_enable),
@@ -945,6 +948,32 @@ class PageApi:
                 "rules": self._forgetting_rules(),
             }
         )
+
+    @staticmethod
+    def _higher_display_role(old: object, new: object) -> str:
+        """展示层身份只升不降：所有者 > 群主 > 群管 > 群成员。"""
+        ranks = {
+            "member": 0,
+            "group_admin": 1,
+            "group_owner": 2,
+            "owner": 3,
+        }
+
+        def normalize(value: object) -> str:
+            text = str(value or "").strip().lower()
+            if text == "admin":
+                return "owner"
+            if text == "administrator":
+                return "group_admin"
+            return text if text in ranks else ""
+
+        old_role = normalize(old)
+        new_role = normalize(new)
+        if not new_role:
+            return old_role or "member"
+        if not old_role:
+            return new_role
+        return new_role if ranks[new_role] > ranks[old_role] else old_role
 
     def _enrich_group_roles(self, item: dict[str, Any]) -> None:
         """用当前群角色缓存补全记忆里的参与者身份（旧记忆没有 role_identities 时）。
@@ -982,16 +1011,21 @@ class PageApi:
         changed = False
         for role_id in related:
             role = roles.get(str(role_id))
-            if role and merged.get(str(role_id)) != role:
-                merged[str(role_id)] = role
+            if not role:
+                continue
+            higher = self._higher_display_role(merged.get(str(role_id)), role)
+            if merged.get(str(role_id)) != higher:
+                merged[str(role_id)] = higher
                 changed = True
         sender_id = str(item.get("sender_id") or "")
         if sender_id:
             role = roles.get(sender_id)
-            if role and item.get("sender_role") != role:
-                item["sender_role"] = role
-                merged[sender_id] = role
-                changed = True
+            if role:
+                higher = self._higher_display_role(item.get("sender_role"), role)
+                if item.get("sender_role") != higher:
+                    item["sender_role"] = higher
+                    merged[sender_id] = higher
+                    changed = True
         if changed:
             meta = dict(meta)
             meta["role_identities"] = merged
@@ -1028,6 +1062,7 @@ class PageApi:
         role_id = query_get("role_id", "", str)
         memory_type = query_get("memory_type", "", str)
         kind = query_get("kind", "", str)
+        needs_review = bool(query_get("needs_review", 0, int))
         identity = query_get("identity", "", str)
         lifecycle = str(query_get("lifecycle", "", str) or "").strip().lower()
         include_archived = bool(query_get("include_archived", 0, int))
@@ -1047,6 +1082,7 @@ class PageApi:
                 role_id=role_id or "",
                 memory_type=memory_type or "",
                 kind=kind or "",
+                needs_review=needs_review,
                 identity=identity or "",
                 include_archived=include_archived,
                 archived_only=archived_only,
@@ -1080,6 +1116,19 @@ class PageApi:
             group_id = str(item.get("group_id") or "").strip()
             item["group_name"] = group_names.get(group_id, "")
             item["source"] = str(meta.get("source") or "manual")
+            for key in (
+                "kind_confidence",
+                "kind_reason",
+                "kind_source",
+                "kind_needs_review",
+                "kind_repaired_from",
+                "kind_repaired_by",
+                "kind_repaired_at",
+                "kind_review_suggested",
+                "kind_review_reason",
+            ):
+                if key in meta:
+                    item[key] = meta[key]
             item["extra_metadata"] = self._compact_list_metadata(meta)
             self._decorate_forgetting(item, now=decor_now, rag=decor_rag)
         return ok(data)
@@ -1272,6 +1321,19 @@ class PageApi:
         )
         meta = item.get("extra_metadata")
         meta = meta if isinstance(meta, dict) else {}
+        for key in (
+            "kind_confidence",
+            "kind_reason",
+            "kind_source",
+            "kind_needs_review",
+            "kind_repaired_from",
+            "kind_repaired_by",
+            "kind_repaired_at",
+            "kind_review_suggested",
+            "kind_review_reason",
+        ):
+            if key in meta:
+                item[key] = meta[key]
         try:
             parent_id = int(meta.get("episode_id") or 0)
         except (TypeError, ValueError):
@@ -1539,6 +1601,48 @@ class PageApi:
             return fail(f"保存引导状态失败：{exc}")
         return ok({"version": version, "seen": True})
 
+    async def rag_set_kind(self, memory_id: str) -> dict[str, Any]:
+        """人工修改记忆类型；可同时清除待复核标记。"""
+        readonly = self._memory_readonly_error()
+        if readonly:
+            return fail(readonly)
+        payload, error = await _read_payload()
+        if error:
+            return fail(error)
+        body = payload if isinstance(payload, dict) else {}
+        kind = str(body.get("kind") or "").strip().lower()
+        from .constants import MEMORY_KINDS
+
+        if kind not in MEMORY_KINDS:
+            return fail("无效的记忆类型")
+        expected_kind = str(body.get("expected_kind") or "").strip().lower()
+        mark_reviewed = self._truthy(body.get("mark_reviewed"))
+        try:
+            result = await self.plugin.set_memory_kind(
+                int(memory_id),
+                kind,
+                mark_reviewed=mark_reviewed,
+                reviewer="page",
+                expected_kind=expected_kind,
+            )
+        except (TypeError, ValueError):
+            return fail("记忆 ID 无效")
+        except Exception as exc:
+            logger.error(f"[ActiveReply] 人工修改记忆类型失败: {exc}", exc_info=True)
+            return fail(f"修改失败：{exc}")
+        if not result.get("ok"):
+            return fail(str(result.get("error") or "修改失败"))
+        if int(result.get("applied") or 0) > 0:
+            self._invalidate_recall_cache_hook("manual_kind_change")
+        logger.info(
+            "[ActiveReply] 人工修改记忆类型 | id=%s %s -> %s reviewed=%s",
+            result.get("memory_id"),
+            result.get("old_kind"),
+            result.get("kind"),
+            result.get("reviewed"),
+        )
+        return ok(result)
+
     async def rag_repair_kinds(self) -> dict[str, Any]:
         """规则 + 模型复核记忆分类；默认只预览，显式 apply 才写库。"""
         readonly = self._memory_readonly_error()
@@ -1552,14 +1656,22 @@ class PageApi:
         use_model = self._truthy(body.get("use_model", True))
         try:
             if apply_changes:
-                cached_at, cached_items = self._kind_repair_preview
+                cached_at, cached_items, cached_review = self._kind_repair_preview
                 if cached_items and time.time() - cached_at < 600:
                     applied = await asyncio.to_thread(
                         self.plugin.memory_store.apply_kind_repairs,
                         cached_items,
                     )
-                    self._kind_repair_preview = (0.0, [])
-                    result = {"applied": int(applied), "cached": True}
+                    review_marked = await asyncio.to_thread(
+                        self.plugin.memory_store.mark_kind_review,
+                        cached_review,
+                    )
+                    self._kind_repair_preview = (0.0, [], [])
+                    result = {
+                        "applied": int(applied),
+                        "review_marked": int(review_marked),
+                        "cached": True,
+                    }
                 else:
                     result = await self.plugin.apply_memory_kind_repairs(
                         use_model=use_model
@@ -1571,6 +1683,7 @@ class PageApi:
                 self._kind_repair_preview = (
                     time.time(),
                     list(result.pop("_all", [])),
+                    list(result.pop("_review_all", result.get("review") or [])),
                 )
         except Exception as exc:
             logger.error(f"[ActiveReply] 记忆分类修复失败: {exc}", exc_info=True)

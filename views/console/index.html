@@ -39,7 +39,7 @@
     <link rel="preload" as="image" type="image/svg+xml" href="./assets/morph/theme-dark.svg" />
     <link rel="preload" as="image" type="image/svg+xml" href="./assets/morph/theme-light.svg" />
     <link rel="preload" as="image" type="image/svg+xml" href="./assets/morph/theme-system.svg" />
-    <link rel="stylesheet" href="./styles.css?v=30" />
+    <link rel="stylesheet" href="./styles.css?v=36" />
   </head>
   <body>
     
@@ -429,7 +429,7 @@
         <section id="view-dev" class="view">
           <div class="section-head">
             <h2>开发者选项</h2>
-            <p class="muted">提示词预览与自检仅对知道开发者密钥的人开放；记忆分类修复无需密钥。</p>
+            <p class="muted">提示词预览与自检仅对知道开发者密钥的人开放；记忆修复无需密钥。</p>
           </div>
           <div id="dev-gate" class="card dev-gate">
             <label class="field">
@@ -441,17 +441,19 @@
             </div>
           </div>
           <div class="card dev-gate">
-            <h3>记忆分类修复</h3>
-            <p class="muted small">先用规则初筛、再用已配置模型复核可疑项，把误标为「事实」的事件/计划/偏好/关系改判，并按新类型重算有效期；无需开发者密钥。</p>
-            <div class="dev-actions">
-              <button id="dev-memory-repair" class="ghost" type="button"><span class="icon icon-wrench" aria-hidden="true"></span>扫描并修复记忆分类</button>
+            <h3>记忆修复</h3>
+            <p class="muted small">扫描分类与群身份：先用规则初筛、再用已配置模型复核可疑分类，把误标为「事实」的事件/计划/偏好/关系改判，并按新类型重算有效期；同时从原始消息修复群主/群管等身份；仅处理未归档且有原始消息的记录。无需开发者密钥。</p>
+            <div class="dev-actions repair-actions">
+              <button id="dev-memory-repair" class="ghost" type="button"><span class="icon icon-wrench" aria-hidden="true"></span>扫描并修复记忆</button>
+              <button id="dev-memory-repair-settings" class="icon-btn repair-settings-btn" type="button" title="记忆修复设置" aria-label="记忆修复设置"><span class="icon icon-settings" aria-hidden="true"></span></button>
             </div>
           </div>
           <div class="card dev-gate">
             <h3>版本引导</h3>
-            <p class="muted small">重新查看当前版本新增功能的漫游引导。</p>
-            <div class="dev-actions">
-              <button id="dev-tour-replay" class="ghost" type="button"><span class="icon icon-eye" aria-hidden="true"></span>重现此版本引导</button>
+            <p class="muted small">最新版本会自动显示最新一次引导；也可以单独重看历史版本。</p>
+            <div class="dev-actions tour-replay-actions">
+              <button id="dev-tour-replay" class="ghost" type="button"><span class="icon icon-eye" aria-hidden="true"></span>重现 beta.6 引导</button>
+              <button id="dev-tour-replay-beta5" class="ghost" type="button"><span class="icon icon-eye" aria-hidden="true"></span>重现 beta.5 引导</button>
             </div>
           </div>
           <div id="dev-tools" class="card dev-tools" hidden>
@@ -526,6 +528,28 @@
       <div id="detail-body" class="detail-body"></div>
     </aside>
 
+    <div id="repair-settings-modal" class="modal" aria-hidden="true">
+      <div class="modal-card">
+        <h3>记忆修复设置</h3>
+        <div class="filter-form">
+          <label>修复置信度阈值
+            <input id="repair-confidence" class="input" type="range" min="0.5" max="0.90" step="0.05" />
+            <span id="repair-confidence-value" class="muted small">0.80</span>
+          </label>
+          <label class="filter-review-row">允许反向修复
+            <span class="switch">
+              <input id="repair-reverse" type="checkbox" />
+              <span class="slider"></span>
+            </span>
+          </label>
+          <p class="muted small">批量修复只应用达到该置信度的分类结果；反向修复允许高置信度地把非 fact 类型改判。</p>
+        </div>
+        <div class="modal-actions">
+          <button id="repair-settings-cancel" class="ghost" type="button">取消</button>
+          <button id="repair-settings-save" class="primary" type="button">保存</button>
+        </div>
+      </div>
+    </div>
     <div id="filter-modal" class="modal" aria-hidden="true">
       <div class="modal-card">
         <h3>筛选记忆</h3>
@@ -547,7 +571,14 @@
               <option value="plan">计划</option>
               <option value="preference">偏好</option>
               <option value="relation">关系</option>
+              <option value="experience">经验</option>
             </select>
+          </label>
+          <label class="filter-review-row">只看待复核
+            <span class="switch">
+              <input id="filter-review" type="checkbox" />
+              <span class="slider"></span>
+            </span>
           </label>
           <label>群范围
             <select id="filter-scope" class="input"></select>
@@ -622,6 +653,6 @@
         </div>
       </section>
     </div>
-    <script type="module" src="./app.js?v=30"></script>
+    <script type="module" src="./app.js?v=36"></script>
   </body>
 </html>

@@ -14,6 +14,7 @@ from __future__ import annotations
 from astrbot.api import logger
 
 import base64
+import hashlib
 import json
 import math
 import os
@@ -1228,7 +1229,9 @@ class MemoryStore:
     # ------------------------------------------------------------------ #
     # 写入 / 读取
     # ------------------------------------------------------------------ #
-    def find_exact_memory(self, content: str, group_scope: str = "") -> int | None:
+    def find_exact_memory(
+        self, content: str, group_scope: str = "", kind: str = ""
+    ) -> int | None:
         """查找同作用域下正文完全相同的未归档、未过期记忆，用于快速去重。
 
         作用域必须精确匹配：否则两个群说同一句话时，后写入的那条会被当成
@@ -1239,13 +1242,20 @@ class MemoryStore:
         if not text:
             return None
         scope = str(group_scope or "").strip()
+        clean_kind = str(kind or "").strip().lower()
+        kind_sql = " AND kind = ?" if clean_kind else ""
+        params: list[Any] = [text, scope]
+        if clean_kind:
+            params.append(clean_kind)
+        params.append(time.time())
         with self._lock, closing(self._connect()) as conn:
             row = conn.execute(
                 "SELECT id FROM memories WHERE content = ? AND group_scope = ? "
-                "AND archived = 0 AND superseded_by IS NULL "
+                + kind_sql
+                + " AND archived = 0 AND superseded_by IS NULL "
                 "AND (valid_until IS NULL OR valid_until >= ?) "
                 "ORDER BY id DESC LIMIT 1",
-                (text, scope, time.time()),
+                params,
             ).fetchone()
         return int(row["id"]) if row else None
 
@@ -1315,7 +1325,7 @@ class MemoryStore:
             if str(item).strip() and len(str(item).strip()) >= 2
         ][:8]
         clean_kind = str(kind or "fact").strip().lower()
-        if clean_kind not in {"fact", "preference", "plan", "episode", "relation"}:
+        if clean_kind not in {"fact", "preference", "plan", "episode", "relation", "experience"}:
             clean_kind = "fact"
 
         with self._lock, closing(self._connect()) as conn, conn:
@@ -1505,6 +1515,7 @@ class MemoryStore:
         role_id: str = "",
         memory_type: str = "",
         kind: str = "",
+        needs_review: bool = False,
         identity: str = "",
         include_archived: bool = False,
         archived_only: bool = False,
@@ -1575,9 +1586,15 @@ class MemoryStore:
             where.append("m.memory_type = ?")
             params.append(memory_type)
         kind = str(kind or "").strip().lower()
-        if kind in {"fact", "episode", "plan", "preference", "relation"}:
+        if kind in {"fact", "episode", "plan", "preference", "relation", "experience"}:
             where.append("m.kind = ?")
             params.append(kind)
+        if needs_review:
+            where.append(
+                "CASE WHEN json_valid(m.extra_metadata) THEN "
+                "json_extract(m.extra_metadata, '$.kind_needs_review') = 1 "
+                "ELSE 0 END"
+            )
         identity = str(identity or "").strip()
         if identity:
             # r3.3f：身份筛选改为「发送者身份 或 任一参与者角色徽标」。
@@ -1653,7 +1670,7 @@ class MemoryStore:
                 f"""
                 SELECT m.*
                 FROM memories m {where_sql}
-                ORDER BY m.memory_time DESC, m.id DESC
+                ORDER BY m.id DESC
                 LIMIT ? OFFSET ?
                 """,
                 [*params, page_size, offset],
@@ -1949,6 +1966,63 @@ class MemoryStore:
             )
 
     @staticmethod
+    def _merge_kind_audit(
+        old: dict[str, Any],
+        new: Any,
+        old_kind: str,
+        old_snapshot: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """合并分类审计字段；新置信度更高且类型一致时才更新。
+
+        正文/去重合并不能把旧记录的低置信度、待复核标记永久锁死，也不能
+        在类型不一致时把新类型的审计字段贴到旧类型上。
+        """
+        if not isinstance(new, dict):
+            return old
+        new_kind = str(new.get("kind") or old_kind).strip().lower()
+        if new_kind and new_kind != old_kind:
+            # 上游 _merge_extra_metadata 可能已经补进了新类型的审计字段；
+            # 类型不一致时全部移除，避免 metadata.kind 与 kind 列分叉。
+            snapshot = old_snapshot if isinstance(old_snapshot, dict) else {}
+            for key in (
+                "kind",
+                "kind_confidence",
+                "kind_reason",
+                "kind_source",
+                "kind_needs_review",
+                "kind_review_suggested",
+                "kind_review_reason",
+            ):
+                if key in snapshot:
+                    old[key] = snapshot[key]
+                else:
+                    old.pop(key, None)
+            old["kind"] = old_kind
+            return old
+        old_conf = old.get("kind_confidence")
+        new_conf = new.get("kind_confidence")
+        try:
+            old_value = float(old_conf) if old_conf is not None else -1.0
+        except (TypeError, ValueError):
+            old_value = -1.0
+        try:
+            new_value = float(new_conf) if new_conf is not None else -1.0
+        except (TypeError, ValueError):
+            new_value = -1.0
+        if new_value < old_value:
+            return old
+        for key in (
+            "kind_confidence",
+            "kind_reason",
+            "kind_source",
+            "kind_needs_review",
+        ):
+            if key in new:
+                old[key] = new[key]
+        old["kind"] = old_kind
+        return old
+
+    @staticmethod
     def _merge_extra_metadata(
         old: dict[str, Any] | None, new: dict[str, Any] | None
     ) -> dict[str, Any]:
@@ -1975,6 +2049,33 @@ class MemoryStore:
         for key, value in new.items():
             if key not in merged:
                 merged[key] = value
+            elif key == "role_identities":
+                # 角色修复会写入更高身份；普通合并只能升不能降，避免新窗口
+                # 参与者更少时把 owner/群主覆盖成 member。
+                if isinstance(value, dict):
+                    current = merged.get(key)
+                    current = dict(current) if isinstance(current, dict) else {}
+                    ranks = {
+                        "member": 0,
+                        "group_admin": 1,
+                        "group_owner": 2,
+                        "owner": 3,
+                    }
+
+                    def normalize(role: object) -> str:
+                        text = str(role or "").strip().lower()
+                        if text == "admin":
+                            return "owner"
+                        if text == "administrator":
+                            return "group_admin"
+                        return text if text in ranks else ""
+
+                    for user_id, role in value.items():
+                        old_role = normalize(current.get(str(user_id)))
+                        new_role = normalize(role)
+                        if new_role and ranks[new_role] > ranks.get(old_role, -1):
+                            current[str(user_id)] = new_role
+                    merged[key] = current
             elif key == "participant_identities":
                 previous = merged.get(key)
                 old_list = previous if isinstance(previous, list) else []
@@ -2110,6 +2211,12 @@ class MemoryStore:
             merged_entities_json = json.dumps(merged_entities, ensure_ascii=False)
             old_metadata = self._parse_metadata(row["extra_metadata"])
             merged_metadata = self._merge_extra_metadata(old_metadata, extra_metadata)
+            merged_metadata = self._merge_kind_audit(
+                merged_metadata,
+                extra_metadata,
+                str(row["kind"] or "fact").strip().lower() or "fact",
+                old_metadata,
+            )
             # 两个分支共用的「只增不减」字段：重要性取大、有效期取晚、实体并集。
             shared_fields = (
                 "importance = MAX(importance, ?), "
@@ -2534,7 +2641,8 @@ class MemoryStore:
         with self._lock, closing(self._connect()) as conn:
             rows = conn.execute(
                 "SELECT id, content, kind, importance, access_count, "
-                "created_at, memory_time, valid_until, extra_metadata "
+                "created_at, memory_time, valid_until, extra_metadata, "
+                "sender_id, sender_role "
                 "FROM memories WHERE archived = 0 ORDER BY id"
             ).fetchall()
         result: list[dict[str, Any]] = []
@@ -2556,6 +2664,8 @@ class MemoryStore:
                         else None
                     ),
                     "extra_metadata": self._parse_metadata(row["extra_metadata"]),
+                    "sender_id": str(row["sender_id"] or ""),
+                    "sender_role": str(row["sender_role"] or "member"),
                 }
             )
         return result
@@ -2575,24 +2685,149 @@ class MemoryStore:
                 kind = str(
                     item.get("kind") or item.get("new_kind") or ""
                 ).strip().lower()
-                if memory_id <= 0 or kind not in {"fact", "preference", "plan", "episode", "relation"}:
+                if memory_id <= 0 or kind not in {"fact", "preference", "plan", "episode", "relation", "experience"}:
                     continue
                 metadata = item.get("extra_metadata")
                 if not isinstance(metadata, dict):
                     metadata = {}
+                old_kind = str(item.get("old_kind") or "").strip().lower()
+                row = conn.execute(
+                    "SELECT kind, content, valid_until, extra_metadata FROM memories "
+                    "WHERE id = ? AND archived = 0",
+                    (memory_id,),
+                ).fetchone()
+                if row is None:
+                    continue
+                # 预览后被人工改过类型：不要用过期候选覆盖。
+                if old_kind and str(row["kind"] or "").strip().lower() != old_kind:
+                    continue
+                content_hash = str(item.get("content_hash") or "")
+                if content_hash and hashlib.sha1(
+                    str(row["content"] or "").encode("utf-8")
+                ).hexdigest() != content_hash:
+                    continue
+                # 保留预览后新增的参与者/证据等字段；审计字段以本次候选为准。
+                merged = self._merge_extra_metadata(
+                    self._parse_metadata(row["extra_metadata"]), metadata
+                )
+                merged["kind"] = kind
+                for key in (
+                    "kind_confidence",
+                    "kind_reason",
+                    "kind_source",
+                    "kind_needs_review",
+                    "kind_repaired_from",
+                    "kind_repaired_at",
+                    "kind_repaired_by",
+                    "ttl_base_days",
+                    "ttl_days",
+                ):
+                    if key in metadata:
+                        merged[key] = metadata[key]
+                candidate_until = item.get("valid_until")
+                existing_until = row["valid_until"]
+                if candidate_until is None:
+                    final_until = existing_until
+                elif existing_until is None:
+                    final_until = candidate_until
+                else:
+                    final_until = max(float(existing_until), float(candidate_until))
+                if old_kind and kind != old_kind:
+                    merged.pop("kind_review_suggested", None)
+                    merged.pop("kind_review_reason", None)
+                if final_until is not None:
+                    merged["ttl_days"] = round(
+                        max(0.0, (float(final_until) - now) / 86400.0), 3
+                    )
                 cursor = conn.execute(
                     "UPDATE memories SET kind = ?, valid_until = ?, "
-                    "extra_metadata = ?, updated_at = ? "
+                    "extra_metadata = ?, updated_at = ?, "
+                    "sender_role = COALESCE(?, sender_role) "
                     "WHERE id = ? AND archived = 0",
                     (
                         kind,
-                        item.get("valid_until"),
-                        json.dumps(metadata, ensure_ascii=False),
+                        final_until,
+                        json.dumps(merged, ensure_ascii=False),
                         now,
+                        str(item.get("sender_role") or "").strip() or None,
                         memory_id,
                     ),
                 )
                 updated += max(0, int(cursor.rowcount or 0))
+        return updated
+
+    def mark_kind_reviewed(
+        self, memory_id: int, reviewer: str = "manual"
+    ) -> bool:
+        """人工确认分类后清除待复核标记，保留分类依据。"""
+        try:
+            target = int(memory_id)
+        except (TypeError, ValueError):
+            return False
+        if target <= 0:
+            return False
+        with self._lock, closing(self._connect()) as conn, conn:
+            row = conn.execute(
+                "SELECT extra_metadata FROM memories "
+                "WHERE id = ? AND archived = 0",
+                (target,),
+            ).fetchone()
+            if row is None:
+                return False
+            metadata = self._parse_metadata(row["extra_metadata"])
+            metadata["kind_needs_review"] = False
+            metadata.pop("kind_review_suggested", None)
+            metadata.pop("kind_review_reason", None)
+            metadata["kind_reviewed_by"] = str(reviewer or "manual")[:32]
+            metadata["kind_reviewed_at"] = time.time()
+            conn.execute(
+                "UPDATE memories SET extra_metadata = ?, updated_at = ? "
+                "WHERE id = ? AND archived = 0",
+                (json.dumps(metadata, ensure_ascii=False), time.time(), target),
+            )
+        return True
+
+    def mark_kind_review(
+        self, items: list[dict[str, Any]], reason: str = "分类置信度不足"
+    ) -> int:
+        """把低置信度候选标记为待复核，不改动 kind 列。"""
+        if not items:
+            return 0
+        now = time.time()
+        updated = 0
+        with self._lock, closing(self._connect()) as conn, conn:
+            for item in items:
+                try:
+                    memory_id = int(item.get("memory_id") or item.get("id"))
+                except (TypeError, ValueError):
+                    continue
+                if memory_id <= 0:
+                    continue
+                row = conn.execute(
+                    "SELECT extra_metadata FROM memories "
+                    "WHERE id = ? AND archived = 0",
+                    (memory_id,),
+                ).fetchone()
+                if row is None:
+                    continue
+                metadata = self._parse_metadata(row["extra_metadata"])
+                metadata["kind_needs_review"] = True
+                suggested = str(item.get("suggested_kind") or "").strip().lower()
+                if suggested:
+                    metadata["kind_review_suggested"] = suggested
+                review_reason = str(
+                    item.get("kind_reason") or reason
+                ).strip()[:240]
+                if review_reason:
+                    # 不要覆盖当前类型的 kind_reason；建议依据单独存放，
+                    # 避免出现 kind=fact 而 reason 描述 episode 的分叉。
+                    metadata["kind_review_reason"] = review_reason
+                conn.execute(
+                    "UPDATE memories SET extra_metadata = ?, updated_at = ? "
+                    "WHERE id = ? AND archived = 0",
+                    (json.dumps(metadata, ensure_ascii=False), now, memory_id),
+                )
+                updated += 1
         return updated
 
     def get_stats(self) -> dict[str, Any]:

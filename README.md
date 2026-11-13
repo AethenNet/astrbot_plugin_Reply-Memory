@@ -8,7 +8,7 @@
 
 [![AstrBot](https://img.shields.io/badge/AstrBot-%3E%3D4.29.0-4b8bf5)](https://docs.astrbot.app/dev/star/plugin-new.html)
 [![Python](https://img.shields.io/badge/Python-%3E%3D3.10-3776ab)](https://www.python.org/)
-[![Version](https://img.shields.io/badge/version-v1.1.0--beta.5-12a37a)](./CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-v1.1.0--beta.6-12a37a)](./CHANGELOG.md)
 [![GitHub](https://img.shields.io/badge/GitHub-astrbot__plugin__Reply--Memory-181717?logo=github)](https://github.com/AethenNet/astrbot_plugin_Reply-Memory)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-blue)](./LICENSE)
 
@@ -32,7 +32,7 @@
 
 ActiveReply 是面向 AstrBot 的群聊增强插件，把主动回复、群聊上下文、长期记忆 RAG、用户屏蔽和可视化控制台组合在一起。
 
-当前版本：**v1.1.0-beta.5**。本版重点：
+当前版本：**v1.1.0-beta.6**。本版重点：
 
 - 记忆采用「事件 + 原子记忆」两层结构；
 - 重要性统一为 0–10，并按类型设置有效期与半衰期；
@@ -147,7 +147,7 @@ ActiveReply 是面向 AstrBot 的群聊增强插件，把主动回复、群聊�
 
 - **重要性 importance**：0–10；
 - **置信度 confidence**：0–1，按 major/discussion/daily/chatter/spam 分档；
-- **按类型基础有效期**：计划/事件/偏好/关系/事实，范围 **1–365 天**；
+- **按类型基础有效期**：计划/事件/偏好/关系/经验/事实，范围 **0–365 天**；
 - **按类型半衰期**：控制遗忘速度；
 - 重要性可随时间衰减，查询时计算，不写回数据库。
 

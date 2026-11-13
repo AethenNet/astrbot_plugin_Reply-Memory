@@ -4,7 +4,7 @@ desc: 群聊主动回复增强插件：React 群聊上下文、模型判定主�
 short_desc: 主动回复 + 长期记忆：让 Bot 自己决定何时开口、@ 谁，并记住该记的事。
 author: Dew
 repo: https://github.com/AethenNet/astrbot_plugin_Reply-Memory
-version: 1.1.0-beta.5
+version: 1.1.0-beta.6
 category: ai_tools
 tags:
   - 主动回复

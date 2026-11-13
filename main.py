@@ -94,6 +94,24 @@ from .tags import (
     transform_result_chain,
 )
 
+# 身份等级：所有者 > 群主 > 群管 > 群成员。数值越大权限越高，合并时只升不降。
+_ROLE_RANK = {"member": 0, "group_admin": 1, "group_owner": 2, "owner": 3}
+
+
+def _role_rank(role: object) -> int:
+    return _ROLE_RANK.get(str(role or "").strip().lower(), -1)
+
+
+def _higher_role(*roles: object) -> str:
+    """返回多个身份中权限最高的一个；空值按 member 处理。"""
+    best = "member"
+    for role in roles:
+        text = str(role or "").strip().lower()
+        if text and _role_rank(text) > _role_rank(best):
+            best = text
+    return best
+
+
 PLUGIN_NAME = "astrbot_plugin_active_reply"
 
 
@@ -411,7 +429,7 @@ class ActiveReplyPlugin(MemoryOpsMixin, star.Star):
                 "memory_dedup_threshold": mem.get("memory_dedup_threshold", 0.90),
                 "memory_conflict_threshold": mem.get("memory_conflict_threshold", 0.75),
                 "auto_extract_min_confidence": mem.get(
-                    "auto_extract_min_confidence", 0.5
+                    "auto_extract_min_confidence", 0.25
                 ),
                 "auto_extract_scope": mem.get("auto_extract_scope", "group_first"),
             }
@@ -545,13 +563,14 @@ class ActiveReplyPlugin(MemoryOpsMixin, star.Star):
             logger.warning(f"[ActiveReply] 迁移记忆提示词失败: {exc}")
 
     def _migrate_memory_scoring(self) -> None:
-        """把旧默认的最低置信度 0.60 迁移到新评分口径的 0.50。
+        """把旧默认最低置信度迁移到 beta.6 的 0.25。
 
-        旧分数普遍虚高，0.60 是旧默认；新评分下日常讨论集中在 0.50-0.60，
-        继续用 0.60 会把正常的日常记忆全部过滤掉。只迁移恰好等于旧默认
-        的值，用户自行调整过的其他阈值保持不变。
+        旧版本先后使用 0.60 / 0.50 作为默认值；旧迁移 marker
+        ``.migrated_min_confidence`` 可能已经存在，不能复用它，否则升级用户
+        永远不会执行新迁移。这里用版本化 marker，并只改恰好等于旧默认值的
+        配置，用户自行调整过的其它数值保持不变。
         """
-        marker = self.data_dir / ".migrated_min_confidence"
+        marker = self.data_dir / ".migrated_min_confidence_025"
         if marker.exists():
             return
         try:
@@ -562,10 +581,18 @@ class ActiveReplyPlugin(MemoryOpsMixin, star.Star):
             if not isinstance(gen, dict):
                 return
             raw = gen.get("auto_extract_min_confidence")
-            if raw is not None and abs(float(raw) - 0.6) <= 1e-9:
-                gen["auto_extract_min_confidence"] = 0.5
-                self._save_config()
-                logger.info("[ActiveReply] 记忆最低置信度已从旧默认 0.60 迁移到 0.50")
+            if raw is not None:
+                try:
+                    value = float(raw)
+                except (TypeError, ValueError):
+                    value = -1.0
+                if any(abs(value - legacy) <= 1e-9 for legacy in (0.5, 0.6)):
+                    gen["auto_extract_min_confidence"] = 0.25
+                    self._save_config()
+                    logger.info(
+                        "[ActiveReply] 记忆最低置信度已从旧默认 %.2f 迁移到 0.25",
+                        value,
+                    )
             marker.write_text("1", encoding="utf-8")
         except Exception as exc:
             logger.debug(f"[ActiveReply] 迁移最低置信度失败: {exc}")
@@ -1206,6 +1233,12 @@ class ActiveReplyPlugin(MemoryOpsMixin, star.Star):
                 "修复记忆分类",
             ),
             (
+                f"/{PLUGIN_NAME}/rag/<memory_id>/kind",
+                self.page_api.rag_set_kind,
+                ["POST"],
+                "人工修改记忆类型",
+            ),
+            (
                 f"/{PLUGIN_NAME}/rag/cleanup",
                 self.page_api.rag_cleanup,
                 ["POST"],
@@ -1315,11 +1348,14 @@ class ActiveReplyPlugin(MemoryOpsMixin, star.Star):
 
         role_tag = ""
         if ctx_cfg.include_role_tag:
-            role_tag = "admin" if event.is_admin() else "member"
+            role_tag = "owner" if event.is_admin() else "member"
             group_id = self._group_id(event)
             cache = self._group_role_cache.get(group_id) if group_id else None
             if cache:
-                role_tag = cache[1].get(sender_id, role_tag)
+                # 缓存里可能是群管/群主，不能让较低身份覆盖 owner/admin。
+                role_tag = _higher_role(role_tag, cache[1].get(sender_id))
+                if event.is_admin():
+                    role_tag = "owner"
 
         # 行格式统一由 history_format 生成：昵称在引号内并已清洗，用户改名
         # 造不出 [SELF/ 行首；记忆历史始终带发送者 ID 与完整日期。
@@ -4024,7 +4060,8 @@ class ActiveReplyPlugin(MemoryOpsMixin, star.Star):
                 if role == "owner":
                     roles[uid] = "group_owner"
                 elif role == "admin":
-                    roles[uid] = "group_admin"
+                    # 同一账号同时出现在 owner/admin 时不能让 admin 降级群主。
+                    roles[uid] = _higher_role(roles.get(uid), "group_admin")
             return roles
         return {}
 
@@ -4048,7 +4085,9 @@ class ActiveReplyPlugin(MemoryOpsMixin, star.Star):
             for admin in getattr(group, "group_admins", None) or []:
                 admin_id = str(admin or "").strip()
                 if admin_id:
-                    roles[admin_id] = "group_admin"
+                    roles[admin_id] = _higher_role(
+                        roles.get(admin_id), "group_admin"
+                    )
         if not roles:
             roles.update(await self._group_roles_from_member_list(gid))
         uid = str(user_id or "").strip()
